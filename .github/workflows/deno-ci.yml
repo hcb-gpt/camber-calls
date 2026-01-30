@@ -1,0 +1,34 @@
+# DEV_STRAT_20260130T0745Z_github_actions_denoci.yml
+# Purpose: create a real status check for branch protection
+# Assumes Supabase Edge Functions (Deno / TypeScript) live under supabase/functions/**
+
+name: Deno CI
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  deno-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v1
+        with:
+          deno-version: v1.x
+
+      - name: Deno fmt (check)
+        run: |
+          deno fmt --check supabase/functions || (echo "deno fmt failed" && exit 1)
+
+      - name: Deno lint
+        run: |
+          deno lint supabase/functions || (echo "deno lint failed" && exit 1)
+
+      - name: Deno check (typecheck entrypoints)
+        run: |
+          for f in supabase/functions/*/index.ts; do
+            echo "typecheck $f"
+            deno check "$f" || exit 1
+          done
