@@ -1,5 +1,22 @@
 # Release History
 
+## 2026-01-30 (Commit: 6803884)
+
+### PR-5: Human Resolution Endpoint
+- Head SHA: `3adffbdc1c8d37847d09289d32d78127279d75f6`
+- Merge commit: `6803884`
+- Edge Function: `review-resolve` v3.0.0
+- RPC: `resolve_review_item()` (atomic, single-transaction)
+- Migration: `20260130220000_pr5_override_log_add_span_attribution_type.sql`
+
+Gates:
+- Human-lock conflict (409 if overwriting different project)
+- SSOT rowcount assertion (fails if span_attributions missing)
+- No overwrites on scheduler_items/journal_claims (NULL only)
+- Actor from JWT (no hardcoded user_id)
+
+---
+
 ## 2026-01-30 (Commit: ed8af8a)
 
 ### Edge Functions Deployed
