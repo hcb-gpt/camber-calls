@@ -1,0 +1,5 @@
+ALTER TABLE public.financial_overrides
+DROP CONSTRAINT IF EXISTS financial_overrides_original_cost_code_id_fkey;
+
+ALTER TABLE public.financial_overrides
+DROP CONSTRAINT IF EXISTS financial_overrides_override_cost_code_id_fkey;;
