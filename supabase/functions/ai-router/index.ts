@@ -250,6 +250,7 @@ function buildReasonCodes(opts: {
 /**
  * Upsert a review item keyed by span_id
  * Uses existing review_queue schema (reasons, pending/resolved/dismissed)
+ * Writes BOTH reason_codes AND reasons for back-compat (reconciled PR-4)
  */
 async function upsertReviewQueue(
   db: ReturnType<typeof createClient>,
@@ -267,7 +268,8 @@ async function upsertReviewQueue(
         span_id: payload.span_id,
         interaction_id: payload.interaction_id,
         status: "pending",
-        reasons: payload.reasons,
+        reason_codes: payload.reasons, // New column (preferred)
+        reasons: payload.reasons, // Legacy column (back-compat)
         context_payload: payload.context_payload,
       },
       { onConflict: "span_id" },
