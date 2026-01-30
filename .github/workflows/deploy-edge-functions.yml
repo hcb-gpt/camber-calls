@@ -1,0 +1,46 @@
+# Deploy Supabase Edge Functions on push to main
+# 
+# Required secrets:
+#   SUPABASE_ACCESS_TOKEN - From https://supabase.com/dashboard/account/tokens
+#   SUPABASE_PROJECT_ID - rjhdwidddtfetbwqolof
+
+name: Deploy Edge Functions
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'supabase/functions/**'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Deploy process-call function
+        run: |
+          supabase functions deploy process-call \
+            --project-ref ${{ secrets.SUPABASE_PROJECT_ID }} \
+            --no-verify-jwt
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+
+      - name: Deployment summary
+        run: |
+          echo "## Edge Function Deployed 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Function | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| process-call | ✅ Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Endpoint: \`https://rjhdwidddtfetbwqolof.supabase.co/functions/v1/process-call\`" >> $GITHUB_STEP_SUMMARY

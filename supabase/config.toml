@@ -1,0 +1,8 @@
+# Supabase project configuration
+# https://supabase.com/docs/guides/cli/config
+
+[project]
+id = "rjhdwidddtfetbwqolof"
+
+[functions.process-call]
+verify_jwt = false
