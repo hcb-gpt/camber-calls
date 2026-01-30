@@ -1,0 +1,9 @@
+# CODEOWNERS - Require review for protected paths
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Migration files require DEV + DATA review
+# Prevents drift: no migration changes without lane owner approval
+/supabase/migrations/ @hcb-gpt/dev @hcb-gpt/data
+
+# Edge functions require DEV review
+/supabase/functions/ @hcb-gpt/dev
