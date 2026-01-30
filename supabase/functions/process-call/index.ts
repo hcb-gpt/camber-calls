@@ -327,13 +327,9 @@ Deno.serve(async (req: Request) => {
             const idx = findTermInText(transcriptLower, termLower);
             if (idx >= 0) {
               // Found a match with word boundaries!
-              const matchType = fromAliasTable.some((a) =>
-                  a.toLowerCase() === termLower
-                )
+              const matchType = fromAliasTable.some((a) => a.toLowerCase() === termLower)
                 ? "alias_match"
-                : (p.name.toLowerCase() === termLower
-                  ? "name_match"
-                  : "location_match");
+                : (p.name.toLowerCase() === termLower ? "name_match" : "location_match");
 
               const cur = candidatesById.get(p.id) || {
                 project_id: p.id,
@@ -397,8 +393,7 @@ Deno.serve(async (req: Request) => {
           for (const r of mentionData) {
             const pid = r.project_id || r.projectId;
             if (pid) {
-              const affinity =
-                Number(r.contact_affinity || r.affinity || 0.9) || 0.9;
+              const affinity = Number(r.contact_affinity || r.affinity || 0.9) || 0.9;
               addCandidate(pid, "mentioned_contact_affinity", affinity);
 
               // Add as alias match evidence

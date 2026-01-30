@@ -25,9 +25,7 @@ function normalizeTerm(t: unknown): string {
 }
 
 function coerceBoost(b: unknown): number {
-  const n = typeof b === "number"
-    ? b
-    : (typeof b === "string" ? Number(b) : NaN);
+  const n = typeof b === "number" ? b : (typeof b === "string" ? Number(b) : NaN);
   if (!Number.isFinite(n)) return 1;
   return n;
 }
@@ -48,9 +46,7 @@ Deno.serve(async (req: Request) => {
     const recording_url = body?.recording_url;
     const interaction_id = body?.interaction_id;
     const keywords_enabled = body?.keywords_enabled ?? true;
-    const transcript_variant: TranscriptVariant = keywords_enabled
-      ? "keywords_on"
-      : "keywords_off";
+    const transcript_variant: TranscriptVariant = keywords_enabled ? "keywords_on" : "keywords_off";
 
     if (!recording_url) {
       return new Response(
