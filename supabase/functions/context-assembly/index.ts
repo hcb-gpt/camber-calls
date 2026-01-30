@@ -1,13 +1,19 @@
 /**
- * context-assembly Edge Function v1.1.0
+ * context-assembly Edge Function v1.2.0
  * Assembles LLM-ready context_package from span_id (SPAN-FIRST)
  *
- * @version 1.1.0
+ * @version 1.2.0
  * @date 2026-01-30
  * @purpose Provide rich context for AI Router project attribution
  * @port 6-source candidate collection from process-call v3.9.6
  *
  * CORE PRINCIPLE: span_id is the unit of truth. Calls are containers only.
+ *
+ * v1.2.0 Changes (PR-7 Phase 2: Enroute Detection):
+ * - VERB-DRIVEN role tagging: destination/origin/proximity
+ * - Inserts detected place mentions into span_place_mentions
+ * - POLICY (STRAT-1 BLOCK): Role is ONLY assigned via explicit verbs
+ * - Single place without verb = "proximity" (NEVER inferred direction)
  *
  * v1.1.0 Changes (PR-7: Geo Candidate Assist):
  * - SOURCE 7: geo proximity candidates from project_geo + geo_places
@@ -19,12 +25,12 @@
  *   - interaction_id + span_index: (debug convenience) - resolves to span_id first
  *
  * Output:
- *   - context_package JSON with meta, span, contact, candidates
+ *   - context_package JSON with meta, span, contact, candidates, place_mentions
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const ASSEMBLY_VERSION = "v1.1.0";
+const ASSEMBLY_VERSION = "v1.2.0";
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_TRANSCRIPT_CHARS = 8000;
@@ -33,6 +39,42 @@ const MAX_ALIAS_TERMS_PER_PROJECT = 25;
 // Geo candidate constants
 const GEO_MAX_DISTANCE_KM = 50; // Only consider projects within 50km
 const GEO_MAX_CANDIDATES = 5; // Cap geo candidates to prevent flooding
+
+// ============================================================
+// ENROUTE VERB PATTERNS (STRAT-1 POLICY: VERB-DRIVEN ONLY)
+// ============================================================
+// POLICY: Role tagging is DETERMINISTIC and VERB-DRIVEN
+// - "destination" requires explicit destination verbs
+// - "origin" requires explicit origin verbs
+// - Single place mention WITHOUT verb = "proximity" (NO direction inferred)
+// - NEVER infer direction from a single place without explicit verb
+
+const DESTINATION_VERBS = [
+  "headed to",
+  "heading to",
+  "going to",
+  "on my way to",
+  "on the way to",
+  "driving to",
+  "heading over to",
+  "headed over to",
+  "going over to",
+  "en route to",
+  "enroute to",
+];
+
+const ORIGIN_VERBS = [
+  "coming from",
+  "came from",
+  "leaving",
+  "left from",
+  "left",
+  "back from",
+  "returning from",
+  "just left",
+  "driving from",
+  "on my way from",
+];
 
 // ============================================================
 // TYPES
@@ -49,7 +91,7 @@ interface CandidateEvidence {
   affinity_weight: number;
   assigned: boolean;
   alias_matches: AliasMatch[];
-  geo_distance_km?: number; // Added for geo candidates
+  geo_distance_km?: number;
 }
 
 interface Candidate {
@@ -67,6 +109,17 @@ interface RecentProject {
   project_id: string;
   project_name: string;
   last_seen: string | null;
+}
+
+interface PlaceMention {
+  place_name: string;
+  geo_place_id: string | null;
+  lat: number | null;
+  lon: number | null;
+  role: "proximity" | "origin" | "destination";
+  trigger_verb: string | null;
+  char_offset: number;
+  snippet: string;
 }
 
 interface ContextPackage {
@@ -94,10 +147,11 @@ interface ContextPackage {
     recent_projects: RecentProject[];
   };
   candidates: Candidate[];
+  place_mentions: PlaceMention[];
 }
 
 // ============================================================
-// UTILITIES (ported from process-call v3.9.6)
+// UTILITIES
 // ============================================================
 
 /** Strip speaker labels from transcript to avoid false alias matches */
@@ -154,16 +208,12 @@ function smartTruncate(
     return { text: transcript, truncated: false };
   }
 
-  // If no matches, truncate from start (fallback)
   if (matchPositions.length === 0) {
     return { text: transcript.slice(0, maxChars) + "...", truncated: true };
   }
 
-  // Window around the first match, trying to capture context
   const firstMatch = Math.min(...matchPositions);
   const lastMatch = Math.max(...matchPositions);
-
-  // Try to center the window around matches
   const matchSpan = lastMatch - firstMatch;
   const windowStart = Math.max(0, firstMatch - Math.floor((maxChars - matchSpan) / 2));
   const windowEnd = Math.min(transcript.length, windowStart + maxChars);
@@ -182,7 +232,7 @@ function haversineDistanceKm(
   lat2: number,
   lon2: number,
 ): number {
-  const R = 6371; // Earth's radius in km
+  const R = 6371;
   const toRad = (deg: number) => deg * Math.PI / 180;
 
   const dLat = toRad(lat2 - lat1);
@@ -194,6 +244,55 @@ function haversineDistanceKm(
 
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
+}
+
+/**
+ * VERB-DRIVEN ROLE DETECTION
+ * POLICY (STRAT-1 BLOCK):
+ * - Role is ONLY assigned via explicit verbs
+ * - Single place without verb = "proximity"
+ * - NEVER infer direction from a single place
+ *
+ * @param transcriptLower - Lowercased transcript
+ * @param placeIdx - Character index of place mention
+ * @param placeName - Name of the place
+ * @returns { role, trigger_verb } - Role and the verb that triggered it
+ */
+function detectPlaceRole(
+  transcriptLower: string,
+  placeIdx: number,
+  placeName: string,
+): { role: "proximity" | "origin" | "destination"; trigger_verb: string | null } {
+  // Look in a window before the place mention for verb patterns
+  const VERB_WINDOW = 60; // Characters before place to search for verbs
+  const windowStart = Math.max(0, placeIdx - VERB_WINDOW);
+  const windowText = transcriptLower.slice(windowStart, placeIdx + placeName.length);
+
+  // Check destination verbs first (more specific patterns)
+  for (const verb of DESTINATION_VERBS) {
+    const verbIdx = windowText.indexOf(verb);
+    if (verbIdx >= 0) {
+      // Verify verb appears BEFORE the place (not after)
+      const verbEndPos = windowStart + verbIdx + verb.length;
+      if (verbEndPos <= placeIdx + 5) { // Allow small gap
+        return { role: "destination", trigger_verb: verb };
+      }
+    }
+  }
+
+  // Check origin verbs
+  for (const verb of ORIGIN_VERBS) {
+    const verbIdx = windowText.indexOf(verb);
+    if (verbIdx >= 0) {
+      const verbEndPos = windowStart + verbIdx + verb.length;
+      if (verbEndPos <= placeIdx + 5) {
+        return { role: "origin", trigger_verb: verb };
+      }
+    }
+  }
+
+  // No verb found = proximity only (NEVER infer direction)
+  return { role: "proximity", trigger_verb: null };
 }
 
 // ============================================================
@@ -236,7 +335,6 @@ Deno.serve(async (req: Request) => {
     let span_id: string | null = body.span_id || null;
     let interaction_id: string | null = null;
 
-    // Debug convenience: resolve from interaction_id + span_index
     if (!span_id && body.interaction_id) {
       const span_index = body.span_index ?? 0;
       const { data: spanRow } = await db
@@ -293,7 +391,7 @@ Deno.serve(async (req: Request) => {
     const start_ms = span.time_start_sec != null ? span.time_start_sec * 1000 : null;
     const end_ms = span.time_end_sec != null ? span.time_end_sec * 1000 : null;
 
-    // Fetch words from transcripts_comparison (for span boundaries)
+    // Fetch words from transcripts_comparison
     let words: any[] | undefined;
     const { data: tc } = await db
       .from("transcripts_comparison")
@@ -305,13 +403,7 @@ Deno.serve(async (req: Request) => {
       .single();
 
     if (tc?.words && Array.isArray(tc.words)) {
-      // Filter words to span boundaries if char positions available
-      if (span.char_start != null && span.char_end != null) {
-        // For now, include all words (trivial segmenter has full transcript)
-        words = tc.words;
-      } else {
-        words = tc.words;
-      }
+      words = tc.words;
     }
 
     // ========================================
@@ -334,7 +426,6 @@ Deno.serve(async (req: Request) => {
       contact_phone = interaction.contact_phone;
     }
 
-    // Get floater flag from contacts table
     if (contact_id) {
       const { data: contact } = await db
         .from("contacts")
@@ -347,7 +438,6 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // Get recent projects for contact
     const recent_projects: RecentProject[] = [];
     if (contact_id) {
       const { data: affRows } = await db
@@ -358,7 +448,6 @@ Deno.serve(async (req: Request) => {
         .limit(5);
 
       if (affRows?.length) {
-        // Fetch project names
         const projectIds = affRows.map((r) => r.project_id).filter(Boolean);
         const { data: prows } = await db
           .from("projects")
@@ -438,7 +527,7 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // SOURCE 2: correspondent_project_affinity (historical call frequency)
+    // SOURCE 2: correspondent_project_affinity
     if (contact_id) {
       const { data: affRows } = await db
         .from("correspondent_project_affinity")
@@ -455,7 +544,7 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // SOURCE 3: existing_project from interactions (replay fallback)
+    // SOURCE 3: existing_project from interactions
     {
       const { data: irows } = await db
         .from("interactions")
@@ -469,10 +558,10 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // Track match positions for smart truncation
     const matchPositions: number[] = [];
+    const place_mentions: PlaceMention[] = [];
 
-    // SOURCE 4-6: Transcript-based sources
+    // SOURCE 4-7: Transcript-based sources
     if (transcript_text) {
       const transcriptClean = stripSpeakerLabels(transcript_text);
       const transcriptLower = transcriptClean.toLowerCase();
@@ -480,7 +569,6 @@ Deno.serve(async (req: Request) => {
       // Fetch all projects + aliases for matching
       const { data: projects } = await db.from("projects").select("id, name, aliases, city, address");
 
-      // Try to fetch from v_project_alias_lookup view (may not exist)
       let aliasRows: Array<{ project_id: string; alias: string }> | null = null;
       try {
         const { data, error } = await db.from("v_project_alias_lookup").select("project_id, alias");
@@ -493,7 +581,6 @@ Deno.serve(async (req: Request) => {
         warnings.push("v_project_alias_lookup_error");
       }
 
-      // Build alias map
       const aliasByProject = new Map<string, string[]>();
       for (const r of (aliasRows || [])) {
         if (!r.project_id || !r.alias) continue;
@@ -501,7 +588,7 @@ Deno.serve(async (req: Request) => {
         aliasByProject.get(r.project_id)!.push(r.alias);
       }
 
-      // SOURCE 4: Name/alias/location matches in transcript (with word boundaries)
+      // SOURCE 4: Name/alias/location matches in transcript
       if (projects) {
         sources_used.push("transcript_scan");
         for (const p of projects) {
@@ -545,7 +632,7 @@ Deno.serve(async (req: Request) => {
         }
       }
 
-      // SOURCE 5: Try RPC scan_transcript_for_projects
+      // SOURCE 5: RPC scan_transcript_for_projects
       try {
         const { data: scanData, error: scanErr } = await db.rpc("scan_transcript_for_projects", {
           transcript_text: transcript_text,
@@ -569,7 +656,7 @@ Deno.serve(async (req: Request) => {
         }
       } catch { /* RPC may not exist */ }
 
-      // SOURCE 6: Try RPC expand_candidates_from_mentions
+      // SOURCE 6: RPC expand_candidates_from_mentions
       try {
         const { data: mentionData, error: mentionErr } = await db.rpc("expand_candidates_from_mentions", {
           transcript_text: transcript_text,
@@ -596,46 +683,105 @@ Deno.serve(async (req: Request) => {
       } catch { /* RPC may not exist */ }
 
       // ========================================
-      // SOURCE 7: GEO PROXIMITY (WEAK SIGNAL)
-      // Find place mentions in transcript → nearest projects
-      // POLICY: Geo alone is NEVER sufficient for auto-assign
+      // SOURCE 7: GEO + ENROUTE DETECTION
+      // POLICY (STRAT-1 BLOCK):
+      // - Role is VERB-DRIVEN only
+      // - Single place without verb = "proximity"
+      // - NEVER infer direction from single place
       // ========================================
       try {
-        // Fetch all places from gazetteer
         const { data: places, error: placesErr } = await db
           .from("geo_places")
-          .select("name, state, lat, lon");
+          .select("id, name, state, lat, lon");
 
         if (!placesErr && places?.length) {
-          // Find place mentions in transcript
-          const mentionedPlaces: Array<{ name: string; lat: number; lon: number }> = [];
+          const mentionedPlaces: Array<{
+            id: string;
+            name: string;
+            lat: number;
+            lon: number;
+            char_offset: number;
+            role: "proximity" | "origin" | "destination";
+            trigger_verb: string | null;
+            snippet: string;
+          }> = [];
 
           for (const place of places) {
             if (!place.name || place.lat == null || place.lon == null) continue;
 
             const placeNameLower = place.name.toLowerCase();
-            if (placeNameLower.length < 4) continue; // Skip very short names
+            if (placeNameLower.length < 4) continue;
 
             const idx = findTermInText(transcriptLower, placeNameLower);
             if (idx >= 0) {
+              // VERB-DRIVEN ROLE DETECTION
+              const { role, trigger_verb } = detectPlaceRole(transcriptLower, idx, placeNameLower);
+
+              const mention: PlaceMention = {
+                place_name: place.name,
+                geo_place_id: place.id,
+                lat: place.lat,
+                lon: place.lon,
+                role,
+                trigger_verb,
+                char_offset: idx,
+                snippet: snippetAround(transcriptClean, idx, place.name.length),
+              };
+
+              place_mentions.push(mention);
+
               mentionedPlaces.push({
+                id: place.id,
                 name: place.name,
                 lat: place.lat,
                 lon: place.lon,
+                char_offset: idx,
+                role,
+                trigger_verb,
+                snippet: mention.snippet,
               });
             }
           }
 
+          // Insert place mentions into span_place_mentions (upsert)
           if (mentionedPlaces.length > 0) {
-            // Fetch all projects with geo data
+            sources_used.push("geo_proximity");
+
+            const insertRows = mentionedPlaces.map((p) => ({
+              span_id: span_id,
+              geo_place_id: p.id,
+              place_name: p.name,
+              lat: p.lat,
+              lon: p.lon,
+              role: p.role,
+              trigger_verb: p.trigger_verb,
+              char_offset: p.char_offset,
+              snippet: p.snippet,
+            }));
+
+            try {
+              // Upsert: on conflict, update if role changes
+              await db.from("span_place_mentions").upsert(insertRows, {
+                onConflict: "span_id,COALESCE(geo_place_id,'00000000-0000-0000-0000-000000000000'),role",
+                ignoreDuplicates: true,
+              });
+            } catch (_insertErr) {
+              // Table may not exist yet - continue without persisting
+              warnings.push("span_place_mentions_insert_skipped");
+            }
+
+            // Log enroute detections
+            const enrouteCount = mentionedPlaces.filter((p) => p.role !== "proximity").length;
+            if (enrouteCount > 0) {
+              warnings.push(`enroute_detected:${enrouteCount}`);
+            }
+
+            // Find nearby projects (geo proximity candidates)
             const { data: projectGeos, error: geoErr } = await db
               .from("project_geo")
               .select("project_id, lat, lon");
 
             if (!geoErr && projectGeos?.length) {
-              sources_used.push("geo_proximity");
-
-              // For each mentioned place, find nearby projects
               const nearbyProjectsWithDistance = new Map<string, number>();
 
               for (const place of mentionedPlaces) {
@@ -658,7 +804,6 @@ Deno.serve(async (req: Request) => {
                 }
               }
 
-              // Sort by distance and add as candidates (capped)
               const sortedNearby = Array.from(nearbyProjectsWithDistance.entries())
                 .sort((a, b) => a[1] - b[1])
                 .slice(0, GEO_MAX_CANDIDATES);
@@ -674,7 +819,6 @@ Deno.serve(async (req: Request) => {
           }
         }
       } catch (_geoErr) {
-        // Geo tables may not exist or be empty - this is fine
         warnings.push("geo_lookup_skipped");
       }
     }
@@ -713,7 +857,6 @@ Deno.serve(async (req: Request) => {
         }
       }
 
-      // Also try to fetch from alias view (may not exist)
       try {
         const { data: enrichAliasRows, error: aliasErr } = await db
           .from("v_project_alias_lookup")
@@ -731,12 +874,12 @@ Deno.serve(async (req: Request) => {
           }
         }
       } catch {
-        // View doesn't exist - aliases from projects.aliases are still used
+        // View doesn't exist
       }
     }
 
     // ========================================
-    // BUILD CANDIDATES ARRAY (NO RANKING - LLM DECIDES)
+    // BUILD CANDIDATES ARRAY
     // ========================================
     const candidates: Candidate[] = [];
 
@@ -762,30 +905,24 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    // Sort by evidence strength for presentation (but LLM makes decision)
+    // Sort by evidence strength
     candidates.sort((a, b) => {
-      // Assigned first
       if (a.evidence.assigned !== b.evidence.assigned) return a.evidence.assigned ? -1 : 1;
-      // More alias matches second
       if (b.evidence.alias_matches.length !== a.evidence.alias_matches.length) {
         return b.evidence.alias_matches.length - a.evidence.alias_matches.length;
       }
-      // Higher affinity third
       if (b.evidence.affinity_weight !== a.evidence.affinity_weight) {
         return b.evidence.affinity_weight - a.evidence.affinity_weight;
       }
-      // Geo-only candidates go last (weak signal)
       const aGeoOnly = a.evidence.sources.length === 1 && a.evidence.sources[0] === "geo_proximity";
       const bGeoOnly = b.evidence.sources.length === 1 && b.evidence.sources[0] === "geo_proximity";
       if (aGeoOnly !== bGeoOnly) return aGeoOnly ? 1 : -1;
-      // If both geo, sort by distance
       if (a.evidence.geo_distance_km !== undefined && b.evidence.geo_distance_km !== undefined) {
         return a.evidence.geo_distance_km - b.evidence.geo_distance_km;
       }
       return 0;
     });
 
-    // Cap at MAX_CANDIDATES
     if (candidates.length > MAX_CANDIDATES) {
       truncations.push(`candidates_capped_at_${MAX_CANDIDATES}`);
     }
@@ -832,6 +969,7 @@ Deno.serve(async (req: Request) => {
         recent_projects,
       },
       candidates: finalCandidates,
+      place_mentions,
     };
 
     return new Response(
