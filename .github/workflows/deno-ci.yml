@@ -1,6 +1,7 @@
 # DEV_STRAT_20260130T0745Z_github_actions_denoci.yml
 # Purpose: create a real status check for branch protection
 # Assumes Supabase Edge Functions (Deno / TypeScript) live under supabase/functions/**
+# First run: 2026-01-30
 
 name: Deno CI
 on:
