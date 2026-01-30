@@ -30,7 +30,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const ASSEMBLY_VERSION = "v1.2.0";
+const ASSEMBLY_VERSION = "v1.2.5";
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_TRANSCRIPT_CHARS = 8000;
@@ -309,6 +309,17 @@ Deno.serve(async (req: Request) => {
     });
   }
 
+  // ========================================
+  // AUTH GATE: Require valid JWT (PR-9 hotfix)
+  // ========================================
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return new Response(JSON.stringify({ error: "missing_auth", hint: "Authorization: Bearer <token> required" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
   let body: any;
   try {
     body = await req.json();
@@ -323,6 +334,41 @@ Deno.serve(async (req: Request) => {
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
   );
+
+  // Verify JWT is valid (will fail if token invalid/expired)
+  const anonClient = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_ANON_KEY")!,
+    { global: { headers: { Authorization: authHeader } } },
+  );
+  const { data: { user }, error: authErr } = await anonClient.auth.getUser();
+  if (authErr || !user) {
+    return new Response(JSON.stringify({ error: "invalid_token", detail: authErr?.message }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  // ========================================
+  // ALLOWLIST GATE: Only permitted users (PR-9 hotfix)
+  // REQUIRED: ALLOWED_EMAILS must be set, else hard-deny
+  // ========================================
+  const allowedEmails = (Deno.env.get("ALLOWED_EMAILS") || "").split(",").map(
+    (e) => e.trim().toLowerCase(),
+  ).filter(Boolean);
+  if (allowedEmails.length === 0) {
+    return new Response(
+      JSON.stringify({ error: "config_error", hint: "ALLOWED_EMAILS env not configured" }),
+      { status: 500, headers: { "Content-Type": "application/json" } },
+    );
+  }
+  const userEmail = (user.email || "").toLowerCase();
+  if (!allowedEmails.includes(userEmail)) {
+    return new Response(JSON.stringify({ error: "forbidden", hint: "User not in ALLOWED_EMAILS" }), {
+      status: 403,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
 
   const truncations: string[] = [];
   const warnings: string[] = [];
@@ -747,27 +793,33 @@ Deno.serve(async (req: Request) => {
           if (mentionedPlaces.length > 0) {
             sources_used.push("geo_proximity");
 
+            // Map to actual DB schema: (span_id, place_id, mention_text, role, verb_hint, confidence)
+            // PK is (span_id, place_id, mention_text)
             const insertRows = mentionedPlaces.map((p) => ({
               span_id: span_id,
-              geo_place_id: p.id,
-              place_name: p.name,
-              lat: p.lat,
-              lon: p.lon,
+              place_id: p.id,
+              mention_text: p.name,
               role: p.role,
-              trigger_verb: p.trigger_verb,
-              char_offset: p.char_offset,
-              snippet: p.snippet,
+              verb_hint: p.trigger_verb,
+              confidence: p.role === "proximity" ? 0.5 : 0.8,
             }));
 
-            try {
-              // Upsert: on conflict, update if role changes
-              await db.from("span_place_mentions").upsert(insertRows, {
-                onConflict: "span_id,COALESCE(geo_place_id,'00000000-0000-0000-0000-000000000000'),role",
-                ignoreDuplicates: true,
-              });
-            } catch (_insertErr) {
-              // Table may not exist yet - continue without persisting
-              warnings.push("span_place_mentions_insert_skipped");
+            // Upsert using PK columns (PR-9 hotfix)
+            // PK: span_place_mentions_pkey (span_id, place_id, mention_text)
+            const { error: upsertErr } = await db.from("span_place_mentions").upsert(insertRows, {
+              onConflict: "span_id,place_id,mention_text",
+            });
+            if (upsertErr) {
+              // FAIL CLOSED: upsert failure is fatal (schema/PK mismatch)
+              return new Response(
+                JSON.stringify({
+                  ok: false,
+                  error: "span_place_mentions_upsert_failed",
+                  detail: upsertErr.message,
+                  ms: Date.now() - t0,
+                }),
+                { status: 500, headers: { "Content-Type": "application/json" } },
+              );
             }
 
             // Log enroute detections
