@@ -32,7 +32,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { requireEdgeSecret, authErrorResponse } from "../_shared/auth.ts";
 
-const VERSION = "1.1.0";
+const VERSION = "1.1.3";
 const ALLOWED_SOURCES = ["admin-reseed", "system"];
 
 interface ReseedRequest {
@@ -258,15 +258,58 @@ Deno.serve(async (req: Request) => {
   // ========================================
   // 9. FETCH TRANSCRIPT FOR RECHUNKING
   // ========================================
+  // Try transcripts_comparison first (canonical source)
   const { data: transcriptData } = await db
     .from("transcripts_comparison")
-    .select("transcript_text, words")
+    .select("transcript, words")
     .eq("interaction_id", interaction_id)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
 
-  const transcript = transcriptData?.transcript_text || "";
+  let transcript = transcriptData?.transcript || "";
+
+  // Fallback: reconstruct from existing spans if no transcript_comparison
+  if (!transcript) {
+    // Try active spans first, then fall back to most recent superseded generation
+    let fallbackSpanIds = activeSpanIds;
+    let fallbackSource = "active";
+
+    if (fallbackSpanIds.length === 0) {
+      // No active spans - get most recent superseded generation
+      const { data: supersededSpans } = await db
+        .from("conversation_spans")
+        .select("id, segment_generation")
+        .eq("interaction_id", interaction_id)
+        .eq("is_superseded", true)
+        .order("segment_generation", { ascending: false })
+        .order("span_index");
+
+      if (supersededSpans && supersededSpans.length > 0) {
+        const maxGen = supersededSpans[0].segment_generation;
+        fallbackSpanIds = supersededSpans
+          .filter((s) => s.segment_generation === maxGen)
+          .map((s) => s.id);
+        fallbackSource = `superseded_gen${maxGen}`;
+      }
+    }
+
+    if (fallbackSpanIds.length > 0) {
+      const { data: spanTexts } = await db
+        .from("conversation_spans")
+        .select("transcript_segment, span_index")
+        .in("id", fallbackSpanIds)
+        .order("span_index");
+
+      if (spanTexts && spanTexts.length > 0) {
+        transcript = spanTexts
+          .map((s) => s.transcript_segment || "")
+          .filter(Boolean)
+          .join("\n\n");
+        console.log(`[admin-reseed] Reconstructed transcript from ${spanTexts.length} ${fallbackSource} spans, ${transcript.length} chars`);
+      }
+    }
+  }
 
   // ========================================
   // 10. CREATE NEW SPANS (trivial chunker for now)
@@ -348,21 +391,31 @@ Deno.serve(async (req: Request) => {
     const contextAssemblyUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/context-assembly`;
     const aiRouterUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/ai-router`;
     const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const edgeSecret = Deno.env.get("EDGE_SHARED_SECRET");
+
+    // Headers for internal function-to-function calls
+    const internalHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${serviceKey}`,
+    };
+    // Add X-Edge-Secret if available for additional auth path
+    if (edgeSecret) {
+      internalHeaders["X-Edge-Secret"] = edgeSecret;
+      internalHeaders["X-Source"] = "admin-reseed";
+    }
 
     for (const spanId of newSpanIds) {
       try {
         // Call context-assembly
         const ctxResp = await fetch(contextAssemblyUrl, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${serviceKey}`,
-          },
+          headers: internalHeaders,
           body: JSON.stringify({ span_id: spanId }),
         });
 
         if (!ctxResp.ok) {
-          console.error(`[admin-reseed] context-assembly failed for span ${spanId}: ${ctxResp.status}`);
+          const errText = await ctxResp.text().catch(() => "");
+          console.error(`[admin-reseed] context-assembly failed for span ${spanId}: ${ctxResp.status} ${errText}`);
           continue;
         }
 
@@ -375,10 +428,7 @@ Deno.serve(async (req: Request) => {
         // Call ai-router
         const routerResp = await fetch(aiRouterUrl, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${serviceKey}`,
-          },
+          headers: internalHeaders,
           body: JSON.stringify({
             context_package: ctxData.context_package,
             dry_run: false,

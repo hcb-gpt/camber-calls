@@ -26,11 +26,15 @@
  *
  * Output:
  *   - context_package JSON with meta, span, contact, candidates, place_mentions
+ *
+ * AUTH:
+ * - Accepts service role JWT (verify_jwt=false in config)
+ * - Also accepts X-Edge-Secret for internal function-to-function calls
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const ASSEMBLY_VERSION = "v1.2.1";
+const ASSEMBLY_VERSION = "v1.2.2";
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_TRANSCRIPT_CHARS = 8000;

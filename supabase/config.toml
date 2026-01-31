@@ -5,3 +5,14 @@ project_id = "rjhdwidddtfetbwqolof"
 
 [functions.process-call]
 verify_jwt = false
+
+# Internal machine-to-machine endpoints
+# These require X-Edge-Secret or service role key for auth
+[functions.context-assembly]
+verify_jwt = false
+
+[functions.ai-router]
+verify_jwt = false
+
+[functions.admin-reseed]
+verify_jwt = false
