@@ -125,7 +125,7 @@ call_admin_reseed() {
       -X POST "$url" \
       -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
       -H "X-Edge-Secret: ${EDGE_SHARED_SECRET}" \
-      -H "X-Source: shadow-batch" \
+      -H "X-Source: admin-reseed" \
       -H "Content-Type: application/json" \
       --data "$body" || echo "000")"
 
@@ -163,7 +163,7 @@ call_admin_reseed() {
 }
 
 sanitize_ids() {
-  grep -vE '^\s*(#|$)' "$IDS_FILE" | sed -e 's/\r$//' | xargs
+  grep -vE '^\s*(#|$)' "$IDS_FILE" | sed -e 's/\r$//' | while read -r line; do echo "$line"; done
 }
 
 # ---- main loop ----
