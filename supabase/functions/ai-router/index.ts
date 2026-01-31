@@ -1,13 +1,17 @@
 /**
- * ai-router Edge Function v1.0.0
+ * ai-router Edge Function v1.1.0
  * LLM-based project attribution for conversation spans
  *
- * @version 1.0.0
- * @date 2026-01-30
+ * @version 1.1.0
+ * @date 2026-01-31
  * @purpose Use Claude Haiku to attribute spans to projects with anchored evidence
  *
  * CORE PRINCIPLE: span_attributions is the single source of truth.
  * NO writes to interactions.project_id from this path.
+ *
+ * PR-12/STRAT TURN23:
+ * - Added X-Edge-Secret OR JWT auth gate (like process-call)
+ * - Forward X-Edge-Secret to downstream calls
  *
  * Input:
  *   - context_package: ContextPackage (from context-assembly)
@@ -20,7 +24,21 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 
+const AI_ROUTER_VERSION = "v1.1.0";
 const PROMPT_VERSION = "v1.5.0";
+
+// ============================================================
+// AUTH GATE (PR-12 / STRAT TURN23)
+// ============================================================
+const ALLOWED_PROVENANCE_SOURCES = [
+  "context-assembly", // Called from context-assembly
+  "edge",
+  "test",
+];
+
+const ADMIN_USER_IDS: string[] = [
+  // Add Supabase auth.users.id values here
+];
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
 
@@ -438,6 +456,76 @@ Deno.serve(async (req: Request) => {
     });
   }
 
+  // ============================================================
+  // AUTHENTICATION GATE (PR-12 / STRAT TURN23)
+  // Two-layer: JWT user auth OR X-Edge-Secret header
+  // ============================================================
+  const authHeader = req.headers.get("Authorization");
+  const edgeSecret = req.headers.get("X-Edge-Secret");
+  const provenanceSource = (body.source || "unknown").toLowerCase();
+
+  // Check edge secret first (for internal edge function calls)
+  const expectedSecret = Deno.env.get("EDGE_SHARED_SECRET");
+  const hasValidEdgeSecret = expectedSecret &&
+    edgeSecret === expectedSecret &&
+    ALLOWED_PROVENANCE_SOURCES.includes(provenanceSource);
+
+  // If no valid edge secret, require JWT auth
+  if (!hasValidEdgeSecret) {
+    if (!authHeader) {
+      return new Response(
+        JSON.stringify({
+          error: "missing_auth",
+          hint: "Authorization: Bearer <token> or X-Edge-Secret required",
+        }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // Validate JWT
+    const anonClient = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_ANON_KEY")!,
+      { global: { headers: { Authorization: authHeader } } },
+    );
+    const { data: { user }, error: authErr } = await anonClient.auth.getUser();
+
+    if (authErr || !user) {
+      return new Response(
+        JSON.stringify({ error: "invalid_token", hint: authErr?.message }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    const userId = user.id;
+    const userEmail = user.email || "";
+
+    // AUTHORIZATION GATE
+    const allowedEmails = (Deno.env.get("ALLOWED_EMAILS") || "").split(",").map(
+      (e) => e.trim().toLowerCase(),
+    ).filter((e) => e.length > 0);
+
+    const isAdmin = ADMIN_USER_IDS.length > 0 && ADMIN_USER_IDS.includes(userId);
+    const isAllowedEmail = allowedEmails.length > 0 && allowedEmails.includes(userEmail.toLowerCase());
+
+    if (ADMIN_USER_IDS.length === 0 && allowedEmails.length === 0) {
+      return new Response(
+        JSON.stringify({
+          error: "config_error",
+          hint: "Neither ADMIN_USER_IDS nor ALLOWED_EMAILS configured",
+        }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    if (!isAdmin && !isAllowedEmail) {
+      return new Response(
+        JSON.stringify({ error: "forbidden", hint: "User not authorized" }),
+        { status: 403, headers: { "Content-Type": "application/json" } },
+      );
+    }
+  }
+
   const context_package: ContextPackage | null = body.context_package || null;
   const dry_run = body.dry_run === true;
 
@@ -722,6 +810,7 @@ Deno.serve(async (req: Request) => {
   return new Response(
     JSON.stringify({
       ok: true,
+      version: AI_ROUTER_VERSION,
       span_id,
       project_id: result.project_id,
       confidence: result.confidence,
