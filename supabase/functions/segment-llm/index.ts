@@ -16,7 +16,39 @@
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
-const SEGMENT_LLM_VERSION = "segment-llm_v1.0.0";
+const SEGMENT_LLM_VERSION = "segment-llm_v1.1.0";
+
+// ============================================================
+// STRUCTURED LOGGING (per GPT-DEV-6 spec)
+// ============================================================
+type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
+
+function structuredLog(
+  level: LogLevel,
+  event: string,
+  requestId: string,
+  interactionId: string | null,
+  extra: Record<string, unknown> = {},
+): void {
+  const log = {
+    ts: new Date().toISOString(),
+    level,
+    service: "edge-function",
+    function: "segment-llm",
+    event,
+    interaction_id: interactionId,
+    generation: null, // segment-llm doesn't track generation
+    request_id: requestId,
+    correlation_id: `${interactionId || "unknown"}:0:${requestId}`,
+    segmenter_version: SEGMENT_LLM_VERSION,
+    ...extra,
+  };
+  if (level === "ERROR") {
+    console.error(JSON.stringify(log));
+  } else {
+    console.log(JSON.stringify(log));
+  }
+}
 
 // ============================================================
 // AUTH CONFIGURATION
@@ -174,6 +206,16 @@ Deno.serve(async (req: Request) => {
   }
 
   const transcriptLength = transcript.length;
+  const requestId = req.headers.get("x-request-id") || crypto.randomUUID();
+  const caller = provenanceSource;
+
+  // Structured log: segment_llm_request
+  structuredLog("INFO", "segment_llm_request", requestId, interaction_id, {
+    transcript_chars: transcriptLength,
+    caller,
+    params: { max_segments, min_segment_chars },
+  });
+
   console.log(
     `[segment-llm] Processing: interaction_id=${interaction_id}, len=${transcriptLength}`,
   );
@@ -242,12 +284,24 @@ Deno.serve(async (req: Request) => {
     if (!resp.ok) {
       const errText = await resp.text();
       console.error(`[segment-llm] LLM API error: ${resp.status} ${errText}`);
+      // Structured log: segment_llm_error
+      structuredLog("ERROR", "segment_llm_error", requestId, interaction_id, {
+        error_code: `llm_api_${resp.status}`,
+        error_class: "openai_http_error",
+        duration_ms: Date.now() - t0,
+      });
       return fallbackResponse(transcriptLength, [`llm_api_error_${resp.status}`], t0);
     }
 
     llmResponse = await resp.json();
   } catch (fetchErr: any) {
     console.error(`[segment-llm] LLM fetch error: ${fetchErr.message}`);
+    // Structured log: segment_llm_error
+    structuredLog("ERROR", "segment_llm_error", requestId, interaction_id, {
+      error_code: "llm_fetch_error",
+      error_class: fetchErr.message || "unknown",
+      duration_ms: Date.now() - t0,
+    });
     return fallbackResponse(transcriptLength, [`llm_fetch_error`], t0);
   }
 
@@ -385,7 +439,14 @@ Deno.serve(async (req: Request) => {
     boundary_quote: seg.boundary_quote ? seg.boundary_quote.slice(0, 50) : null,
   }));
 
+  const durationMs = Date.now() - t0;
   console.log(`[segment-llm] Produced ${segments.length} segments with ${warnings.length} warnings`);
+
+  // Structured log: segment_llm_response
+  structuredLog("INFO", "segment_llm_response", requestId, interaction_id, {
+    segments_returned: segments.length,
+    duration_ms: durationMs,
+  });
 
   return new Response(
     JSON.stringify({
@@ -393,7 +454,7 @@ Deno.serve(async (req: Request) => {
       segmenter_version: SEGMENT_LLM_VERSION,
       segments,
       warnings,
-      ms: Date.now() - t0,
+      ms: durationMs,
     } as SegmentLLMOutput),
     { status: 200, headers: { "Content-Type": "application/json" } },
   );

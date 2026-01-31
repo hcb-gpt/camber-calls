@@ -32,8 +32,59 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { authErrorResponse, requireEdgeSecret } from "../_shared/auth.ts";
 
-const VERSION = "1.2.0"; // Version tracking for admin-reseed endpoint
+const VERSION = "1.3.0"; // Version tracking for admin-reseed endpoint
 const ALLOWED_SOURCES = ["admin-reseed", "system"];
+
+// ============================================================
+// STRUCTURED LOGGING (per GPT-DEV-6 spec)
+// ============================================================
+type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
+
+interface StructuredLog {
+  ts: string;
+  level: LogLevel;
+  service: string;
+  function: string;
+  event: string;
+  interaction_id: string | null;
+  generation: number | null;
+  request_id: string;
+  correlation_id: string;
+  segmenter_version: string | null;
+  [key: string]: unknown;
+}
+
+function structuredLog(
+  level: LogLevel,
+  event: string,
+  requestId: string,
+  interactionId: string | null,
+  generation: number | null,
+  extra: Record<string, unknown> = {},
+): void {
+  const log: StructuredLog = {
+    ts: new Date().toISOString(),
+    level,
+    service: "edge-function",
+    function: "admin-reseed",
+    event,
+    interaction_id: interactionId,
+    generation,
+    request_id: requestId,
+    correlation_id: `${interactionId || "unknown"}:${generation ?? 0}:${requestId}`,
+    segmenter_version: (extra.segmenter_version as string) || null,
+    ...extra,
+  };
+  if (level === "ERROR") {
+    console.error(JSON.stringify(log));
+  } else {
+    console.log(JSON.stringify(log));
+  }
+}
+
+// Single-span guard thresholds
+const LONG_TRANSCRIPT_THRESHOLD = 2000; // chars
+const RETRY_MIN_SEGMENT_CHARS = 100; // smaller for retry to encourage more splits
 
 type SegmentFromLLM = {
   span_index: number;
@@ -330,6 +381,9 @@ Deno.serve(async (req: Request) => {
   // ========================================
   const newSpanIds: string[] = [];
 
+  // Generate request_id for structured logging
+  const requestId = crypto.randomUUID();
+
   if (transcript.length > 0) {
     const edgeSecret = Deno.env.get("EDGE_SHARED_SECRET");
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
@@ -340,6 +394,22 @@ Deno.serve(async (req: Request) => {
     const segmenterWarnings: string[] = [];
     const max_segments = 10;
     const min_segment_chars = 200;
+    const transcriptChars = transcript.length;
+
+    // Structured log: reseed_start
+    structuredLog("INFO", "reseed_start", requestId, interaction_id, newGeneration, {
+      transcript_chars: transcriptChars,
+      reseed_mode: mode,
+      reroute: mode === "resegment_and_reroute",
+    });
+
+    // Structured log: reseed_segment_request
+    structuredLog("INFO", "reseed_segment_request", requestId, interaction_id, newGeneration, {
+      transcript_chars: transcriptChars,
+      segmenter_params: { max_segments, min_segment_chars },
+    });
+
+    const segmentT0 = Date.now();
 
     try {
       const llmResp = await fetch(segmentLLMUrl, {
@@ -347,6 +417,7 @@ Deno.serve(async (req: Request) => {
         headers: {
           "Content-Type": "application/json",
           "X-Edge-Secret": edgeSecret || "",
+          "x-request-id": requestId,
         },
         body: JSON.stringify({
           interaction_id,
@@ -359,7 +430,11 @@ Deno.serve(async (req: Request) => {
 
       if (!llmResp.ok) {
         const errBody = await llmResp.text().catch(() => "");
-        console.error(`[admin-reseed] segment-llm failed: ${llmResp.status} - ${errBody}`);
+        structuredLog("ERROR", "reseed_segment_error", requestId, interaction_id, newGeneration, {
+          error_code: `http_${llmResp.status}`,
+          error_class: "segment_llm_http_error",
+          segmenter_latency_ms: Date.now() - segmentT0,
+        });
         segmenterWarnings.push(`segment_llm_http_${llmResp.status}`);
       } else {
         const llmData = await llmResp.json().catch(() => null);
@@ -367,13 +442,113 @@ Deno.serve(async (req: Request) => {
           segments = llmData.segments;
           segmenterVersion = llmData.segmenter_version || "segment-llm_v1.0.0";
           if (Array.isArray(llmData.warnings)) segmenterWarnings.push(...llmData.warnings);
+
+          // Structured log: reseed_segment_result
+          structuredLog("INFO", "reseed_segment_result", requestId, interaction_id, newGeneration, {
+            segments_returned: segments.length,
+            segmenter_latency_ms: Date.now() - segmentT0,
+            segmenter_version: segmenterVersion,
+          });
         } else {
           segmenterWarnings.push("segment_llm_invalid_response");
         }
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "unknown";
+      structuredLog("ERROR", "reseed_segment_error", requestId, interaction_id, newGeneration, {
+        error_code: "fetch_error",
+        error_class: msg,
+        segmenter_latency_ms: Date.now() - segmentT0,
+      });
       segmenterWarnings.push(`segment_llm_error:${msg}`);
+    }
+
+    // ========================================
+    // SINGLE-SPAN GUARD (Phase 1 P0 requirement)
+    // If transcript > 2000 chars AND segment-llm returns 1 span:
+    // 1. Retry with stricter params
+    // 2. If still 1 span, use deterministic fallback
+    // ========================================
+    const isLongTranscript = transcriptChars > LONG_TRANSCRIPT_THRESHOLD;
+    const isSingleSpan = segments.length === 1;
+
+    if (isLongTranscript && isSingleSpan) {
+      structuredLog("WARN", "reseed_retry_segment_request", requestId, interaction_id, newGeneration, {
+        retry_reason: "long_transcript_single_segment",
+        transcript_chars: transcriptChars,
+        segmenter_params: { max_segments, min_segment_chars: RETRY_MIN_SEGMENT_CHARS },
+      });
+
+      const retryT0 = Date.now();
+
+      try {
+        const retryResp = await fetch(segmentLLMUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Edge-Secret": edgeSecret || "",
+            "x-request-id": requestId,
+          },
+          body: JSON.stringify({
+            interaction_id,
+            transcript,
+            source: "admin-reseed",
+            max_segments,
+            min_segment_chars: RETRY_MIN_SEGMENT_CHARS,
+            // Hint to LLM to be more aggressive about splitting
+            strict_split: true,
+          }),
+        });
+
+        if (retryResp.ok) {
+          const retryData = await retryResp.json().catch(() => null);
+          if (retryData?.ok && Array.isArray(retryData.segments) && retryData.segments.length > 1) {
+            segments = retryData.segments;
+            segmenterVersion = retryData.segmenter_version || "segment-llm_v1.0.0";
+            segmenterWarnings.push("retry_produced_multiple_spans");
+
+            structuredLog("INFO", "reseed_retry_segment_result", requestId, interaction_id, newGeneration, {
+              segments_returned: segments.length,
+              segmenter_latency_ms: Date.now() - retryT0,
+              segmenter_version: segmenterVersion,
+            });
+          } else {
+            // Retry still returned 1 span - use deterministic fallback
+            structuredLog("WARN", "reseed_single_segment_fallback_warning", requestId, interaction_id, newGeneration, {
+              transcript_chars: transcriptChars,
+              segments_returned: 1,
+              fallback_reason: "retry_still_single_span",
+            });
+
+            // Deterministic fallback: split by paragraphs or fixed chunks
+            segments = deterministicSplit(transcript, transcriptChars);
+            segmenterVersion = "fallback_deterministic_v1";
+            segmenterWarnings.push("deterministic_fallback_after_retry");
+          }
+        } else {
+          // Retry failed - use deterministic fallback
+          structuredLog("WARN", "reseed_single_segment_fallback_warning", requestId, interaction_id, newGeneration, {
+            transcript_chars: transcriptChars,
+            segments_returned: 1,
+            fallback_reason: "retry_http_failed",
+          });
+
+          segments = deterministicSplit(transcript, transcriptChars);
+          segmenterVersion = "fallback_deterministic_v1";
+          segmenterWarnings.push("deterministic_fallback_retry_failed");
+        }
+      } catch (retryErr: unknown) {
+        const msg = retryErr instanceof Error ? retryErr.message : "unknown";
+        structuredLog("WARN", "reseed_single_segment_fallback_warning", requestId, interaction_id, newGeneration, {
+          transcript_chars: transcriptChars,
+          segments_returned: 1,
+          fallback_reason: `retry_error:${msg}`,
+        });
+
+        segments = deterministicSplit(transcript, transcriptChars);
+        segmenterVersion = "fallback_deterministic_v1";
+        segmenterWarnings.push(`deterministic_fallback_retry_error:${msg}`);
+      }
     }
 
     // Safety net: ensure we always write at least one span covering the transcript.
@@ -511,6 +686,14 @@ Deno.serve(async (req: Request) => {
 
     inserted.sort((a, b) => a.span_index - b.span_index);
     newSpanIds.push(...inserted.map((r) => r.id));
+
+    // Structured log: reseed_spans_inserted
+    structuredLog("INFO", "reseed_spans_inserted", requestId, interaction_id, newGeneration, {
+      spans_inserted: newSpanIds.length,
+      superseded_count: activeSpanIds.length,
+      spans_active_after: newSpanIds.length,
+      segmenter_version: segmenterVersion,
+    });
   }
 
   // ========================================
@@ -609,6 +792,16 @@ Deno.serve(async (req: Request) => {
   // ========================================
   // 13. RESPONSE
   // ========================================
+
+  // Structured log: reseed_end
+  structuredLog("INFO", "reseed_end", requestId, interaction_id, newGeneration, {
+    outcome: "success",
+    duration_ms: Date.now() - t0,
+    spans_total: newSpanIds.length,
+    spans_active: newSpanIds.length,
+    reroute_triggered: receipt.reroute_triggered,
+  });
+
   console.log(
     `[admin-reseed] Rechunk completed: interaction=${interaction_id}, spans_before=${spanCountBefore}, spans_after=${newSpanIds.length}, ` +
       `mode=${mode}, reroute=${receipt.reroute_triggered}`,
@@ -629,6 +822,88 @@ function jsonResponse(data: Record<string, unknown>, status: number): Response {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+/**
+ * Deterministic fallback split for long transcripts when LLM fails to segment.
+ * Strategy: Split by paragraph breaks, or by fixed character chunks if no paragraphs.
+ */
+function deterministicSplit(transcript: string, transcriptChars: number): SegmentFromLLM[] {
+  const MIN_CHUNK_SIZE = 500;
+  const TARGET_CHUNKS = Math.min(4, Math.ceil(transcriptChars / 2000));
+
+  // Try paragraph-based split first (double newlines)
+  const paragraphs = transcript.split(/\n\n+/);
+
+  if (paragraphs.length >= 2) {
+    // Merge small paragraphs into chunks
+    const chunks: { text: string; start: number; end: number }[] = [];
+    let cursor = 0;
+    let currentChunk = { text: "", start: 0, end: 0 };
+
+    for (const para of paragraphs) {
+      const paraStart = transcript.indexOf(para, cursor);
+      const paraEnd = paraStart + para.length;
+
+      if (currentChunk.text.length === 0) {
+        currentChunk = { text: para, start: paraStart, end: paraEnd };
+      } else if (currentChunk.text.length + para.length < MIN_CHUNK_SIZE) {
+        currentChunk.text += "\n\n" + para;
+        currentChunk.end = paraEnd;
+      } else {
+        chunks.push(currentChunk);
+        currentChunk = { text: para, start: paraStart, end: paraEnd };
+      }
+      cursor = paraEnd;
+    }
+    if (currentChunk.text.length > 0) {
+      chunks.push(currentChunk);
+    }
+
+    if (chunks.length >= 2) {
+      return chunks.map((c, i) => ({
+        span_index: i,
+        char_start: c.start,
+        char_end: c.end,
+        boundary_reason: "fallback_paragraph_split",
+        confidence: 0.5,
+        boundary_quote: null,
+      }));
+    }
+  }
+
+  // Fixed character split fallback
+  const chunkSize = Math.ceil(transcriptChars / TARGET_CHUNKS);
+  const segments: SegmentFromLLM[] = [];
+
+  for (let i = 0; i < TARGET_CHUNKS; i++) {
+    const start = i * chunkSize;
+    const end = Math.min((i + 1) * chunkSize, transcriptChars);
+    if (start >= transcriptChars) break;
+
+    segments.push({
+      span_index: i,
+      char_start: start,
+      char_end: end,
+      boundary_reason: "fallback_fixed_split",
+      confidence: 0.3,
+      boundary_quote: null,
+    });
+  }
+
+  // Ensure last segment ends at transcript end
+  if (segments.length > 0) {
+    segments[segments.length - 1].char_end = transcriptChars;
+  }
+
+  return segments.length > 0 ? segments : [{
+    span_index: 0,
+    char_start: 0,
+    char_end: transcriptChars,
+    boundary_reason: "fallback_full_call",
+    confidence: 1.0,
+    boundary_quote: null,
+  }];
 }
 
 async function writeOverrideLog(
