@@ -34,3 +34,38 @@ jobs:
       #       echo "typecheck $f"
       #       deno check "$f" || exit 1
       #     done
+
+  # Proof pack merge gate - runs replay on known interaction to verify pipeline integrity
+  proof-pack:
+    runs-on: ubuntu-latest
+    # Only run if secrets are available (not on forks)
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      EDGE_SHARED_SECRET: ${{ secrets.EDGE_SHARED_SECRET }}
+      # Known good interaction for regression testing
+      TEST_INTERACTION_ID: ${{ secrets.TEST_INTERACTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check secrets available
+        run: |
+          if [[ -z "$SUPABASE_URL" || -z "$SUPABASE_SERVICE_ROLE_KEY" || -z "$EDGE_SHARED_SECRET" ]]; then
+            echo "Secrets not configured - skipping proof pack"
+            exit 0
+          fi
+
+      - name: Run proof pack
+        if: env.TEST_INTERACTION_ID != ''
+        run: |
+          chmod +x ./scripts/replay_call.sh
+          ./scripts/replay_call.sh "$TEST_INTERACTION_ID" --reseed --reroute --verbose --save-artifacts
+
+      - name: Upload proof artifacts
+        if: always() && env.TEST_INTERACTION_ID != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-pack-${{ github.run_id }}
+          path: /tmp/proofs/
+          retention-days: 7

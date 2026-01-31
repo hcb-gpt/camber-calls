@@ -26,6 +26,10 @@
  *
  * Output:
  *   - context_package JSON with meta, span, contact, candidates, place_mentions
+ *
+ * AUTH:
+ * - Accepts service role JWT (verify_jwt=false in config)
+ * - Also accepts X-Edge-Secret for internal function-to-function calls
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -409,11 +413,13 @@ Deno.serve(async (req: Request) => {
 
     if (!span_id && body.interaction_id) {
       const span_index = body.span_index ?? 0;
+      // POLICY: Active spans only (is_superseded=false)
       const { data: spanRow } = await db
         .from("conversation_spans")
         .select("id, interaction_id")
         .eq("interaction_id", body.interaction_id)
         .eq("span_index", span_index)
+        .eq("is_superseded", false)
         .single();
 
       if (spanRow) {
