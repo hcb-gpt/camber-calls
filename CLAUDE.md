@@ -81,6 +81,56 @@ source ~/.zshrc
 
 All scripts MUST source: `scripts/load-env.sh` (CI enforced).
 
+### Tool Management (permanent, never lost)
+
+**Central tool repository:** `~/.camber/tools/`
+
+**Why:** Tools in repo `scripts/` directories can be lost on branch switches. Canonical versions in `~/.camber/tools/` survive all branch operations.
+
+**Tool inventory (5 essential scripts):**
+1. `replay_call.sh` (8.5K) - Pipeline validation (this file line 16)
+2. `test-credentials.sh` (1.1K) - Credential verification (this file line 78)
+3. `load-env.sh` (1.2K) - Script credential loader (sourced by all scripts)
+4. `shadow-batch.sh` (3.2K) - Batch shadow testing
+5. `test-shadow.sh` (891B) - Individual shadow testing
+
+**Operations:**
+
+**Install tools to current repo/worktree:**
+```bash
+~/.camber/install-tools.sh
+# ✅ All 5 tools installed to ./scripts/
+```
+
+**Check sync status (canonical vs repo):**
+```bash
+~/.camber/sync-tools.sh --check
+# Shows: ✅ in sync / ⚠️ differs / ❌ missing
+```
+
+**Update repo from canonical (safe):**
+```bash
+~/.camber/sync-tools.sh --to-repo
+# Copies canonical → repo (read-only to canonical)
+```
+
+**Update canonical from repo (after PR merge):**
+```bash
+cd /path/to/repo  # Must be on master with merged changes
+~/.camber/sync-tools.sh --from-repo
+# Interactive confirmation for each tool
+```
+
+**Recovery if tools lost:**
+```bash
+# One command restores all from canonical
+~/.camber/install-tools.sh
+```
+
+**Full documentation:** `~/.camber/TOOLS.md`
+
+**Never lost guarantee:** All tools referenced in this file are preserved in `~/.camber/tools/` and can be installed to any repo/worktree with one command.
+
 ### Branch Protocol (prevent drift)
 **DO NOT create a branch immediately.** Start on master.
 
@@ -107,6 +157,123 @@ git checkout -b feat/chunking-retry-fallback
 ```
 
 **Why:** Random branches = documentation drift. Named branches = reviewable intent.
+
+### Auth/Credentials Patterns (fixes "gymnastics" forever)
+
+**Problem:** Shell state doesn't persist between Bash tool invocations. Credentials loaded via `source` disappear on next command.
+
+**WRONG (unreliable):**
+```bash
+source ~/.camber/credentials.env
+curl "$SUPABASE_URL/rest/v1/rpc/some_function"  # ❌ $SUPABASE_URL is empty
+```
+
+**RIGHT (always works):**
+```bash
+# Pattern 1: Export inline (bash scripts)
+export $(grep -v '^#' ~/.camber/credentials.env | xargs) && \
+  curl "$SUPABASE_URL/rest/v1/rpc/some_function"
+
+# Pattern 2: Chain commands with &&
+source ~/.camber/credentials.env && \
+  export SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY EDGE_SHARED_SECRET && \
+  curl "$SUPABASE_URL/rest/v1/rpc/some_function"
+
+# Pattern 3: Use explicit values (scripts)
+SUPABASE_URL=$(grep SUPABASE_URL ~/.camber/credentials.env | cut -d= -f2)
+curl "$SUPABASE_URL/rest/v1/rpc/some_function"
+```
+
+**Edge Function Auth Stack (all layers required):**
+
+| Layer | What's Needed | Why |
+|-------|---------------|-----|
+| **Gateway** | `Authorization: Bearer <SERVICE_ROLE_KEY>` | Gateway rejects without it (even with `verify_jwt=false`) |
+| **Function** | `X-Edge-Secret: <EDGE_SHARED_SECRET>` | Function's own auth logic |
+| **Function** | `source` in allowlist (e.g., `segment-call`) | Provenance verification |
+| **Deploy** | `--no-verify-jwt` flag OR `verify_jwt=false` in config.toml | Otherwise gateway validates JWT before function runs |
+
+**Internal Function-to-Function Calls:**
+
+```typescript
+// ❌ WRONG - Gateway returns 401
+const response = await fetch(`${SUPABASE_URL}/functions/v1/segment-llm`, {
+  headers: {
+    "X-Edge-Secret": edgeSecret,  // Not enough!
+  },
+  body: JSON.stringify({ ... }),
+});
+
+// ✅ RIGHT - Both auth layers
+const response = await fetch(`${SUPABASE_URL}/functions/v1/segment-llm`, {
+  headers: {
+    "Authorization": `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`,  // Gateway auth
+    "X-Edge-Secret": edgeSecret,                                             // Function auth
+    "X-Source": "admin-reseed",                                              // Provenance
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({ ... }),
+});
+```
+
+**Deployment for Internal Functions:**
+
+```bash
+# ❌ WRONG - Defaults to verify_jwt=true
+supabase functions deploy segment-llm
+
+# ✅ RIGHT - Explicit no-verify-jwt
+supabase functions deploy segment-llm --no-verify-jwt
+
+# Or in supabase/functions/segment-llm/config.toml:
+[functions.segment-llm]
+verify_jwt = false
+```
+
+**External curl to Edge Functions:**
+
+```bash
+# Always include Authorization header (even for verify_jwt=false functions)
+curl -X POST "${SUPABASE_URL}/functions/v1/admin-reseed" \
+  -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+  -H "X-Edge-Secret: ${EDGE_SHARED_SECRET}" \
+  -H "X-Source: test" \
+  -H "Content-Type: application/json" \
+  -d '{"interaction_id":"cll_test","mode":"resegment_only"}'
+```
+
+**Script Pattern (in repo scripts/):**
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+# Auto-load credentials
+if [[ -f "$HOME/.camber/load-credentials.sh" ]]; then
+  source "$HOME/.camber/load-credentials.sh" 2>/dev/null || true
+fi
+
+# Verify loaded (fail closed)
+for var in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY EDGE_SHARED_SECRET; do
+  if [[ -z "${!var:-}" ]]; then
+    echo "ERROR: Missing env var: $var" >&2
+    exit 2
+  fi
+done
+
+# Now use credentials (they're in scope for this script)
+curl -X POST "${SUPABASE_URL}/functions/v1/some-function" \
+  -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+  ...
+```
+
+**Key Takeaways:**
+1. **Gateway auth ≠ Function auth** - Both required for internal calls
+2. **Shell state is ephemeral** - Use export pattern or chain with &&
+3. **verify_jwt defaults to true** - Always deploy with `--no-verify-jwt` for internal functions
+4. **Bearer token required** - Even when `verify_jwt=false`, gateway still needs it
+
+**Never:** Assume `source` persists across commands in Bash tool calls.
 
 ---
 
