@@ -8,13 +8,13 @@ Status codes are not proof. DB deltas are proof.
 ## Environment Stamp (required on every substantive edit)
 
 Repo:
-- org/repo:
-- branch:
-- HEAD (sha + subject):
+- org/repo: hcb-gpt/beside-v3.8
+- branch: master
+- HEAD (sha + subject): 4811106 Merge pull request #18 from hcb-gpt/merge-all-branches-to-master
 Supabase:
-- project ref:
-- functions deployed (names only):
-Stamp Date (UTC):
+- project ref: rjhdwidddtfetbwqolof
+- functions deployed (names only): process-call, segment-call, segment-llm, context-assembly, ai-router, admin-reseed, eval-ai-router, transcribe-deepgram, transcribe-assemblyai, transcribe-claude, transcribe-whisper, transcribe-audio, review-resolve, sync-google-contacts, test-tma-fetch, dlq-enqueue
+Stamp Date (UTC): 2026-01-31T19:57Z
 
 ---
 
@@ -105,7 +105,33 @@ Valid review targeting:
 
 ---
 
-## E) Anti-drift protocol (v2)
+## E) Credential management (established 2026-01-31)
+
+**Central credential store:** `~/.camber/credentials.env` (chmod 600)
+
+All credentials auto-load in new shells via `~/.zshrc`. Scripts should source:
+```bash
+source "$(git rev-parse --show-toplevel)/scripts/load-env.sh"
+```
+
+Available credentials:
+- SUPABASE_URL
+- SUPABASE_SERVICE_ROLE_KEY
+- EDGE_SHARED_SECRET
+- ANTHROPIC_API_KEY
+- OPENAI_API_KEY
+- DEEPGRAM_API_KEY
+- ASSEMBLYAI_API_KEY
+- PIPEDREAM_API_KEY
+- CLI (Supabase access token)
+
+**Never commit credentials to git.** All `.env.local` files are gitignored.
+
+Documentation: `~/.camber/README.md` and `CREDENTIALS.md` in repo.
+
+---
+
+## F) Anti-drift protocol (v2)
 
 Drift = prod (runtime) differs from git (reviewable truth).
 
@@ -131,7 +157,7 @@ Drift is closed only when BOTH are true:
 
 ---
 
-## F) v4 Sprint 0 deliverable — LLM segmenter
+## G) v4 Sprint 0 deliverable — LLM segmenter
 
 ### Problem statement
 Current segmenting is trivial (1 call = 1 span). Multi-project calls get forced into one attribution. v4 fixes that by segmenting into multiple spans before routing.
@@ -193,7 +219,7 @@ Segmenter never does:
 
 ---
 
-## G) Orchestration (call → N spans → N attributions)
+## H) Orchestration (call → N spans → N attributions)
 
 Chain:
 `process-call → segment-call → segment-llm → (for each span) context-assembly → ai-router`
@@ -214,7 +240,7 @@ DB note:
 
 ---
 
-## H) Attribution uniqueness decision gate (DATA-A + DATA-1)
+## I) Attribution uniqueness decision gate (DATA-A + DATA-1)
 
 We must choose and enforce ONE meaning:
 
@@ -234,7 +260,7 @@ Until decided: do not change constraints silently; document which option is acti
 
 ---
 
-## I) Acceptance tests (DEV executes)
+## J) Acceptance tests (DEV executes)
 
 Synthetic multi-project (forced switch):
 - Use a transcript with an explicit switch (“Now about Hurley… also Skelton…”)
