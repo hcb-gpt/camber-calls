@@ -137,53 +137,96 @@ v4 adds LLM-powered segmentation so that a multi-project call produces **N spans
 
 ## B) Roles and division of labor (lane rules)
 
-STRAT routes work and defines the acceptance tests. STRAT does **not** code, test, deploy, or rotate secrets.
+**Reporting chain (mandatory):**
+- **DEV reports to STRAT** via TRAM messages
+- When blocked or need decisions: write `TO:STRAT FROM:DEV` message with BLOCKED protocol
+- STRAT routes all work, DEV executes
+- Read TRAM daily for new tasks from STRAT
 
-DEV is paramount in execution:
-- applies patches (from GPT-DEV PRs),
-- runs tests,
-- deploys,
-- rotates secrets,
-- posts receipts.
+**STRAT (your manager):**
+- Routes work and defines acceptance tests
+- Does **not** code, test, deploy, or rotate secrets
+- Gives you tasks via TRAM (check `/Users/chadbarlow/Library/CloudStorage/GoogleDrive-admin@heartwoodcustombuilders.com/My Drive/_camber/Camber/01_TRAM/` daily)
 
-GPT-DEV-* write code only:
-- diffs + PR descriptions + test steps + rollback notes,
-- no deploys.
+**DEV (you):**
+- Applies patches (from GPT-DEV PRs)
+- Runs tests
+- Deploys
+- Rotates secrets
+- Posts receipts back to STRAT via TRAM
 
-DATA-1 owns DB:
-- migrations/constraints/indexes/views/RPCs,
-- post-deploy measurement.
+**When to write TO:STRAT:**
+- Task complete (with receipt)
+- Blocked and need help (with BLOCKED protocol)
+- Found issue requiring decision
+- Daily status if working multi-day task
 
-CAMBER-1 is review + block:
-- can BLOCK merges/deploys on stopline violations.
+**GPT-DEV-* (code writers):**
+- Write code only: diffs + PR descriptions + test steps + rollback notes
+- No deploys
 
-Chad is referee only:
-- resolves tradeoffs and conflicts, no execution tasks.
+**DATA-1 (database owner):**
+- Migrations/constraints/indexes/views/RPCs
+- Post-deploy measurement
+
+**CAMBER-1 (reviewer + blocker):**
+- Can BLOCK merges/deploys on stopline violations
+
+**Chad (referee only):**
+- Resolves tradeoffs and conflicts, no execution tasks
 
 ---
 
 ## C) TRAM + async comms protocol (enforced)
 
-TRAM path (messages + downloads):
+**TRAM path (check daily):**
 `/Users/chadbarlow/Library/CloudStorage/GoogleDrive-admin@heartwoodcustombuilders.com/My Drive/_camber/Camber/01_TRAM/`
 
-TRAM message filename format:
-`{TO}_{FROM}_{YYYYMMDDTHHMM}Z_{SUBJECT}.md`
+**TRAM message filename format:**
+`to_{TO}_from_{FROM}_{YYYYMMDDTHHMM}Z_{SUBJECT}.md`
 
-Rules:
-- First token (TO) is the recipient so Chad can route without opening.
-- ≤50 words narration (code blocks don’t count).
+Example: `to_STRAT_from_DEV_20260131T2045Z_pr18_merged_ready_for_review.md`
+
+**Message header (first line):**
+```
+TO:STRAT FROM:DEV TURN:5 TS_UTC:2026-01-31T20:45Z RECEIPT:PR#18/headSHA:d5dd14c/CI:pass
+```
+
+**Rules:**
+- First token (TO) is the recipient so Chad can route without opening
+- ≤50 words narration (code blocks don't count)
 - Use tags:
   - `⚡ CHAD:` needs a human decision
   - `🚫 BLOCKED:` cannot proceed
   - `✅ DONE:` task complete
 
-BLOCKED protocol:
-1) what is blocked
-2) why
-3) what decision/info unblocks
-4) who can unblock
-No guesswork and no workarounds.
+**When to write TO:STRAT:**
+1. Task complete → include receipt (commit SHA, PR number, deploy slug)
+2. Blocked → use BLOCKED protocol below
+3. Daily progress → if multi-day task
+4. Found issue → needs decision
+
+**BLOCKED protocol (mandatory when stuck):**
+1. What is blocked
+2. Why
+3. What decision/info unblocks
+4. Who can unblock (usually STRAT)
+
+**No guesswork. No workarounds.** If blocked, write TO:STRAT immediately.
+
+**Example BLOCKED message:**
+```markdown
+TO:STRAT FROM:DEV TURN:12 TS_UTC:2026-02-01T14:30Z RECEIPT:blocked
+
+🚫 BLOCKED: Cannot complete chunking fallback
+
+1. What: Phase 1 P0 task (chunking retry + fallback)
+2. Why: Unclear if fallback should use speaker-turn or paragraph-based split
+3. Unblocks: Decision on fallback algorithm (speaker-turn vs paragraph vs fixed-char)
+4. Who: STRAT (owns acceptance criteria)
+
+Awaiting guidance.
+```
 
 ---
 
