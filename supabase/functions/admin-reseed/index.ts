@@ -429,7 +429,7 @@ Deno.serve(async (req: Request) => {
       });
 
       if (!llmResp.ok) {
-        const errBody = await llmResp.text().catch(() => "");
+        const _errBody = await llmResp.text().catch(() => "");
         structuredLog("ERROR", "reseed_segment_error", requestId, interaction_id, newGeneration, {
           error_code: `http_${llmResp.status}`,
           error_class: "segment_llm_http_error",
@@ -578,7 +578,7 @@ Deno.serve(async (req: Request) => {
     const repaired: SegmentFromLLM[] = [];
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
-      let start = Math.max(cursor, seg.char_start);
+      const start = Math.max(cursor, seg.char_start);
       let end = Math.max(start, seg.char_end);
       if (i === segments.length - 1) end = transcript.length;
       if (start === end) continue;
@@ -659,7 +659,7 @@ Deno.serve(async (req: Request) => {
         return jsonResponse({ ok: false, error: "db_write_failed", detail: ins1.error.message }, 500);
       }
 
-      const spanRowsNoMetadata = spanRowsWithMetadata.map(({ segment_metadata, ...rest }) => rest);
+      const spanRowsNoMetadata = spanRowsWithMetadata.map(({ segment_metadata: _segment_metadata, ...rest }) => rest);
       const ins2 = await db
         .from("conversation_spans")
         .insert(spanRowsNoMetadata as any)
