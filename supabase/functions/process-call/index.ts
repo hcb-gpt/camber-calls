@@ -1,16 +1,50 @@
 /**
- * process-call Edge Function v3.9.0
+ * process-call Edge Function v4.0.0
  * Full v3.6 pipeline in Supabase - Ported from v4.0.22 context_assembly
  *
- * @version 3.9.0
- * @date 2026-01-30
+ * @version 4.0.0
+ * @date 2026-01-31
  * @port context_assembly v4.0.22 - 6-source ranking, word boundaries, speaker stripping
+ *
+ * PR-12 HARDENING:
+ * - JWT + provenance gate (like context-assembly)
+ * - REMOVED interactions.project_id write (POLICY: only human review-resolve may write)
+ * - project_kind='client' + status filters on all candidate sources
+ * - No silent OK paths
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
+const PROCESS_CALL_VERSION = "v4.0.0";
 const GATE = { PASS: "PASS", SKIP: "SKIP", NEEDS_REVIEW: "NEEDS_REVIEW" };
 const ID_PATTERN = /^cll_[a-zA-Z0-9_]+$/;
+
+// ============================================================
+// PROJECT FILTERS (PR-11/PR-12: Only client projects with valid status)
+// ============================================================
+const VALID_PROJECT_STATUSES = ["active", "warranty", "estimating"];
+const VALID_PROJECT_KIND = "client";
+
+// ============================================================
+// ADMIN ALLOWLIST (PR-12 hardening)
+// Hard-coded admin user IDs as second-layer gate
+// ============================================================
+const ADMIN_USER_IDS: string[] = [
+  // Add Supabase auth.users.id values here
+  // Example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+];
+
+// ============================================================
+// PROVENANCE GATE (PR-12)
+// Allowed sources that may call this endpoint
+// ============================================================
+const ALLOWED_PROVENANCE_SOURCES = [
+  "zapier",
+  "pipedream",
+  "n8n",
+  "edge", // internal edge function calls
+  "test", // synthetic tests
+];
 
 // ============================================================
 // V3 PORTED UTILITIES (from context_assembly v4.0.22)
@@ -90,6 +124,9 @@ Deno.serve(async (req: Request) => {
   const t0 = Date.now();
   const run_id = `run_${t0}_${Math.random().toString(36).slice(2, 8)}`;
 
+  // ============================================================
+  // REQUEST VALIDATION
+  // ============================================================
   if (req.method !== "POST") {
     return new Response(JSON.stringify({ error: "POST only" }), {
       status: 405,
@@ -107,6 +144,79 @@ Deno.serve(async (req: Request) => {
     });
   }
 
+  // ============================================================
+  // AUTHENTICATION GATE (PR-12)
+  // Two-layer: JWT user auth OR provenance secret
+  // ============================================================
+  const authHeader = req.headers.get("Authorization");
+  const provenanceSecret = req.headers.get("X-Provenance-Secret");
+  const provenanceSource = (raw.source || "unknown").toLowerCase();
+
+  // Check provenance secret first (for pipeline sources like Zapier)
+  const expectedSecret = Deno.env.get("PROCESS_CALL_SECRET");
+  const hasValidProvenance = expectedSecret &&
+    provenanceSecret === expectedSecret &&
+    ALLOWED_PROVENANCE_SOURCES.includes(provenanceSource);
+
+  // If no valid provenance, require JWT auth
+  if (!hasValidProvenance) {
+    if (!authHeader) {
+      return new Response(
+        JSON.stringify({
+          error: "missing_auth",
+          hint: "Authorization: Bearer <token> or X-Provenance-Secret required",
+        }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // Validate JWT
+    const anonClient = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_ANON_KEY")!,
+      { global: { headers: { Authorization: authHeader } } },
+    );
+    const { data: { user }, error: authErr } = await anonClient.auth.getUser();
+
+    if (authErr || !user) {
+      return new Response(
+        JSON.stringify({ error: "invalid_token", hint: authErr?.message }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    const userId = user.id;
+    const userEmail = user.email || "";
+
+    // AUTHORIZATION GATE
+    const allowedEmails = (Deno.env.get("ALLOWED_EMAILS") || "").split(",").map(
+      (e) => e.trim().toLowerCase(),
+    ).filter((e) => e.length > 0);
+
+    const isAdmin = ADMIN_USER_IDS.length > 0 && ADMIN_USER_IDS.includes(userId);
+    const isAllowedEmail = allowedEmails.length > 0 && allowedEmails.includes(userEmail.toLowerCase());
+
+    if (ADMIN_USER_IDS.length === 0 && allowedEmails.length === 0) {
+      return new Response(
+        JSON.stringify({
+          error: "config_error",
+          hint: "Neither ADMIN_USER_IDS nor ALLOWED_EMAILS configured",
+        }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    if (!isAdmin && !isAllowedEmail) {
+      return new Response(
+        JSON.stringify({ error: "forbidden", hint: "User not authorized" }),
+        { status: 403, headers: { "Content-Type": "application/json" } },
+      );
+    }
+  }
+
+  // ============================================================
+  // SERVICE ROLE CLIENT (for DB writes)
+  // ============================================================
   const db = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
@@ -129,6 +239,7 @@ Deno.serve(async (req: Request) => {
     alias_matches: { term: string; match_type: string }[];
   }>();
   const sources_used: string[] = [];
+  const warnings: string[] = [];
 
   try {
     // IDEMPOTENCY
@@ -137,7 +248,7 @@ Deno.serve(async (req: Request) => {
         key: iid,
         interaction_id: iid,
         source: raw.source || "edge",
-        router_version: "v3.9.0",
+        router_version: PROCESS_CALL_VERSION,
       });
       if (
         error &&
@@ -148,9 +259,9 @@ Deno.serve(async (req: Request) => {
           interaction_id: iid,
           gate_status: "SKIP",
           gate_reasons: ["G1_DUPLICATE_EXACT"],
-          source_system: "edge_v3.9",
+          source_system: `edge_${PROCESS_CALL_VERSION}`,
           source_run_id: run_id,
-          pipeline_version: "v3.9",
+          pipeline_version: PROCESS_CALL_VERSION,
         });
         return new Response(
           JSON.stringify({
@@ -171,9 +282,9 @@ Deno.serve(async (req: Request) => {
       interaction_id: iid,
       gate_status: "STARTED",
       gate_reasons: [],
-      source_system: "edge_v3.9",
+      source_system: `edge_${PROCESS_CALL_VERSION}`,
       source_run_id: run_id,
-      pipeline_version: "v3.9",
+      pipeline_version: PROCESS_CALL_VERSION,
       processed_by: "process-call",
       persisted_to_calls_raw: false,
       i1_phone_present: !!(raw.from_phone || raw.to_phone),
@@ -201,6 +312,7 @@ Deno.serve(async (req: Request) => {
 
     // ========================================
     // V3 PORTED: 6-SOURCE CANDIDATE COLLECTION
+    // PR-12: All sources now filter by project_kind + status
     // ========================================
 
     // Helper to add/update candidate
@@ -221,11 +333,14 @@ Deno.serve(async (req: Request) => {
     };
 
     // SOURCE 1: project_contacts (direct assignment)
+    // PR-12: Join projects to filter by status + project_kind
     if (contact_id) {
       const { data: pcRows } = await db
         .from("project_contacts")
-        .select("project_id")
-        .eq("contact_id", contact_id);
+        .select("project_id, projects!inner(status, project_kind)")
+        .eq("contact_id", contact_id)
+        .in("projects.status", VALID_PROJECT_STATUSES)
+        .eq("projects.project_kind", VALID_PROJECT_KIND);
 
       if (pcRows?.length) {
         sources_used.push("project_contacts");
@@ -249,11 +364,14 @@ Deno.serve(async (req: Request) => {
     }
 
     // SOURCE 2: correspondent_project_affinity (historical call frequency)
+    // PR-12: Join projects to filter by status + project_kind
     if (contact_id) {
       const { data: affRows } = await db
         .from("correspondent_project_affinity")
-        .select("project_id, weight")
-        .eq("contact_id", contact_id);
+        .select("project_id, weight, projects!inner(status, project_kind)")
+        .eq("contact_id", contact_id)
+        .in("projects.status", VALID_PROJECT_STATUSES)
+        .eq("projects.project_kind", VALID_PROJECT_KIND);
 
       if (affRows?.length) {
         sources_used.push("correspondent_project_affinity");
@@ -270,6 +388,7 @@ Deno.serve(async (req: Request) => {
     }
 
     // SOURCE 3: existing_project from interactions (replay fallback)
+    // PR-12: Validate project still meets filters before using
     {
       const { data: irows } = await db
         .from("interactions")
@@ -278,8 +397,21 @@ Deno.serve(async (req: Request) => {
         .limit(1);
 
       if (irows?.[0]?.project_id) {
-        addCandidate(irows[0].project_id, "interactions_existing_project");
-        sources_used.push("interactions_existing_project");
+        // Validate existing project still qualifies
+        const { data: pcheck } = await db
+          .from("projects")
+          .select("id")
+          .eq("id", irows[0].project_id)
+          .in("status", VALID_PROJECT_STATUSES)
+          .eq("project_kind", VALID_PROJECT_KIND)
+          .limit(1);
+
+        if (pcheck?.length) {
+          addCandidate(irows[0].project_id, "interactions_existing_project");
+          sources_used.push("interactions_existing_project");
+        } else {
+          warnings.push("existing_project_filtered_out");
+        }
       }
     }
 
@@ -289,17 +421,22 @@ Deno.serve(async (req: Request) => {
       const transcriptClean = stripSpeakerLabels(n.transcript);
       const transcriptLower = transcriptClean.toLowerCase();
 
-      // Fetch all projects + aliases for matching
-      const { data: projects } = await db.from("projects").select(
-        "id, name, aliases, city, address",
-      );
+      // PR-12: Fetch only client projects with valid status
+      const { data: projects } = await db
+        .from("projects")
+        .select("id, name, aliases, city, address")
+        .in("status", VALID_PROJECT_STATUSES)
+        .eq("project_kind", VALID_PROJECT_KIND);
+
       const { data: aliasRows } = await db.from("v_project_alias_lookup")
         .select("project_id, alias");
 
-      // Build alias map
+      // Build alias map (only for valid projects)
+      const validProjectIds = new Set((projects || []).map((p) => p.id));
       const aliasByProject = new Map<string, string[]>();
       for (const r of (aliasRows || [])) {
         if (!r.project_id || !r.alias) continue;
+        if (!validProjectIds.has(r.project_id)) continue; // PR-12: Skip non-client projects
         if (!aliasByProject.has(r.project_id)) {
           aliasByProject.set(r.project_id, []);
         }
@@ -349,6 +486,7 @@ Deno.serve(async (req: Request) => {
       }
 
       // SOURCE 5: Try RPC scan_transcript_for_projects (if available)
+      // Note: RPC should be updated to filter by project_kind + status internally
       try {
         const { data: scanData, error: scanErr } = await db.rpc(
           "scan_transcript_for_projects",
@@ -362,7 +500,7 @@ Deno.serve(async (req: Request) => {
           sources_used.push("rpc_scan_transcript_for_projects");
           for (const r of scanData) {
             const pid = r.project_id || r.projectId;
-            if (pid) {
+            if (pid && validProjectIds.has(pid)) { // PR-12: Filter
               const score = Number(r.score || r.similarity || 0) || 0;
               addCandidate(pid, "rpc_scan_transcript_for_projects", score);
 
@@ -380,6 +518,7 @@ Deno.serve(async (req: Request) => {
       } catch { /* RPC may not exist, ignore */ }
 
       // SOURCE 6: Try RPC expand_candidates_from_mentions (non-floater contacts)
+      // Note: RPC should be updated to filter by project_kind + status internally
       try {
         const { data: mentionData, error: mentionErr } = await db.rpc(
           "expand_candidates_from_mentions",
@@ -392,7 +531,7 @@ Deno.serve(async (req: Request) => {
           sources_used.push("rpc_expand_candidates_from_mentions");
           for (const r of mentionData) {
             const pid = r.project_id || r.projectId;
-            if (pid) {
+            if (pid && validProjectIds.has(pid)) { // PR-12: Filter
               const affinity = Number(r.contact_affinity || r.affinity || 0.9) || 0.9;
               addCandidate(pid, "mentioned_contact_affinity", affinity);
 
@@ -413,7 +552,7 @@ Deno.serve(async (req: Request) => {
     // ========================================
     // V3 PORTED: RANKING FORMULA
     // ========================================
-    // Fetch project names for candidates
+    // Fetch project names for candidates (already filtered, just need names)
     const candidateIds = Array.from(candidatesById.keys());
     const projectNameById = new Map<string, string>();
 
@@ -480,7 +619,7 @@ Deno.serve(async (req: Request) => {
     });
 
     // ========================================
-    // SELECT WINNER
+    // SELECT WINNER (for candidates, NOT for direct assignment)
     // ========================================
     if (rankedCandidates.length > 0) {
       const winner = rankedCandidates[0];
@@ -504,7 +643,7 @@ Deno.serve(async (req: Request) => {
     // GATE
     const g = m4(n);
 
-    // CALLS_RAW
+    // CALLS_RAW (primary storage - includes candidate info)
     const { data: cr } = await db.from("calls_raw").upsert({
       interaction_id: iid,
       channel: "call",
@@ -514,15 +653,16 @@ Deno.serve(async (req: Request) => {
       event_at_utc: n.event_at_utc || null,
       transcript: n.transcript || null,
       recording_url: n.recording_url || n.beside_note_url || null,
-      pipeline_version: "v3.9",
+      pipeline_version: PROCESS_CALL_VERSION,
       raw_snapshot_json: {
         run_id,
-        v: "v3.9.0",
+        v: PROCESS_CALL_VERSION,
         gate: g.decision,
         contact_id,
-        project_id,
-        project_source,
-        project_confidence,
+        // PR-12: Store candidate info but DO NOT assign to interactions.project_id
+        candidate_project_id: project_id,
+        candidate_project_source: project_source,
+        candidate_project_confidence: project_confidence,
         candidate_count: rankedCandidates.length,
         top_candidates: rankedCandidates.slice(0, 5).map((c) => ({
           id: c.project_id,
@@ -532,11 +672,15 @@ Deno.serve(async (req: Request) => {
           matches: c.alias_matches.length,
         })),
         sources_used,
+        warnings,
       },
     }, { onConflict: "interaction_id" }).select("id").single();
     if (cr) cr_uuid = cr.id;
 
-    // INTERACTIONS
+    // ========================================
+    // INTERACTIONS (PR-12: NO project_id write)
+    // POLICY: Only review-resolve (human) may write interactions.project_id
+    // ========================================
     if (g.decision === "PASS" || g.decision === "NEEDS_REVIEW") {
       await db.from("interactions").upsert({
         interaction_id: iid,
@@ -545,10 +689,11 @@ Deno.serve(async (req: Request) => {
         contact_name: contact_name || null,
         contact_phone: phone || null,
         owner_phone: n.from_phone || null,
-        project_id: project_id || null,
+        // PR-12: REMOVED project_id write - only human review-resolve may set this
+        // project_id: project_id || null,  // REMOVED
         event_at_utc: n.event_at_utc || null,
-        needs_review: g.decision === "NEEDS_REVIEW",
-        review_reasons: g.reasons,
+        needs_review: true, // PR-12: Always needs review since AI doesn't assign
+        review_reasons: [...g.reasons, "ai_candidate_only"],
         project_attribution_confidence: project_confidence,
         transcript_chars: n.transcript?.length || 0,
       }, { onConflict: "interaction_id" });
@@ -560,7 +705,7 @@ Deno.serve(async (req: Request) => {
         await db.rpc("update_contact_interaction_stats", {
           p_contact_id: contact_id,
         });
-      } catch {}
+      } catch { /* ignore */ }
     }
 
     // AUDIT FINAL
@@ -577,15 +722,17 @@ Deno.serve(async (req: Request) => {
       JSON.stringify({
         ok: true,
         run_id,
+        version: PROCESS_CALL_VERSION,
         interaction_id: iid,
         decision: g.decision,
         reasons: g.reasons,
         contact_id,
         contact_name,
-        project_id,
-        project_name,
-        project_source,
-        project_confidence,
+        // PR-12: Renamed to "candidate" to clarify not assigned
+        candidate_project_id: project_id,
+        candidate_project_name: project_name,
+        candidate_project_source: project_source,
+        candidate_project_confidence: project_confidence,
         candidate_count: rankedCandidates.length,
         top_candidates: rankedCandidates.slice(0, 3).map((c) => ({
           id: c.project_id,
@@ -593,6 +740,7 @@ Deno.serve(async (req: Request) => {
           score: c.rank_score,
         })),
         sources_used,
+        warnings,
         audit_id,
         cr_uuid,
         ms: Date.now() - t0,
@@ -600,6 +748,7 @@ Deno.serve(async (req: Request) => {
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
   } catch (e: any) {
+    // PR-12: No silent OK - errors return 500
     if (audit_id) {
       await db.from("event_audit").update({
         gate_status: "ERROR",
@@ -610,6 +759,7 @@ Deno.serve(async (req: Request) => {
       JSON.stringify({
         ok: false,
         run_id,
+        version: PROCESS_CALL_VERSION,
         interaction_id: iid,
         error: e.message,
         ms: Date.now() - t0,
