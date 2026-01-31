@@ -17,7 +17,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const SEGMENT_CALL_VERSION = "v1.3.1";
+const SEGMENT_CALL_VERSION = "v1.4.0";
 
 // ============================================================
 // AUTH CONFIGURATION
@@ -71,20 +71,26 @@ Deno.serve(async (req: Request) => {
     edgeSecretHeader === expectedSecret &&
     ALLOWED_PROVENANCE_SOURCES.includes(provenanceSource);
 
-  // Auth path 2: JWT + ALLOWED_EMAILS
+  // Auth path 2: JWT + ALLOWED_EMAILS (with signature verification via auth.getUser)
   let hasValidJwt = false;
+  let verifiedEmail = "";
   if (!hasValidEdgeSecret && authHeader?.startsWith("Bearer ")) {
-    const token = authHeader.slice(7);
-    try {
-      // Decode JWT to check email (basic validation - Supabase verifies signature)
-      const payload = JSON.parse(atob(token.split(".")[1]));
-      const allowedEmails = (Deno.env.get("ALLOWED_EMAILS") || "").split(",").map((e) => e.trim());
-      hasValidJwt = allowedEmails.includes(payload.email);
+    // Use Supabase auth.getUser() to verify JWT signature (not just decode)
+    const anonClient = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_ANON_KEY")!,
+      { global: { headers: { Authorization: authHeader } } },
+    );
+    const { data: { user }, error: authErr } = await anonClient.auth.getUser();
+
+    if (!authErr && user?.email) {
+      const allowedEmails = (Deno.env.get("ALLOWED_EMAILS") || "").split(",").map((e) => e.trim().toLowerCase());
+      const userEmail = user.email.toLowerCase();
+      hasValidJwt = allowedEmails.includes(userEmail);
       if (hasValidJwt) {
-        console.log(`[segment-call] JWT auth passed for: ${payload.email}`);
+        verifiedEmail = userEmail;
+        console.log(`[segment-call] JWT auth passed for: ${verifiedEmail}`);
       }
-    } catch {
-      // Invalid JWT format
     }
   }
 
