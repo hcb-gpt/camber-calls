@@ -30,7 +30,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const ASSEMBLY_VERSION = "v1.2.5";
+const ASSEMBLY_VERSION = "v1.2.8";
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_TRANSCRIPT_CHARS = 8000;
@@ -39,6 +39,21 @@ const MAX_ALIAS_TERMS_PER_PROJECT = 25;
 // Geo candidate constants
 const GEO_MAX_DISTANCE_KM = 50; // Only consider projects within 50km
 const GEO_MAX_CANDIDATES = 5; // Cap geo candidates to prevent flooding
+
+// PR-11: Project status filter - only include active client projects
+const VALID_PROJECT_STATUSES = ["active", "warranty", "estimating"];
+// PR-11 (STRAT TURN14): Filter by project_kind to exclude internal/owner projects
+const VALID_PROJECT_KIND = "client";
+
+// ============================================================
+// ADMIN ALLOWLIST (PR-10 hardening)
+// Hard-coded admin user IDs as second-layer gate
+// REQUIRED: At least one of ADMIN_USER_IDS or ALLOWED_EMAILS must match
+// ============================================================
+const ADMIN_USER_IDS: string[] = [
+  // Add Supabase auth.users.id values here
+  // Example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+];
 
 // ============================================================
 // ENROUTE VERB PATTERNS (STRAT-1 POLICY: VERB-DRIVEN ONLY)
@@ -350,21 +365,32 @@ Deno.serve(async (req: Request) => {
   }
 
   // ========================================
-  // ALLOWLIST GATE: Only permitted users (PR-9 hotfix)
-  // REQUIRED: ALLOWED_EMAILS must be set, else hard-deny
+  // AUTHORIZATION GATE (PR-10 hardening)
+  // Two-layer check: ADMIN_USER_IDS (hard-coded) OR ALLOWED_EMAILS (env)
+  // At least one gate must be configured; user must pass at least one
   // ========================================
   const allowedEmails = (Deno.env.get("ALLOWED_EMAILS") || "").split(",").map(
     (e) => e.trim().toLowerCase(),
   ).filter(Boolean);
-  if (allowedEmails.length === 0) {
+
+  const userEmail = (user.email || "").toLowerCase();
+  const userId = user.id;
+
+  // Check if user passes either gate
+  const isAdmin = ADMIN_USER_IDS.length > 0 && ADMIN_USER_IDS.includes(userId);
+  const isAllowedEmail = allowedEmails.length > 0 && allowedEmails.includes(userEmail);
+
+  // At least one gate must be configured
+  if (ADMIN_USER_IDS.length === 0 && allowedEmails.length === 0) {
     return new Response(
-      JSON.stringify({ error: "config_error", hint: "ALLOWED_EMAILS env not configured" }),
+      JSON.stringify({ error: "config_error", hint: "Neither ADMIN_USER_IDS nor ALLOWED_EMAILS configured" }),
       { status: 500, headers: { "Content-Type": "application/json" } },
     );
   }
-  const userEmail = (user.email || "").toLowerCase();
-  if (!allowedEmails.includes(userEmail)) {
-    return new Response(JSON.stringify({ error: "forbidden", hint: "User not in ALLOWED_EMAILS" }), {
+
+  // User must pass at least one gate
+  if (!isAdmin && !isAllowedEmail) {
+    return new Response(JSON.stringify({ error: "forbidden", hint: "User not authorized" }), {
       status: 403,
       headers: { "Content-Type": "application/json" },
     });
@@ -829,9 +855,12 @@ Deno.serve(async (req: Request) => {
             }
 
             // Find nearby projects (geo proximity candidates)
+            // PR-11: Join projects table to filter by status and project_kind
             const { data: projectGeos, error: geoErr } = await db
               .from("project_geo")
-              .select("project_id, lat, lon");
+              .select("project_id, lat, lon, projects!inner(status, project_kind)")
+              .in("projects.status", VALID_PROJECT_STATUSES)
+              .eq("projects.project_kind", VALID_PROJECT_KIND);
 
             if (!geoErr && projectGeos?.length) {
               const nearbyProjectsWithDistance = new Map<string, number>();
