@@ -1,0 +1,127 @@
+name: CAMBER Preflight
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - '.camber/**'
+      - 'supabase/functions/**'
+      - '.github/workflows/camber-preflight.yml'
+  push:
+    branches: [master, main]
+    paths:
+      - 'scripts/**'
+      - '.camber/**'
+
+jobs:
+  preflight:
+    name: Tool & Auth Preflight
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup CAMBER environment
+        run: |
+          mkdir -p ~/.camber/tools
+
+          # Install canonical tools if they exist in repo
+          if [ -d "scripts" ]; then
+            cp scripts/*.sh ~/.camber/tools/ 2>/dev/null || true
+            chmod +x ~/.camber/tools/*.sh 2>/dev/null || true
+          fi
+
+          # Install preflight script if it exists
+          if [ -f ".camber/preflight.sh" ]; then
+            cp .camber/preflight.sh ~/.camber/
+            chmod +x ~/.camber/preflight.sh
+          fi
+
+          # Create stub credentials for CI (not real secrets)
+          cat > ~/.camber/credentials.env << 'EOF'
+          SUPABASE_URL=https://test.supabase.co
+          SUPABASE_SERVICE_ROLE_KEY=stub_key_for_ci
+          EDGE_SHARED_SECRET=stub_secret_for_ci
+          ANTHROPIC_API_KEY=stub_api_key_for_ci
+          EOF
+          chmod 600 ~/.camber/credentials.env
+
+      - name: Run Tool Integrity Check
+        run: |
+          # Check all scripts are present
+          REQUIRED_TOOLS=(
+            "load-env.sh"
+            "test-credentials.sh"
+            "replay_call.sh"
+          )
+
+          MISSING=()
+          for tool in "${REQUIRED_TOOLS[@]}"; do
+            if [ ! -f "scripts/$tool" ]; then
+              MISSING+=("$tool")
+            fi
+          done
+
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "❌ Missing required tools: ${MISSING[*]}"
+            echo "Required tools must exist in scripts/ directory"
+            echo "Fix: ~/.camber/install-tools.sh"
+            exit 1
+          fi
+
+          echo "✅ All required tools present"
+
+      - name: Run Auth Pattern Validation
+        run: |
+          # Check for common auth anti-patterns in edge functions
+          ERRORS=0
+
+          # Check 1: Functions should not hardcode URLs
+          if grep -r "https://.*\.supabase\.co" supabase/functions/ --include="*.ts" 2>/dev/null; then
+            echo "❌ Found hardcoded Supabase URLs"
+            echo "Use: Deno.env.get('SUPABASE_URL')"
+            ((ERRORS++))
+          fi
+
+          # Check 2: Internal calls should have both auth headers
+          if grep -r "fetch.*functions/v1" supabase/functions/ --include="*.ts" 2>/dev/null | grep -v "Authorization.*Bearer" | head -5; then
+            echo "⚠️  Found internal function calls - verify both auth headers present"
+            echo "Required: Authorization: Bearer \${serviceKey} AND X-Edge-Secret"
+            echo "See: CLAUDE.md lines 190-210"
+          fi
+
+          # Check 3: Scripts should use proper credential loading
+          if [ -d "scripts" ]; then
+            for script in scripts/*.sh; do
+              if [ -f "$script" ] && grep -q "curl.*SUPABASE_URL" "$script" 2>/dev/null; then
+                if ! grep -q "load-env.sh\|load-credentials.sh" "$script"; then
+                  echo "⚠️  $script uses credentials but doesn't load them"
+                  echo "Add: source \$(git rev-parse --show-toplevel)/scripts/load-env.sh"
+                fi
+              fi
+            done
+          fi
+
+          if [ $ERRORS -gt 0 ]; then
+            exit 1
+          fi
+
+          echo "✅ Auth patterns validated"
+
+      - name: Check Tool Sync Documentation
+        run: |
+          # If tools were modified, PR description should mention sync protocol
+          if git diff --name-only origin/master...HEAD 2>/dev/null | grep -q "^scripts/"; then
+            echo "⚠️  Scripts modified in this PR"
+            echo "Remember to sync to canonical after merge:"
+            echo "  cd repo && ~/.camber/sync-tools.sh --from-repo"
+          fi
+
+      - name: Preflight Status
+        run: |
+          if [ -f ~/.camber/preflight.sh ]; then
+            ~/.camber/preflight.sh --tools-only
+          else
+            echo "✅ Basic checks passed (preflight.sh not available in CI)"
+          fi
