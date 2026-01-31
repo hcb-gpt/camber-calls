@@ -30,7 +30,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const ASSEMBLY_VERSION = "v1.2.0";
+const ASSEMBLY_VERSION = "v1.2.1";
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_TRANSCRIPT_CHARS = 8000;
@@ -337,11 +337,13 @@ Deno.serve(async (req: Request) => {
 
     if (!span_id && body.interaction_id) {
       const span_index = body.span_index ?? 0;
+      // POLICY: Active spans only (is_superseded=false)
       const { data: spanRow } = await db
         .from("conversation_spans")
         .select("id, interaction_id")
         .eq("interaction_id", body.interaction_id)
         .eq("span_index", span_index)
+        .eq("is_superseded", false)
         .single();
 
       if (spanRow) {

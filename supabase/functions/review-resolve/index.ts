@@ -2,9 +2,9 @@
  * review-resolve Edge Function
  * Human resolution endpoint for pending review items
  *
- * @version 3.0.0
- * @date 2026-01-30
- * @purpose Close the product loop: human resolves pending item → SSOT + audit updated
+ * @version 3.1.0
+ * @date 2026-01-31
+ * @purpose Close the product loop: human resolves pending item -> SSOT + audit updated
  *
  * IMPLEMENTATION: Calls resolve_review_item() RPC for single-transaction atomicity
  *
@@ -21,7 +21,11 @@
  * - Idempotency: duplicate resolve = no-op (return success)
  * - Failures must return non-200 + raise exception (txn rollback)
  * - All writes in single transaction (RPC handles this)
- * - Actor extracted from JWT (no hardcoded values)
+ * - Actor verified via supabase.auth.getUser() (NEVER decode JWT manually)
+ *
+ * AUTH (v3.1.0 fix):
+ * - User-facing endpoint: verify_jwt=true + supabase.auth.getUser()
+ * - NEVER decode JWT payload via atob - that violates security policy
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -59,7 +63,8 @@ Deno.serve(async (req: Request) => {
   }
 
   // ========================================
-  // 2. EXTRACT ACTOR FROM JWT
+  // 2. VERIFY USER VIA SUPABASE AUTH
+  // (NEVER decode JWT manually - security policy)
   // ========================================
   const authHeader = req.headers.get("Authorization");
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
@@ -67,35 +72,33 @@ Deno.serve(async (req: Request) => {
   }
 
   const token = authHeader.replace("Bearer ", "");
-  let user_id: string;
 
-  try {
-    // Decode JWT payload (base64url)
-    const payloadB64 = token.split(".")[1];
-    if (!payloadB64) {
-      throw new Error("Invalid JWT format");
-    }
-    const payload = JSON.parse(atob(payloadB64.replace(/-/g, "+").replace(/_/g, "/")));
+  // Create client with user's token to verify it
+  const userClient = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_ANON_KEY")!,
+    {
+      global: {
+        headers: { Authorization: `Bearer ${token}` },
+      },
+    },
+  );
 
-    // Extract user identifier: prefer sub, fallback to email
-    user_id = payload.sub || payload.email || null;
+  // Verify JWT signature and get user
+  const { data: { user }, error: authError } = await userClient.auth.getUser();
 
-    if (!user_id) {
-      return jsonResponse({
-        error: "jwt_missing_user_id",
-        detail: "JWT must contain sub or email claim",
-      }, 401);
-    }
-  } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "Unknown error";
+  if (authError || !user) {
+    console.error("[review-resolve] Auth verification failed:", authError?.message);
     return jsonResponse({
-      error: "jwt_decode_failed",
-      detail: message,
+      error: "auth_verification_failed",
+      detail: authError?.message || "Invalid or expired token",
     }, 401);
   }
 
+  const user_id = user.id;
+
   // ========================================
-  // 3. INIT DB CLIENT
+  // 3. INIT SERVICE ROLE DB CLIENT
   // ========================================
   const db = createClient(
     Deno.env.get("SUPABASE_URL")!,
