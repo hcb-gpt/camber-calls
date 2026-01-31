@@ -62,6 +62,7 @@ interface ReseedReceipt {
 
 Deno.serve(async (req: Request) => {
   const t0 = Date.now();
+  console.log(`[admin-reseed ${VERSION}] Processing request`);
 
   // ========================================
   // 1. AUTH: X-Edge-Secret + source allowlist
