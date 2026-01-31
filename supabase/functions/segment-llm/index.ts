@@ -268,7 +268,7 @@ Deno.serve(async (req: Request) => {
   let parsed: { segments?: Segment[] };
   try {
     parsed = JSON.parse(rawContent);
-  } catch (parseErr) {
+  } catch (_parseErr) {
     console.error(`[segment-llm] JSON parse failed: ${rawContent.slice(0, 200)}`);
     return fallbackResponse(transcriptLength, ["llm_parse_error_json"], t0);
   }
