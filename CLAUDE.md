@@ -1,20 +1,68 @@
 # CLAUDE.md — CAMBER v4 Operating Manual
 
-This is the single “boot + contract” doc for v4. If it’s not here, it’s not a rule.
+This is the single "boot + contract" doc for v4. If it's not here, it's not a rule.
 Status codes are not proof. DB deltas are proof.
+
+---
+
+## NEW DEV FAST START (read this first)
+
+### Canonical Call (everyone uses the same target)
+**interaction_id:** `cll_06DSX0CVZHZK72VCVW54EH9G3C`
+
+This is the real call we use for all proof + replay work.
+
+### One Command to Validate Pipeline
+```bash
+./scripts/replay_call.sh cll_06DSX0CVZHZK72VCVW54EH9G3C --reseed --reroute
+```
+
+### Strict PASS Template (paste exactly)
+```
+PASS | cll_06DSX0CVZHZK72VCVW54EH9G3C | gen=<n> spans_total=<n> spans_active=<n> attributions=<n> review_queue=<n> gap=<n> reseeds=<n> | headSHA=<sha>
+```
+
+### Current Reality & Next Gate
+- Proof pack is **PASS** on canonical call
+- BUT chunking collapses to single span: `spans_total=1 spans_active=1` (transcript ~10k chars)
+- **Next gate:** Make `spans_total > 1` without breaking PASS
+- Currently warn-only, will become strict gate once fixed
+
+### P0 Task: Fix Chunking
+**Where:** `supabase/functions/segment-llm` + `supabase/functions/segment-call`
+
+**Required behavior:**
+- If `transcript_chars > 2000` AND chunker returns 1 span:
+  1. Retry with stricter instruction ("must produce at least 2 chunks unless truly single-topic")
+  2. If still 1: deterministic fallback split into 2-4 spans by char ranges
+  3. Mark fallback in span metadata (`segment_metadata.fallback=true`)
+
+**Testing with idempotency:** Use `admin-reseed` with reroute to generate new generation (canonical call already has attributions, so segment-call may refuse re-chunk due to `already_attributed` rule).
+
+**Acceptance:** Canonical call PASS line shows `spans_total > 1` AND `gap=0`.
+
+### Vocabulary Rule
+- **In prose/logs/comments:** say "chunking" / "rechunk"
+- **Legacy slugs remain:** `segment-call`, `segment-llm`, `segment_generation` (don't rename routes mid-sprint)
+
+### Credential Protocol (mandatory before everything)
+```bash
+./scripts/test-credentials.sh
+```
+All scripts MUST source: `scripts/load-env.sh` (CI enforced).
 
 ---
 
 ## Environment Stamp (required on every substantive edit)
 
 Repo:
-- org/repo:
-- branch:
-- HEAD (sha + subject):
+- org/repo: hcb-gpt/beside-v3.8
+- branch: master
+- HEAD (sha + subject): 4811106 Merge pull request #18 from hcb-gpt/merge-all-branches-to-master
 Supabase:
-- project ref:
-- functions deployed (names only):
-Stamp Date (UTC):
+- project ref: rjhdwidddtfetbwqolof
+- functions deployed (names only): process-call, segment-call, segment-llm, context-assembly, ai-router, admin-reseed, eval-ai-router, transcribe-deepgram, transcribe-assemblyai, transcribe-claude, transcribe-whisper, transcribe-audio, review-resolve, sync-google-contacts, test-tma-fetch, dlq-enqueue
+Stamp Date (UTC): 2026-01-31T19:57Z
 
 ---
 
@@ -105,7 +153,33 @@ Valid review targeting:
 
 ---
 
-## E) Anti-drift protocol (v2)
+## E) Credential management (established 2026-01-31)
+
+**Central credential store:** `~/.camber/credentials.env` (chmod 600)
+
+All credentials auto-load in new shells via `~/.zshrc`. Scripts should source:
+```bash
+source "$(git rev-parse --show-toplevel)/scripts/load-env.sh"
+```
+
+Available credentials:
+- SUPABASE_URL
+- SUPABASE_SERVICE_ROLE_KEY
+- EDGE_SHARED_SECRET
+- ANTHROPIC_API_KEY
+- OPENAI_API_KEY
+- DEEPGRAM_API_KEY
+- ASSEMBLYAI_API_KEY
+- PIPEDREAM_API_KEY
+- CLI (Supabase access token)
+
+**Never commit credentials to git.** All `.env.local` files are gitignored.
+
+Documentation: `~/.camber/README.md` and `CREDENTIALS.md` in repo.
+
+---
+
+## F) Anti-drift protocol (v2)
 
 Drift = prod (runtime) differs from git (reviewable truth).
 
@@ -131,7 +205,7 @@ Drift is closed only when BOTH are true:
 
 ---
 
-## F) v4 Sprint 0 deliverable — LLM segmenter
+## G) v4 Sprint 0 deliverable — LLM segmenter
 
 ### Problem statement
 Current segmenting is trivial (1 call = 1 span). Multi-project calls get forced into one attribution. v4 fixes that by segmenting into multiple spans before routing.
@@ -193,7 +267,7 @@ Segmenter never does:
 
 ---
 
-## G) Orchestration (call → N spans → N attributions)
+## H) Orchestration (call → N spans → N attributions)
 
 Chain:
 `process-call → segment-call → segment-llm → (for each span) context-assembly → ai-router`
@@ -214,7 +288,7 @@ DB note:
 
 ---
 
-## H) Attribution uniqueness decision gate (DATA-A + DATA-1)
+## I) Attribution uniqueness decision gate (DATA-A + DATA-1)
 
 We must choose and enforce ONE meaning:
 
@@ -234,7 +308,7 @@ Until decided: do not change constraints silently; document which option is acti
 
 ---
 
-## I) Acceptance tests (DEV executes)
+## J) Acceptance tests (DEV executes)
 
 Synthetic multi-project (forced switch):
 - Use a transcript with an explicit switch (“Now about Hurley… also Skelton…”)
@@ -270,4 +344,76 @@ Success criteria:
 
 Protocol marker:
 - You may write **CHAIN WRITE VERIFIED** only after the query above shows N spans and N attribution rows (or after a fail-closed 500 is observed with logged `error_code`).
+
+---
+
+## K) Phased Roadmap (STRAT TURN 79)
+
+### Phase 1: Fix Chunking Quality
+**Gate:** Canonical call shows `spans_total > 1` AND PASS
+
+**DEV tasks:**
+1. Make single-span on long transcripts self-correcting
+   - If `transcript_chars > 2000` AND chunker returns 1 span: retry with stricter instruction, then fallback to deterministic split
+   - Mark fallback in metadata
+2. Upgrade warning to controlled gate (after fix ships)
+   - Canonical call requires `spans_total > 1`
+   - Keep warn-only for other calls initially
+3. Re-run proof-pack with strict template
+
+**DATA-1 tasks:**
+1. Add `transcript_chars` to scoreboard output
+2. Add chunk quality distribution query (% calls where `transcript_chars > 2000` and `spans_total = 1`)
+
+**CAMBER-1 review:**
+- Verify no correctness regression: fallback chunking preserves idempotency, no partial writes, SSOT unchanged
+- If proof-pack PASS and no new gaps: approve fast
+
+**GPT-DEV tasks:**
+- GPT-DEV-1: Add `--strict-chunking` mode to replay script
+- GPT-DEV-2: Update proof SQL with `expected_min_spans` + FAIL_REASON rows
+- GPT-DEV-3: Draft chunker prompt upgrade for more splits on long calls
+
+### Phase 2: Backfill + Batch Replay + Ops Signals
+**Gate:** `gap_count = 0` AND CI stays green
+
+**DEV tasks:**
+1. Run `scripts/shadow_batch_autopick.sh` nightly
+2. Make failures actionable (retry list + DLQ list output)
+
+**DATA-1 tasks:**
+1. Make `scripts/regression_detector_v2.sql` daily check
+2. Add snapshot retention/pruning
+
+**GPT-DEV tasks:**
+- GPT-DEV-4: Extend autopick to include chunk quality failures
+- GPT-DEV-6: Turn daily digest into scheduled runner (CI cron)
+
+### Phase 3: Review Workbench Backend
+**Gate:** "resolve" action is idempotent + audited + clears queues
+
+**DEV tasks:**
+1. Implement minimal backend endpoints/RPCs:
+   - List open review items
+   - Resolve item (approve/change/unknown) with idempotency key
+2. Every resolve action must:
+   - Write/append span_attributions
+   - Append override_log receipt
+   - Update review_queue status
+3. Add smoke script: create dummy review item → resolve → proof query PASS
+
+**GPT-DEV tasks:**
+- GPT-DEV-5: Provide exact DB write pseudocode for review resolve + idempotency model + smoke-test
+
+### Phase 4: Resolution Layer + Eval Loop
+**Gate:** Proposal→confirm pipeline works on sampled calls
+
+**DEV tasks:**
+1. Add proposal tables for project/contact mapping from span_attributions receipts
+2. Add human confirm action (append-only mappings)
+3. Start eval runs: sample N calls/week, score from receipts, flag K items for spot-check
+
+**GPT-DEV tasks:**
+- GPT-DEV-7: Draft schema + flow for proposals → confirm → append-only mapping + "current mapping" views
+- GPT-DEV-8: Draft alias rollout plan (introduce `chunk-*` aliases without breaking callers)
 
