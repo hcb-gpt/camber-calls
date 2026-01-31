@@ -30,7 +30,7 @@
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { requireEdgeSecret, authErrorResponse } from "../_shared/auth.ts";
+import { authErrorResponse, requireEdgeSecret } from "../_shared/auth.ts";
 
 const VERSION = "1.1.3";
 const ALLOWED_SOURCES = ["admin-reseed", "system"];
@@ -306,7 +306,9 @@ Deno.serve(async (req: Request) => {
           .map((s) => s.transcript_segment || "")
           .filter(Boolean)
           .join("\n\n");
-        console.log(`[admin-reseed] Reconstructed transcript from ${spanTexts.length} ${fallbackSource} spans, ${transcript.length} chars`);
+        console.log(
+          `[admin-reseed] Reconstructed transcript from ${spanTexts.length} ${fallbackSource} spans, ${transcript.length} chars`,
+        );
       }
     }
   }
