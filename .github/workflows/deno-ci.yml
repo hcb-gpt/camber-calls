@@ -54,13 +54,16 @@ jobs:
         id: check-secrets
         run: |
           if [[ -z "$SUPABASE_URL" || -z "$SUPABASE_SERVICE_ROLE_KEY" || -z "$EDGE_SHARED_SECRET" ]]; then
-            echo "::error::Required secrets not configured. Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, EDGE_SHARED_SECRET in repository secrets."
-            exit 1
+            echo "::warning::Secrets not configured - proof pack checks will be skipped"
+            echo "::warning::To enable: Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, EDGE_SHARED_SECRET in repository secrets"
+            echo "secrets_ok=false" >> $GITHUB_OUTPUT
+          else
+            echo "secrets_ok=true" >> $GITHUB_OUTPUT
           fi
-          echo "secrets_ok=true" >> $GITHUB_OUTPUT
 
       - name: Run canonical proof pack
         id: proof-pack
+        if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
           chmod +x ./scripts/replay_call.sh
           set +e
@@ -90,6 +93,7 @@ jobs:
 
       - name: Check CORI global status
         id: cori-check
+        if: steps.check-secrets.outputs.secrets_ok == 'true'
         run: |
           # Fetch CORI summary
           CORI_RESPONSE=$(curl -s "${SUPABASE_URL}/rest/v1/rpc/get_cori_summary" \
@@ -117,18 +121,25 @@ jobs:
         run: |
           echo "## Proof Pack Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Canonical Interaction:** \`$CANONICAL_INTERACTION_ID\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ steps.proof-pack.outcome }}" == "success" ]]; then
-            echo "✅ **Proof Pack:** PASS" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "${{ steps.check-secrets.outputs.secrets_ok }}" != "true" ]]; then
+            echo "⚠️ **Secrets not configured** - proof pack checks skipped" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "To enable: Set \`SUPABASE_URL\`, \`SUPABASE_SERVICE_ROLE_KEY\`, \`EDGE_SHARED_SECRET\` in repository secrets" >> $GITHUB_STEP_SUMMARY
           else
-            echo "❌ **Proof Pack:** FAIL" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ steps.cori-check.outcome }}" == "success" ]]; then
-            echo "✅ **CORI Global:** PASS (0 uncovered)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ **CORI Global:** FAIL (${{ steps.cori-check.outputs.uncovered_count }} uncovered)" >> $GITHUB_STEP_SUMMARY
+            echo "**Canonical Interaction:** \`$CANONICAL_INTERACTION_ID\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [[ "${{ steps.proof-pack.outcome }}" == "success" ]]; then
+              echo "✅ **Proof Pack:** PASS" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ **Proof Pack:** FAIL" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [[ "${{ steps.cori-check.outcome }}" == "success" ]]; then
+              echo "✅ **CORI Global:** PASS (0 uncovered)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ **CORI Global:** FAIL (${{ steps.cori-check.outputs.uncovered_count }} uncovered)" >> $GITHUB_STEP_SUMMARY
+            fi
           fi
 
       - name: Upload proof artifacts
