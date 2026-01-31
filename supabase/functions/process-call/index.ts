@@ -15,7 +15,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const PROCESS_CALL_VERSION = "v4.0.0";
+const PROCESS_CALL_VERSION = "v4.0.1";
 const GATE = { PASS: "PASS", SKIP: "SKIP", NEEDS_REVIEW: "NEEDS_REVIEW" };
 const ID_PATTERN = /^cll_[a-zA-Z0-9_]+$/;
 
@@ -145,26 +145,26 @@ Deno.serve(async (req: Request) => {
   }
 
   // ============================================================
-  // AUTHENTICATION GATE (PR-12)
-  // Two-layer: JWT user auth OR provenance secret
+  // AUTHENTICATION GATE (PR-12 / STRAT TURN21)
+  // Two-layer: JWT user auth OR X-Edge-Secret header
   // ============================================================
   const authHeader = req.headers.get("Authorization");
-  const provenanceSecret = req.headers.get("X-Provenance-Secret");
+  const edgeSecret = req.headers.get("X-Edge-Secret");
   const provenanceSource = (raw.source || "unknown").toLowerCase();
 
-  // Check provenance secret first (for pipeline sources like Zapier)
-  const expectedSecret = Deno.env.get("PROCESS_CALL_SECRET");
-  const hasValidProvenance = expectedSecret &&
-    provenanceSecret === expectedSecret &&
+  // Check edge secret first (for pipeline sources like Zapier/Pipedream/n8n)
+  const expectedSecret = Deno.env.get("EDGE_SHARED_SECRET");
+  const hasValidEdgeSecret = expectedSecret &&
+    edgeSecret === expectedSecret &&
     ALLOWED_PROVENANCE_SOURCES.includes(provenanceSource);
 
-  // If no valid provenance, require JWT auth
-  if (!hasValidProvenance) {
+  // If no valid edge secret, require JWT auth
+  if (!hasValidEdgeSecret) {
     if (!authHeader) {
       return new Response(
         JSON.stringify({
           error: "missing_auth",
-          hint: "Authorization: Bearer <token> or X-Provenance-Secret required",
+          hint: "Authorization: Bearer <token> or X-Edge-Secret required",
         }),
         { status: 401, headers: { "Content-Type": "application/json" } },
       );
