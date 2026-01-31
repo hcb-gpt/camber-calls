@@ -24,7 +24,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 
-const AI_ROUTER_VERSION = "v1.1.0";
+const AI_ROUTER_VERSION = "v1.1.1";
 const PROMPT_VERSION = "v1.5.0";
 
 // ============================================================
@@ -529,6 +529,9 @@ Deno.serve(async (req: Request) => {
   const context_package: ContextPackage | null = body.context_package || null;
   const dry_run = body.dry_run === true;
 
+  // LOGGING (STRAT TURN24): Track dry_run to debug 0 writes
+  console.log(`[ai-router] Request received: dry_run=${dry_run}, has_context_package=${!!context_package}`);
+
   if (!context_package) {
     return new Response(JSON.stringify({ error: "missing_context_package" }), {
       status: 400,
@@ -672,6 +675,9 @@ Deno.serve(async (req: Request) => {
   let gatekeeper_reason: string | null = null;
 
   if (!dry_run) {
+    // LOGGING (STRAT TURN24): Confirm write branch entered
+    console.log(`[ai-router] Write branch entered: span_id=${span_id}, decision=${result.decision}`);
+
     // Check existing span lock (handle "no row" case with maybeSingle)
     const { data: existingAttribution } = await db
       .from("span_attributions")
@@ -723,7 +729,7 @@ Deno.serve(async (req: Request) => {
     const needs_review = result.decision === "review" || result.decision === "none";
 
     try {
-      await db.from("span_attributions").upsert({
+      const { error: upsertErr } = await db.from("span_attributions").upsert({
         span_id,
         project_id: result.project_id, // Model's predicted project
         confidence: result.confidence,
@@ -746,8 +752,14 @@ Deno.serve(async (req: Request) => {
         onConflict: "span_id,model_id,prompt_version",
         ignoreDuplicates: false,
       });
+      // LOGGING (STRAT TURN24): Confirm upsert result
+      if (upsertErr) {
+        console.error(`[ai-router] span_attributions upsert FAILED: ${upsertErr.message}`);
+      } else {
+        console.log(`[ai-router] span_attributions upsert SUCCESS: span_id=${span_id}`);
+      }
     } catch (dbErr: any) {
-      console.error("span_attributions upsert failed:", dbErr.message);
+      console.error("[ai-router] span_attributions upsert exception:", dbErr.message);
       // Continue - we still return the result
     }
 
