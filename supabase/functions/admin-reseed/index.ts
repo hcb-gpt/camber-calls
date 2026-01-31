@@ -32,7 +32,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { authErrorResponse, requireEdgeSecret } from "../_shared/auth.ts";
 
-const VERSION = "1.1.3";
+const VERSION = "1.1.3"; // Version tracking for admin-reseed endpoint
 const ALLOWED_SOURCES = ["admin-reseed", "system"];
 
 interface ReseedRequest {
