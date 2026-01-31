@@ -24,7 +24,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 
-const AI_ROUTER_VERSION = "v1.1.1";
+const AI_ROUTER_VERSION = "v1.1.2";
 const PROMPT_VERSION = "v1.5.0";
 
 // ============================================================
@@ -32,6 +32,7 @@ const PROMPT_VERSION = "v1.5.0";
 // ============================================================
 const ALLOWED_PROVENANCE_SOURCES = [
   "context-assembly", // Called from context-assembly
+  "segment-call", // Called from segment-call
   "edge",
   "test",
 ];
