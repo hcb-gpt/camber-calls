@@ -1,102 +1,182 @@
--- proof_interaction.sql
--- STRAT TURN 68: taskpack=proof_sql_pack (GPT-DEV-2)
+-- proof_interaction.sql (v2)
+-- STRAT TURN 72: Consolidated proof SQL with 3-part output
 --
--- Canonical "scoreboard query" for pipeline proof
--- Usage: Replace __INTERACTION_ID__ with actual interaction_id
+-- Purpose: one-shot proof SQL for one interaction_id:
+--   1) SCOREBOARD row (+ PASS/FAIL)
+--   2) Top 10 spans with status (active/superseded)
+--   3) Gap detector rows (must be empty on PASS)
 --
--- Output: Single row with all proof metrics
---   generation | spans_total | spans_active | attributions | review_queue_pending
---   | needs_review_flagged | review_queue_gap | override_reseeds
+-- Usage:
+--   psql "$DATABASE_URL" -v interaction_id='cll_...' -f scripts/proof_interaction.sql
+--
+-- Notes:
+-- - Treats active spans as is_superseded=false.
+-- - Treats "needs review" as (decision='review' OR needs_review=true).
+-- - "review_gap" counts spans needing review with NO review_queue row.
 
-WITH params AS (
-  SELECT '__INTERACTION_ID__'::text AS interaction_id
+\echo '=== SCOREBOARD (single row) ==='
+
+with
+params as (select :'interaction_id'::text as interaction_id),
+
+active_spans as (
+  select
+    s.id as span_id,
+    s.interaction_id,
+    s.segment_generation as generation,
+    s.span_index,
+    s.is_superseded
+  from public.conversation_spans s
+  join params p on p.interaction_id = s.interaction_id
+  where s.is_superseded = false
 ),
 
--- All spans for this interaction
-all_spans AS (
-  SELECT
-    cs.id AS span_id,
-    cs.segment_generation,
-    cs.is_superseded,
-    cs.span_index
-  FROM conversation_spans cs, params p
-  WHERE cs.interaction_id = p.interaction_id
+gen_max as (
+  select coalesce(max(generation), 0) as gen_max from active_spans
 ),
 
--- Span counts by generation
-span_stats AS (
-  SELECT
-    COALESCE(MAX(segment_generation), 0) AS latest_generation,
-    COUNT(*) AS spans_total,
-    COUNT(*) FILTER (WHERE is_superseded = false) AS spans_active
-  FROM all_spans
+attributions as (
+  select count(*)::int as attributions
+  from public.span_attributions sa
+  join active_spans a on a.span_id = sa.span_id
 ),
 
--- Active span IDs (for joins)
-active_spans AS (
-  SELECT span_id
-  FROM all_spans
-  WHERE is_superseded = false
+review_items as (
+  select count(*)::int as review_items
+  from public.review_queue rq
+  join active_spans a on a.span_id = rq.span_id
 ),
 
--- Attributions for active spans
-attribution_stats AS (
-  SELECT
-    COUNT(*) AS attributions,
-    COUNT(*) FILTER (WHERE sa.needs_review = true) AS needs_review_flagged
-  FROM span_attributions sa
-  WHERE sa.span_id IN (SELECT span_id FROM active_spans)
+needs_review_spans as (
+  select distinct sa.span_id
+  from public.span_attributions sa
+  join active_spans a on a.span_id = sa.span_id
+  where sa.decision = 'review' or sa.needs_review = true
 ),
 
--- Review queue for active spans
-review_stats AS (
-  SELECT
-    COUNT(*) AS review_queue_pending
-  FROM review_queue rq
-  WHERE rq.span_id IN (SELECT span_id FROM active_spans)
-    AND rq.status = 'pending'
+review_gaps as (
+  select n.span_id
+  from needs_review_spans n
+  left join public.review_queue rq on rq.span_id = n.span_id
+  where rq.id is null
 ),
 
--- Gap detector: needs_review=true but no review_queue entry
-gap_detector AS (
-  SELECT COUNT(*) AS review_queue_gap
-  FROM span_attributions sa
-  WHERE sa.span_id IN (SELECT span_id FROM active_spans)
-    AND sa.needs_review = true
-    AND NOT EXISTS (
-      SELECT 1 FROM review_queue rq
-      WHERE rq.span_id = sa.span_id
-        AND rq.status = 'pending'
-    )
-),
-
--- Override log reseed entries
-override_stats AS (
-  SELECT COUNT(*) AS override_reseeds
-  FROM override_log ol, params p
-  WHERE ol.interaction_id = p.interaction_id
-    AND ol.action = 'reseed'
+override_reseeds as (
+  select count(*)::int as override_reseeds
+  from public.override_log ol
+  join params p on p.interaction_id = ol.interaction_id
+  where ol.entity_type = 'reseed'
 )
 
--- Final scoreboard
-SELECT
-  ss.latest_generation AS generation,
-  ss.spans_total,
-  ss.spans_active,
-  COALESCE(ats.attributions, 0) AS attributions,
-  COALESCE(rs.review_queue_pending, 0) AS review_queue_pending,
-  COALESCE(ats.needs_review_flagged, 0) AS needs_review_flagged,
-  COALESCE(gd.review_queue_gap, 0) AS review_queue_gap,
-  COALESCE(os.override_reseeds, 0) AS override_reseeds,
-  -- PASS/FAIL conditions
-  CASE
-    WHEN ss.spans_active < 1 THEN 'FAIL: no active spans'
-    WHEN COALESCE(ats.attributions, 0) < 1 THEN 'FAIL: no attributions'
-    WHEN COALESCE(gd.review_queue_gap, 0) > 0 THEN 'FAIL: review_queue gap'
-    ELSE 'PASS'
-  END AS status
-FROM span_stats ss
-CROSS JOIN attribution_stats ats
-CROSS JOIN review_stats rs
-CROSS JOIN gap_detector gd
-CROSS JOIN override_stats os;
+select
+  p.interaction_id,
+  (select gen_max from gen_max) as gen_max,
+  (select count(*) from active_spans)::int as spans_active,
+  (select attributions from attributions) as attributions,
+  (select review_items from review_items) as review_items,
+  (select count(*) from review_gaps)::int as review_gap,
+  (select override_reseeds from override_reseeds) as override_reseeds,
+  case
+    when (select count(*) from active_spans) = 0 then 'FAIL_NO_ACTIVE_SPANS'
+    when (select count(*) from review_gaps) = 0 then 'PASS'
+    else 'FAIL_REVIEW_GAP'
+  end as verdict
+from params p;
+
+\echo ''
+\echo '=== TOP 10 SPANS (active + most recent generation) ==='
+
+with
+params as (select :'interaction_id'::text as interaction_id),
+
+spans as (
+  select
+    s.id as span_id,
+    s.segment_generation as generation,
+    s.span_index,
+    s.is_superseded,
+    s.char_start,
+    s.char_end
+  from public.conversation_spans s
+  join params p on p.interaction_id = s.interaction_id
+),
+
+max_gen as (
+  select coalesce(max(generation), 0) as gen_max
+  from spans
+  where is_superseded = false
+),
+
+active_latest as (
+  select *
+  from spans
+  where is_superseded = false
+    and generation = (select gen_max from max_gen)
+),
+
+attr as (
+  select
+    sa.span_id,
+    sa.project_id,
+    sa.decision,
+    sa.needs_review,
+    sa.confidence
+  from public.span_attributions sa
+),
+
+rq as (
+  select
+    rq.span_id,
+    rq.status as review_status
+  from public.review_queue rq
+)
+
+select
+  s.span_id,
+  s.generation,
+  s.span_index,
+  case when s.is_superseded then 'superseded' else 'active' end as span_status,
+  s.char_start,
+  s.char_end,
+  a.project_id,
+  a.decision,
+  a.needs_review,
+  a.confidence,
+  r.review_status
+from active_latest s
+left join attr a on a.span_id = s.span_id
+left join rq r on r.span_id = s.span_id
+order by s.span_index asc
+limit 10;
+
+\echo ''
+\echo '=== GAP DETECTOR ROWS (must be empty on PASS) ==='
+
+with
+params as (select :'interaction_id'::text as interaction_id),
+
+active_spans as (
+  select s.id as span_id
+  from public.conversation_spans s
+  join params p on p.interaction_id = s.interaction_id
+  where s.is_superseded = false
+),
+
+needs_review_spans as (
+  select distinct sa.span_id
+  from public.span_attributions sa
+  join active_spans a on a.span_id = sa.span_id
+  where sa.decision = 'review' or sa.needs_review = true
+)
+
+select
+  n.span_id,
+  sa.decision,
+  sa.needs_review,
+  sa.confidence
+from needs_review_spans n
+join public.span_attributions sa on sa.span_id = n.span_id
+left join public.review_queue rq on rq.span_id = n.span_id
+where rq.id is null
+order by sa.confidence desc nulls last
+limit 50;
