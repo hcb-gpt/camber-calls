@@ -21,7 +21,7 @@ const SEGMENT_LLM_VERSION = "segment-llm_v1.0.0";
 // ============================================================
 // AUTH CONFIGURATION
 // ============================================================
-const ALLOWED_PROVENANCE_SOURCES = ["segment-call", "edge", "test"];
+const ALLOWED_PROVENANCE_SOURCES = ["segment-call", "admin-reseed", "edge", "test"];
 
 // ============================================================
 // GUARDRAIL DEFAULTS

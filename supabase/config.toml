@@ -6,21 +6,17 @@ project_id = "rjhdwidddtfetbwqolof"
 [functions.process-call]
 verify_jwt = false
 
-[functions.segment-call]
-# segment-call is internal-only; auth is enforced via X-Edge-Secret in callers
-verify_jwt = false
-
 [functions.segment-llm]
-# segment-llm uses X-Edge-Secret only (no JWT)
 verify_jwt = false
 
-# Internal machine-to-machine endpoints
-# These require X-Edge-Secret or service role key for auth
+[functions.admin-reseed]
+verify_jwt = false
+
+[functions.segment-call]
+verify_jwt = false
+
 [functions.context-assembly]
 verify_jwt = false
 
 [functions.ai-router]
-verify_jwt = false
-
-[functions.admin-reseed]
 verify_jwt = false

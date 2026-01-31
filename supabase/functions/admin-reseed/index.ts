@@ -32,8 +32,17 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { authErrorResponse, requireEdgeSecret } from "../_shared/auth.ts";
 
-const VERSION = "1.1.3"; // Version tracking for admin-reseed endpoint
+const VERSION = "1.2.0"; // Version tracking for admin-reseed endpoint
 const ALLOWED_SOURCES = ["admin-reseed", "system"];
+
+type SegmentFromLLM = {
+  span_index: number;
+  char_start: number;
+  char_end: number;
+  boundary_reason: string;
+  confidence: number;
+  boundary_quote: string | null;
+};
 
 interface ReseedRequest {
   interaction_id: string;
@@ -315,46 +324,193 @@ Deno.serve(async (req: Request) => {
   }
 
   // ========================================
-  // 10. CREATE NEW SPANS (trivial chunker for now)
-  // TODO: Replace with proper chunking logic (gap-based, topic-based, etc.)
+  // 10. CREATE NEW SPANS (segment-llm)
+  // POLICY (STRAT TURN:82): admin-reseed must use segment-llm (same as segment-call),
+  // not a trivial single-span chunker.
   // ========================================
   const newSpanIds: string[] = [];
 
   if (transcript.length > 0) {
-    // Trivial chunker: single span for entire transcript
-    // Future: implement proper chunking based on gaps, topics, etc.
-    const newSpanId = crypto.randomUUID();
-    newSpanIds.push(newSpanId);
+    const edgeSecret = Deno.env.get("EDGE_SHARED_SECRET");
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const segmentLLMUrl = `${supabaseUrl}/functions/v1/segment-llm`;
 
-    const { error: insertErr } = await db
-      .from("conversation_spans")
-      .insert({
-        id: newSpanId,
-        interaction_id,
-        span_index: 0,
-        transcript_segment: transcript,
-        word_count: transcript.split(/\s+/).filter(Boolean).length,
-        segmenter_version: `reseed_trivial_v1`,
-        segment_reason: `reseed:${reason}`,
-        segment_generation: newGeneration,
-        is_superseded: false,
+    let segments: SegmentFromLLM[] = [];
+    let segmenterVersion = "fallback_trivial_v1";
+    const segmenterWarnings: string[] = [];
+    const max_segments = 10;
+    const min_segment_chars = 200;
+
+    try {
+      const llmResp = await fetch(segmentLLMUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Edge-Secret": edgeSecret || "",
+        },
+        body: JSON.stringify({
+          interaction_id,
+          transcript,
+          source: "admin-reseed",
+          max_segments,
+          min_segment_chars,
+        }),
       });
 
-    if (insertErr) {
-      console.error("[admin-reseed] Failed to insert new span:", insertErr.message);
-      // FAIL CLOSED: rollback by marking old spans as not superseded
-      if (activeSpanIds.length > 0) {
-        await db
-          .from("conversation_spans")
-          .update({
-            is_superseded: false,
-            superseded_at: null,
-            superseded_by_action_id: null,
-          })
-          .in("id", activeSpanIds);
+      if (!llmResp.ok) {
+        const errBody = await llmResp.text().catch(() => "");
+        console.error(`[admin-reseed] segment-llm failed: ${llmResp.status} - ${errBody}`);
+        segmenterWarnings.push(`segment_llm_http_${llmResp.status}`);
+      } else {
+        const llmData = await llmResp.json().catch(() => null);
+        if (llmData?.ok && Array.isArray(llmData.segments) && llmData.segments.length > 0) {
+          segments = llmData.segments;
+          segmenterVersion = llmData.segmenter_version || "segment-llm_v1.0.0";
+          if (Array.isArray(llmData.warnings)) segmenterWarnings.push(...llmData.warnings);
+        } else {
+          segmenterWarnings.push("segment_llm_invalid_response");
+        }
       }
-      return jsonResponse({ ok: false, error: "db_write_failed", detail: insertErr.message }, 500);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "unknown";
+      segmenterWarnings.push(`segment_llm_error:${msg}`);
     }
+
+    // Safety net: ensure we always write at least one span covering the transcript.
+    if (!segments || segments.length === 0) {
+      segments = [{
+        span_index: 0,
+        char_start: 0,
+        char_end: transcript.length,
+        boundary_reason: "fallback_full_call",
+        confidence: 1.0,
+        boundary_quote: null,
+      }];
+    }
+
+    // Boundary guardrails: clamp, sort, repair contiguity
+    segments = segments
+      .map((s, i) => ({
+        ...s,
+        span_index: i,
+        char_start: Math.max(0, Math.min(transcript.length, Math.floor(Number(s.char_start)))),
+        char_end: Math.max(0, Math.min(transcript.length, Math.floor(Number(s.char_end)))),
+      }))
+      .sort((a, b) => a.char_start - b.char_start);
+
+    // Repair to full coverage / contiguity
+    let cursor = 0;
+    const repaired: SegmentFromLLM[] = [];
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      let start = Math.max(cursor, seg.char_start);
+      let end = Math.max(start, seg.char_end);
+      if (i === segments.length - 1) end = transcript.length;
+      if (start === end) continue;
+      repaired.push({ ...seg, span_index: repaired.length, char_start: start, char_end: end });
+      cursor = end;
+    }
+    if (repaired.length === 0) {
+      repaired.push({
+        span_index: 0,
+        char_start: 0,
+        char_end: transcript.length,
+        boundary_reason: "fallback_full_call",
+        confidence: 1.0,
+        boundary_quote: null,
+      });
+    }
+
+    // Merge undersized segments into previous where possible
+    const merged: SegmentFromLLM[] = [];
+    for (const seg of repaired) {
+      const len = seg.char_end - seg.char_start;
+      if (len < min_segment_chars && merged.length > 0) {
+        const prev = merged[merged.length - 1];
+        prev.char_end = seg.char_end;
+        prev.boundary_reason = prev.boundary_reason || seg.boundary_reason;
+        continue;
+      }
+      merged.push(seg);
+    }
+    merged[merged.length - 1].char_end = transcript.length;
+    merged.forEach((s, i) => (s.span_index = i));
+
+    const spanRowsWithMetadata = merged.map((seg) => {
+      const segmentText = transcript.slice(seg.char_start, seg.char_end);
+      const wordCount = segmentText.split(/\s+/).filter(Boolean).length;
+      return {
+        id: crypto.randomUUID(),
+        interaction_id,
+        span_index: seg.span_index,
+        transcript_segment: segmentText,
+        word_count: wordCount,
+        segmenter_version: segmenterVersion,
+        segment_reason: `reseed:${reason}|${seg.boundary_reason}`,
+        segment_generation: newGeneration,
+        is_superseded: false,
+        segment_metadata: {
+          confidence: seg.confidence,
+          boundary_quote: seg.boundary_quote,
+          warnings: segmenterWarnings,
+          source: "admin-reseed",
+        },
+      };
+    });
+
+    // Insert attempt #1 (with segment_metadata); fallback if column not present.
+    let inserted: { id: string; span_index: number }[] = [];
+    const ins1 = await db
+      .from("conversation_spans")
+      .insert(spanRowsWithMetadata)
+      .select("id, span_index");
+
+    if (ins1.error) {
+      const msg = (ins1.error.message || "").toLowerCase();
+      const missingMetaCol = msg.includes("segment_metadata") && msg.includes("does not exist");
+      if (!missingMetaCol) {
+        console.error("[admin-reseed] Failed to insert new spans:", ins1.error.message);
+        // FAIL CLOSED: rollback by marking old spans as not superseded
+        if (activeSpanIds.length > 0) {
+          await db
+            .from("conversation_spans")
+            .update({
+              is_superseded: false,
+              superseded_at: null,
+              superseded_by_action_id: null,
+            })
+            .in("id", activeSpanIds);
+        }
+        return jsonResponse({ ok: false, error: "db_write_failed", detail: ins1.error.message }, 500);
+      }
+
+      const spanRowsNoMetadata = spanRowsWithMetadata.map(({ segment_metadata, ...rest }) => rest);
+      const ins2 = await db
+        .from("conversation_spans")
+        .insert(spanRowsNoMetadata as any)
+        .select("id, span_index");
+
+      if (ins2.error) {
+        console.error("[admin-reseed] Failed to insert new spans:", ins2.error.message);
+        if (activeSpanIds.length > 0) {
+          await db
+            .from("conversation_spans")
+            .update({
+              is_superseded: false,
+              superseded_at: null,
+              superseded_by_action_id: null,
+            })
+            .in("id", activeSpanIds);
+        }
+        return jsonResponse({ ok: false, error: "db_write_failed", detail: ins2.error.message }, 500);
+      }
+      inserted = (ins2.data || []) as any;
+    } else {
+      inserted = (ins1.data || []) as any;
+    }
+
+    inserted.sort((a, b) => a.span_index - b.span_index);
+    newSpanIds.push(...inserted.map((r) => r.id));
   }
 
   // ========================================
