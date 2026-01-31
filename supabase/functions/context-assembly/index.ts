@@ -30,7 +30,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const ASSEMBLY_VERSION = "v1.2.7";
+const ASSEMBLY_VERSION = "v1.2.8";
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_TRANSCRIPT_CHARS = 8000;
@@ -42,6 +42,8 @@ const GEO_MAX_CANDIDATES = 5; // Cap geo candidates to prevent flooding
 
 // PR-11: Project status filter - only include active client projects
 const VALID_PROJECT_STATUSES = ["active", "warranty", "estimating"];
+// PR-11 (STRAT TURN14): Filter by project_kind to exclude internal/owner projects
+const VALID_PROJECT_KIND = "client";
 
 // ============================================================
 // ADMIN ALLOWLIST (PR-10 hardening)
@@ -854,11 +856,12 @@ Deno.serve(async (req: Request) => {
             }
 
             // Find nearby projects (geo proximity candidates)
-            // PR-11: Join projects table to filter by status
+            // PR-11: Join projects table to filter by status and project_kind
             const { data: projectGeos, error: geoErr } = await db
               .from("project_geo")
-              .select("project_id, lat, lon, projects!inner(status)")
-              .in("projects.status", VALID_PROJECT_STATUSES);
+              .select("project_id, lat, lon, projects!inner(status, project_kind)")
+              .in("projects.status", VALID_PROJECT_STATUSES)
+              .eq("projects.project_kind", VALID_PROJECT_KIND);
 
             if (!geoErr && projectGeos?.length) {
               const nearbyProjectsWithDistance = new Map<string, number>();
