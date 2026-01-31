@@ -46,9 +46,39 @@ PASS | cll_06DSX0CVZHZK72VCVW54EH9G3C | gen=<n> spans_total=<n> spans_active=<n>
 - **Legacy slugs remain:** `segment-call`, `segment-llm`, `segment_generation` (don't rename routes mid-sprint)
 
 ### Credential Protocol (mandatory before everything)
+
+**First-time setup (if ~/.camber/ doesn't exist):**
+```bash
+# 1. Create credential store
+mkdir -p ~/.camber
+
+# 2. Copy credentials from source
+# (Chad will provide credentials.env or point to source)
+cp /path/to/credentials.env ~/.camber/credentials.env
+chmod 600 ~/.camber/credentials.env
+
+# 3. Install auto-loader in shell profile
+cat >> ~/.zshrc << 'EOF'
+# CAMBER Auto-load credentials
+if [ -f "$HOME/.camber/load-credentials.sh" ]; then
+    source "$HOME/.camber/load-credentials.sh"
+fi
+EOF
+
+# 4. Copy loader script to ~/.camber/
+cp scripts/load-credentials.sh ~/.camber/
+chmod +x ~/.camber/load-credentials.sh
+
+# 5. Reload shell
+source ~/.zshrc
+```
+
+**Verify credentials work:**
 ```bash
 ./scripts/test-credentials.sh
+# Expected: ✅ All credentials loaded
 ```
+
 All scripts MUST source: `scripts/load-env.sh` (CI enforced).
 
 ### Branch Protocol (prevent drift)
