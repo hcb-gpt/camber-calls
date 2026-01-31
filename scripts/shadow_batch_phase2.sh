@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Load credentials (REQUIRED PROTOCOL)
+SCRIPT_DIR_INIT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR_INIT}/load-env.sh"
+
 # shadow_batch_phase2.sh
 # Phase 2 wrapper:
 #   1) Select candidate interaction_ids from DB (gaps and/or spans_total=0)

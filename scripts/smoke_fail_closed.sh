@@ -16,6 +16,10 @@
 
 set -euo pipefail
 
+# Load credentials (REQUIRED PROTOCOL)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/load-env.sh"
+
 # ============================================================
 # VALIDATION
 # ============================================================

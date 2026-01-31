@@ -1,11 +1,12 @@
-# DEV_STRAT_20260130T0745Z_github_actions_denoci.yml
-# Purpose: create a real status check for branch protection
-# Assumes Supabase Edge Functions (Deno / TypeScript) live under supabase/functions/**
-# First run: 2026-01-30
+# Deno CI + Proof Pack Gate
+# STRAT TURN 78: CI gate with credentials + proof pack + one-line scoreboard
+# First run: 2026-01-30, Updated: 2026-01-31
 
 name: Deno CI
 on:
   pull_request:
+  push:
+    branches: [master, main]
   workflow_dispatch:
 
 jobs:
@@ -27,45 +28,89 @@ jobs:
         run: |
           deno lint supabase/functions || (echo "deno lint failed" && exit 1)
 
-      # Typecheck disabled until TS errors in legacy code are fixed
-      # - name: Deno check (typecheck entrypoints)
-      #   run: |
-      #     for f in supabase/functions/*/index.ts; do
-      #       echo "typecheck $f"
-      #       deno check "$f" || exit 1
-      #     done
-
   # Proof pack merge gate - runs replay on known interaction to verify pipeline integrity
   proof-pack:
     runs-on: ubuntu-latest
     # Only run if secrets are available (not on forks)
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       EDGE_SHARED_SECRET: ${{ secrets.EDGE_SHARED_SECRET }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
       # Known good interaction for regression testing
       TEST_INTERACTION_ID: ${{ secrets.TEST_INTERACTION_ID }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check secrets available
+      - name: Make scripts executable
+        run: chmod +x ./scripts/*.sh
+
+      # Step 1: Credential verification (REQUIRED PROTOCOL)
+      - name: Test credentials
+        id: creds
         run: |
-          if [[ -z "$SUPABASE_URL" || -z "$SUPABASE_SERVICE_ROLE_KEY" || -z "$EDGE_SHARED_SECRET" ]]; then
-            echo "Secrets not configured - skipping proof pack"
-            exit 0
+          ./scripts/test-credentials.sh | tee credentials_result.txt
+          if grep -q "^PASS:" credentials_result.txt; then
+            echo "creds_pass=true" >> $GITHUB_OUTPUT
+          else
+            echo "creds_pass=false" >> $GITHUB_OUTPUT
+            exit 1
           fi
 
+      # Step 2: Proof pack replay
       - name: Run proof pack
-        if: env.TEST_INTERACTION_ID != ''
+        id: proof
+        if: steps.creds.outputs.creds_pass == 'true' && env.TEST_INTERACTION_ID != ''
         run: |
-          chmod +x ./scripts/replay_call.sh
-          ./scripts/replay_call.sh "$TEST_INTERACTION_ID" --reseed --reroute --verbose --save-artifacts
+          HEAD_SHA=$(git rev-parse --short HEAD)
+          mkdir -p /tmp/proofs
 
+          # Run replay and capture output
+          ./scripts/replay_call.sh "$TEST_INTERACTION_ID" --reseed --reroute --save-artifacts 2>&1 | tee proof_output.txt
+
+          # Extract scoreboard line
+          SCOREBOARD=$(grep -E "^(PASS|FAIL)" proof_output.txt | tail -1 || echo "FAIL | no_output")
+
+          # Build full PASS line with required fields
+          echo "PROOF_PACK: ${SCOREBOARD} | headSHA=${HEAD_SHA}"
+
+          # Check for PASS
+          if echo "$SCOREBOARD" | grep -q "^PASS"; then
+            echo "proof_pass=true" >> $GITHUB_OUTPUT
+          else
+            echo "proof_pass=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      # Step 3: Upload artifacts
       - name: Upload proof artifacts
         if: always() && env.TEST_INTERACTION_ID != ''
         uses: actions/upload-artifact@v4
         with:
           name: proof-pack-${{ github.run_id }}
-          path: /tmp/proofs/
+          path: |
+            /tmp/proofs/
+            credentials_result.txt
+            proof_output.txt
           retention-days: 7
+
+      # Summary output
+      - name: Print summary
+        if: always()
+        run: |
+          echo "## Proof Pack Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [[ -f credentials_result.txt ]]; then
+            echo "### Credentials" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat credentials_result.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [[ -f proof_output.txt ]]; then
+            echo "### Proof Pack" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -E "^(PASS|FAIL)" proof_output.txt | tail -1 >> $GITHUB_STEP_SUMMARY || echo "No verdict line found" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi

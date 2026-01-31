@@ -25,6 +25,10 @@
 
 set -euo pipefail
 
+# Load credentials (REQUIRED PROTOCOL)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/load-env.sh"
+
 # ============================================================
 # DEFAULTS
 # ============================================================
@@ -235,6 +239,22 @@ STATUS=$(echo "$SCOREBOARD" | jq -r '.[0].status // "unknown"')
 SCOREBOARD_LINE="$STATUS | $INTERACTION_ID | gen=$GENERATION spans=$SPANS_ACTIVE attr=$ATTRIBUTIONS review=$REVIEW_PENDING gap=$REVIEW_GAP reseeds=$RESEEDS"
 
 log_always "$SCOREBOARD_LINE"
+
+# ============================================================
+# WARNING: SINGLE-SPAN SANITY CHECK (P1)
+# If transcript is long but only 1 span, may indicate de-chunking issue
+# ============================================================
+# Get transcript_chars from calls_raw if available
+TRANSCRIPT_CHARS=$(curl -s --max-time 10 -X POST \
+  "${SUPABASE_URL}/rest/v1/rpc/score_interaction" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+  -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+  -d "{\"p_interaction_id\":\"${INTERACTION_ID}\"}" 2>/dev/null | jq -r '.[0].transcript_chars // 0' 2>/dev/null || echo "0")
+
+if [[ "$TRANSCRIPT_CHARS" =~ ^[0-9]+$ ]] && [[ "$TRANSCRIPT_CHARS" -gt 2000 ]] && [[ "$SPANS_ACTIVE" -eq 1 ]]; then
+  log_always "WARNING: single_span_long_transcript | chars=$TRANSCRIPT_CHARS spans=$SPANS_ACTIVE (possible de-chunking issue)"
+fi
 
 if [[ "$SAVE_ARTIFACTS" == "true" ]]; then
   log_always "Artifacts: $ARTIFACT_DIR/"

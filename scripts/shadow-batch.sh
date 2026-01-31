@@ -9,15 +9,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Load credentials (REQUIRED PROTOCOL)
+source "${SCRIPT_DIR}/load-env.sh"
+
 PIPEDREAM_URL="https://eopz0oyin0j45bv.m.pipedream.net"
 LOG_FILE="$REPO_DIR/shadow_results_$(date +%Y%m%d_%H%M%S).jsonl"
-
-# Load env if exists
-if [[ -f "$REPO_DIR/.env.local" ]]; then
-  set -a
-  source "$REPO_DIR/.env.local"
-  set +a
-fi
 
 # Check required vars
 if [[ -z "${SUPABASE_URL:-}" ]] || [[ -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then

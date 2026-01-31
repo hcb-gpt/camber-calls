@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Load credentials (REQUIRED PROTOCOL)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/load-env.sh"
+
 # shadow_batch_replay.sh
 # STRAT TURN 72: GPT-DEV-3 shadow batch skeleton
 #
