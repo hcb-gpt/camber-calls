@@ -54,7 +54,6 @@ const ADMIN_USER_IDS: string[] = [
   // Add Supabase auth.users.id values here
   // Example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 ];
-const REQUIRE_ADMIN_OR_ALLOWLIST = true; // If true, user must match ADMIN_USER_IDS OR ALLOWED_EMAILS
 
 // ============================================================
 // ENROUTE VERB PATTERNS (STRAT-1 POLICY: VERB-DRIVEN ONLY)
