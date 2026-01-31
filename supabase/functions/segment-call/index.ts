@@ -15,7 +15,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const SEGMENT_CALL_VERSION = "v2.1.0";
+const SEGMENT_CALL_VERSION = "v2.1.2";
 
 const ALLOWED_PROVENANCE_SOURCES = [
   "process-call",
@@ -258,6 +258,7 @@ Deno.serve(async (req: Request) => {
       headers: {
         "Content-Type": "application/json",
         "X-Edge-Secret": edgeSecret,
+        // No Authorization header - segment-llm uses X-Edge-Secret only
       },
       body: JSON.stringify({
         interaction_id,

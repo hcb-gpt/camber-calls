@@ -206,11 +206,11 @@ Deno.serve(async (req: Request) => {
   }
 
   // ============================================================
-  // LLM CALL
+  // LLM CALL (OpenAI)
   // ============================================================
-  const anthropicKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!anthropicKey) {
-    console.error("[segment-llm] ANTHROPIC_API_KEY not configured");
+  const openaiKey = Deno.env.get("OPENAI_API_KEY");
+  if (!openaiKey) {
+    console.error("[segment-llm] OPENAI_API_KEY not configured");
     return fallbackResponse(transcriptLength, ["config_error_no_api_key"], t0);
   }
 
@@ -221,15 +221,14 @@ Deno.serve(async (req: Request) => {
 
   let llmResponse: any;
   try {
-    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-api-key": anthropicKey,
-        "anthropic-version": "2023-06-01",
+        "Authorization": `Bearer ${openaiKey}`,
       },
       body: JSON.stringify({
-        model: "claude-3-haiku-20240307",
+        model: "gpt-4o-mini",
         max_tokens: 1024,
         messages: [
           {
@@ -253,11 +252,11 @@ Deno.serve(async (req: Request) => {
   }
 
   // ============================================================
-  // PARSE LLM OUTPUT
+  // PARSE LLM OUTPUT (OpenAI format)
   // ============================================================
   let rawContent = "";
   try {
-    rawContent = llmResponse.content?.[0]?.text || "";
+    rawContent = llmResponse.choices?.[0]?.message?.content || "";
     // Strip markdown code fences if present
     rawContent = rawContent.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
   } catch {
