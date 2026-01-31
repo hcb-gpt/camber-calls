@@ -24,7 +24,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 
-const AI_ROUTER_VERSION = "v1.1.2";
+const AI_ROUTER_VERSION = "v1.1.3";
 const PROMPT_VERSION = "v1.5.0";
 
 // ============================================================
@@ -725,7 +725,8 @@ Deno.serve(async (req: Request) => {
     // ========================================
     // WRITE TO SPAN_ATTRIBUTIONS (ALWAYS)
     // ========================================
-    // Upsert on idempotency key: span_id + model_id + prompt_version
+    // Upsert on UNIQUE(span_id, project_id) constraint
+    // Note: Also has partial idx_span_attributions_idempotent(span_id, model_id, prompt_version)
     const attribution_lock = applied ? "ai" : null;
     const needs_review = result.decision === "review" || result.decision === "none";
 
@@ -750,7 +751,7 @@ Deno.serve(async (req: Request) => {
         attributed_by: `ai-router-${PROMPT_VERSION}`,
         attributed_at: new Date().toISOString(),
       }, {
-        onConflict: "span_id,model_id,prompt_version",
+        onConflict: "span_id,project_id",  // Matches UNIQUE(span_id, project_id)
         ignoreDuplicates: false,
       });
       // LOGGING (STRAT TURN24): Confirm upsert result
