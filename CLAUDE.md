@@ -51,6 +51,33 @@ PASS | cll_06DSX0CVZHZK72VCVW54EH9G3C | gen=<n> spans_total=<n> spans_active=<n>
 ```
 All scripts MUST source: `scripts/load-env.sh` (CI enforced).
 
+### Branch Protocol (prevent drift)
+**DO NOT create a branch immediately.** Start on master.
+
+**Workflow:**
+1. Stay on master
+2. Read CLAUDE.md (this file)
+3. Understand your task from STRAT or Phase roadmap
+4. THEN create branch with meaningful name
+
+**Branch naming:**
+- Format: `<type>/<description>`
+- Types: `feat/`, `fix/`, `docs/`, `test/`, `refactor/`
+- Description: what you're actually doing (not random names)
+- Examples:
+  - `feat/chunking-retry-fallback` (Phase 1 P0)
+  - `fix/segment-llm-boundary-clamp`
+  - `feat/review-resolve-endpoints` (Phase 3)
+  - NOT: `my-branch`, `test123`, `dev-work`
+
+**Create branch only when ready:**
+```bash
+# After you know what you're doing:
+git checkout -b feat/chunking-retry-fallback
+```
+
+**Why:** Random branches = documentation drift. Named branches = reviewable intent.
+
 ---
 
 ## Environment Stamp (required on every substantive edit)
