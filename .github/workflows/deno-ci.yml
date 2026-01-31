@@ -35,7 +35,8 @@ jobs:
       #       deno check "$f" || exit 1
       #     done
 
-  # Proof pack merge gate - runs replay on known interaction to verify pipeline integrity
+  # Proof pack merge gate - HARD FAIL on canonical interaction or CORI violations
+  # This is a required status check for branch protection
   proof-pack:
     runs-on: ubuntu-latest
     # Only run if secrets are available (not on forks)
@@ -44,28 +45,97 @@ jobs:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       EDGE_SHARED_SECRET: ${{ secrets.EDGE_SHARED_SECRET }}
-      # Known good interaction for regression testing
-      TEST_INTERACTION_ID: ${{ secrets.TEST_INTERACTION_ID }}
+      # Canonical interaction for regression testing
+      CANONICAL_INTERACTION_ID: cll_06DSX0CVZHZK72VCVW54EH9G3C
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check secrets available
+      - name: Verify secrets configured
+        id: check-secrets
         run: |
           if [[ -z "$SUPABASE_URL" || -z "$SUPABASE_SERVICE_ROLE_KEY" || -z "$EDGE_SHARED_SECRET" ]]; then
-            echo "Secrets not configured - skipping proof pack"
-            exit 0
+            echo "::error::Required secrets not configured. Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, EDGE_SHARED_SECRET in repository secrets."
+            exit 1
           fi
+          echo "secrets_ok=true" >> $GITHUB_OUTPUT
 
-      - name: Run proof pack
-        if: env.TEST_INTERACTION_ID != ''
+      - name: Run canonical proof pack
+        id: proof-pack
         run: |
           chmod +x ./scripts/replay_call.sh
-          ./scripts/replay_call.sh "$TEST_INTERACTION_ID" --reseed --reroute --verbose --save-artifacts
+          set +e
+          OUTPUT=$(./scripts/replay_call.sh "$CANONICAL_INTERACTION_ID" --reseed --reroute --verbose --save-artifacts 2>&1)
+          EXIT_CODE=$?
+          set -e
+
+          echo "$OUTPUT"
+
+          # Extract the PASS/FAIL line
+          PROOF_LINE=$(echo "$OUTPUT" | grep -E "^(PASS|FAIL) \|" | tail -1)
+
+          if [[ -z "$PROOF_LINE" ]]; then
+            echo "::error::Proof pack did not produce a PASS/FAIL line"
+            exit 1
+          fi
+
+          echo "proof_line=$PROOF_LINE" >> $GITHUB_OUTPUT
+
+          if [[ $EXIT_CODE -ne 0 ]]; then
+            echo "::error::Canonical proof pack FAILED: $PROOF_LINE"
+            echo "::error::Fix: Ensure the pipeline produces PASS for $CANONICAL_INTERACTION_ID"
+            exit 1
+          fi
+
+          echo "::notice::Canonical proof pack PASSED: $PROOF_LINE"
+
+      - name: Check CORI global status
+        id: cori-check
+        run: |
+          # Fetch CORI summary
+          CORI_RESPONSE=$(curl -s "${SUPABASE_URL}/rest/v1/rpc/get_cori_summary" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}")
+
+          echo "CORI Response: $CORI_RESPONSE"
+
+          UNCOVERED=$(echo "$CORI_RESPONSE" | jq -r '.[0].uncovered_count // 0')
+          GLOBAL_STATUS=$(echo "$CORI_RESPONSE" | jq -r '.[0].global_status // "unknown"')
+
+          echo "uncovered_count=$UNCOVERED" >> $GITHUB_OUTPUT
+          echo "global_status=$GLOBAL_STATUS" >> $GITHUB_OUTPUT
+
+          if [[ "$UNCOVERED" != "0" ]]; then
+            echo "::error::CORI_GLOBAL_FAIL: $UNCOVERED uncovered active spans"
+            echo "::error::Fix: Run admin-reseed with --reroute on uncovered interactions, or mark test fixtures as superseded"
+            exit 1
+          fi
+
+          echo "::notice::CORI_GLOBAL_PASS: 0 uncovered spans"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Proof Pack Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Canonical Interaction:** \`$CANONICAL_INTERACTION_ID\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ steps.proof-pack.outcome }}" == "success" ]]; then
+            echo "✅ **Proof Pack:** PASS" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Proof Pack:** FAIL" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [[ "${{ steps.cori-check.outcome }}" == "success" ]]; then
+            echo "✅ **CORI Global:** PASS (0 uncovered)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **CORI Global:** FAIL (${{ steps.cori-check.outputs.uncovered_count }} uncovered)" >> $GITHUB_STEP_SUMMARY
+          fi
 
       - name: Upload proof artifacts
-        if: always() && env.TEST_INTERACTION_ID != ''
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: proof-pack-${{ github.run_id }}
           path: /tmp/proofs/
           retention-days: 7
+          if-no-files-found: ignore
