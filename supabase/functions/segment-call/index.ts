@@ -15,7 +15,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const SEGMENT_CALL_VERSION = "v2.1.2";
+const SEGMENT_CALL_VERSION = "v2.2.0";
 
 const ALLOWED_PROVENANCE_SOURCES = [
   "process-call",
@@ -190,12 +190,13 @@ Deno.serve(async (req: Request) => {
   }
 
   // ============================================================
-  // 2) RESEED RULE (409 IF ANY ATTRIBUTIONS EXIST)
+  // 2) RESEED RULE (409 IF ANY ATTRIBUTIONS EXIST ON ACTIVE SPANS)
   // ============================================================
   const { data: existingSpans, error: spansErr } = await db
     .from("conversation_spans")
     .select("id")
-    .eq("interaction_id", interaction_id);
+    .eq("interaction_id", interaction_id)
+    .eq("is_superseded", false);
 
   if (spansErr) {
     return new Response(
@@ -310,13 +311,15 @@ Deno.serve(async (req: Request) => {
   }
 
   // ============================================================
-  // 4) REBUILD SPANS (SAFE: NO ATTRIBUTIONS)
+  // 4) REBUILD SPANS (SAFE: NO ATTRIBUTIONS ON ACTIVE SPANS)
   // ============================================================
   if (existingSpans && existingSpans.length > 0) {
+    // Delete only active (non-superseded) spans
     const { error: deleteErr } = await db
       .from("conversation_spans")
       .delete()
-      .eq("interaction_id", interaction_id);
+      .eq("interaction_id", interaction_id)
+      .eq("is_superseded", false);
 
     if (deleteErr) {
       return new Response(
@@ -349,6 +352,8 @@ Deno.serve(async (req: Request) => {
         confidence: seg.confidence,
         boundary_quote: seg.boundary_quote,
       },
+      is_superseded: false,
+      segment_generation: 1,
       created_at: now,
     };
   });
