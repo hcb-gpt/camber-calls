@@ -17,7 +17,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const SEGMENT_CALL_VERSION = "v1.3.0";
+const SEGMENT_CALL_VERSION = "v1.3.1";
 
 // ============================================================
 // AUTH CONFIGURATION
@@ -136,7 +136,6 @@ Deno.serve(async (req: Request) => {
     // 1. CREATE SPAN
     // ========================================
     const now = new Date().toISOString();
-    span_id = `span_${interaction_id}_${Date.now()}`;
 
     // Get transcript from calls_raw if not provided
     let span_transcript = transcript;
@@ -150,16 +149,19 @@ Deno.serve(async (req: Request) => {
       span_transcript = callsRaw?.transcript || "";
     }
 
-    // Create span
-    const { error: spanErr } = await db.from("conversation_spans").upsert({
-      id: span_id,
+    // Create span (matching conversation_spans schema)
+    const wordCount = span_transcript ? span_transcript.split(/\s+/).filter(Boolean).length : 0;
+    const { data: spanData, error: spanErr } = await db.from("conversation_spans").upsert({
       interaction_id,
-      transcript_text: span_transcript,
-      speaker_label: "UNKNOWN",
-      start_ms: 0,
-      end_ms: (span_transcript?.length || 0) * 50, // Rough estimate
+      span_index: 0,  // trivial segmenter: 1 span per call
+      char_start: 0,
+      char_end: span_transcript?.length || 0,
+      transcript_segment: span_transcript,
+      word_count: wordCount,
+      segmenter_version: "segment-call_v1.3.1",
+      segment_reason: "full_call",
       created_at: now,
-    }, { onConflict: "id" });
+    }, { onConflict: "interaction_id,span_index" }).select("id").single();
 
     if (spanErr) {
       console.error("[segment-call] Span creation failed:", spanErr.message);
@@ -169,6 +171,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    span_id = spanData?.id || `${interaction_id}:0`;
     console.log(`[segment-call] Span created: ${span_id}`);
 
     // ========================================
