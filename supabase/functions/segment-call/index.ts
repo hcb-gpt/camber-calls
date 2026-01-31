@@ -72,18 +72,20 @@ Deno.serve(async (req: Request) => {
   try {
     body = await req.json();
   } catch {
-    return new Response(JSON.stringify({
-      ok: false,
-      error: "invalid_json",
-      error_code: "bad_request",
-      version: SEGMENT_CALL_VERSION,
-    }), { status: 400, headers: jsonHeaders });
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: "invalid_json",
+        error_code: "bad_request",
+        version: SEGMENT_CALL_VERSION,
+      }),
+      { status: 400, headers: jsonHeaders },
+    );
   }
 
   const provenanceSource = body.source || "unknown";
 
-  const hasValidEdgeSecret =
-    expectedSecret &&
+  const hasValidEdgeSecret = expectedSecret &&
     edgeSecretHeader === expectedSecret &&
     ALLOWED_PROVENANCE_SOURCES.includes(provenanceSource);
 
@@ -105,13 +107,16 @@ Deno.serve(async (req: Request) => {
   }
 
   if (!hasValidEdgeSecret && !hasValidJwt) {
-    return new Response(JSON.stringify({
-      ok: false,
-      error: "unauthorized",
-      error_code: "auth_failed",
-      hint: "Requires X-Edge-Secret with allowlisted source OR JWT with allowed email",
-      version: SEGMENT_CALL_VERSION,
-    }), { status: 401, headers: jsonHeaders });
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: "unauthorized",
+        error_code: "auth_failed",
+        hint: "Requires X-Edge-Secret with allowlisted source OR JWT with allowed email",
+        version: SEGMENT_CALL_VERSION,
+      }),
+      { status: 401, headers: jsonHeaders },
+    );
   }
 
   const {
@@ -123,23 +128,29 @@ Deno.serve(async (req: Request) => {
   } = body;
 
   if (!interaction_id) {
-    return new Response(JSON.stringify({
-      ok: false,
-      error: "missing_interaction_id",
-      error_code: "bad_request",
-      version: SEGMENT_CALL_VERSION,
-    }), { status: 400, headers: jsonHeaders });
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: "missing_interaction_id",
+        error_code: "bad_request",
+        version: SEGMENT_CALL_VERSION,
+      }),
+      { status: 400, headers: jsonHeaders },
+    );
   }
 
   const edgeSecret = Deno.env.get("EDGE_SHARED_SECRET");
   if (!edgeSecret) {
-    return new Response(JSON.stringify({
-      ok: false,
-      error: "config_error",
-      error_code: "config_missing",
-      hint: "EDGE_SHARED_SECRET not set",
-      version: SEGMENT_CALL_VERSION,
-    }), { status: 500, headers: jsonHeaders });
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: "config_error",
+        error_code: "config_missing",
+        hint: "EDGE_SHARED_SECRET not set",
+        version: SEGMENT_CALL_VERSION,
+      }),
+      { status: 500, headers: jsonHeaders },
+    );
   }
 
   const db = createClient(
@@ -163,13 +174,16 @@ Deno.serve(async (req: Request) => {
       .single();
 
     if (fetchErr || !callsRaw?.transcript) {
-      return new Response(JSON.stringify({
-        ok: false,
-        error: "transcript_not_found",
-        error_code: "no_transcript",
-        interaction_id,
-        version: SEGMENT_CALL_VERSION,
-      }), { status: 400, headers: jsonHeaders });
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "transcript_not_found",
+          error_code: "no_transcript",
+          interaction_id,
+          version: SEGMENT_CALL_VERSION,
+        }),
+        { status: 400, headers: jsonHeaders },
+      );
     }
 
     spanTranscript = callsRaw.transcript;
@@ -184,13 +198,16 @@ Deno.serve(async (req: Request) => {
     .eq("interaction_id", interaction_id);
 
   if (spansErr) {
-    return new Response(JSON.stringify({
-      ok: false,
-      error: "db_error",
-      error_code: "db_error",
-      detail: spansErr.message,
-      version: SEGMENT_CALL_VERSION,
-    }), { status: 500, headers: jsonHeaders });
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: "db_error",
+        error_code: "db_error",
+        detail: spansErr.message,
+        version: SEGMENT_CALL_VERSION,
+      }),
+      { status: 500, headers: jsonHeaders },
+    );
   }
 
   if (existingSpans && existingSpans.length > 0) {
@@ -202,23 +219,29 @@ Deno.serve(async (req: Request) => {
       .limit(1);
 
     if (attribErr) {
-      return new Response(JSON.stringify({
-        ok: false,
-        error: "db_error",
-        error_code: "db_error",
-        detail: attribErr.message,
-        version: SEGMENT_CALL_VERSION,
-      }), { status: 500, headers: jsonHeaders });
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "db_error",
+          error_code: "db_error",
+          detail: attribErr.message,
+          version: SEGMENT_CALL_VERSION,
+        }),
+        { status: 500, headers: jsonHeaders },
+      );
     }
 
     if (existingAttribs && existingAttribs.length > 0) {
-      return new Response(JSON.stringify({
-        ok: false,
-        error: "already_attributed",
-        error_code: "already_attributed",
-        interaction_id,
-        version: SEGMENT_CALL_VERSION,
-      }), { status: 409, headers: jsonHeaders });
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "already_attributed",
+          error_code: "already_attributed",
+          interaction_id,
+          version: SEGMENT_CALL_VERSION,
+        }),
+        { status: 409, headers: jsonHeaders },
+      );
     }
   }
 
@@ -295,13 +318,16 @@ Deno.serve(async (req: Request) => {
       .eq("interaction_id", interaction_id);
 
     if (deleteErr) {
-      return new Response(JSON.stringify({
-        ok: false,
-        error: "span_delete_failed",
-        error_code: "db_error",
-        detail: deleteErr.message,
-        version: SEGMENT_CALL_VERSION,
-      }), { status: 500, headers: jsonHeaders });
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "span_delete_failed",
+          error_code: "db_error",
+          detail: deleteErr.message,
+          version: SEGMENT_CALL_VERSION,
+        }),
+        { status: 500, headers: jsonHeaders },
+      );
     }
   }
 
@@ -339,15 +365,18 @@ Deno.serve(async (req: Request) => {
     const msg = (ins1.error.message || "").toLowerCase();
     const missingMetaCol = msg.includes("segment_metadata") && msg.includes("does not exist");
     if (!missingMetaCol) {
-      return new Response(JSON.stringify({
-        ok: false,
-        error: "span_creation_failed",
-        error_code: "db_error",
-        detail: ins1.error.message,
-        version: SEGMENT_CALL_VERSION,
-        spans_written,
-        spans_write_ok,
-      }), { status: 500, headers: jsonHeaders });
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "span_creation_failed",
+          error_code: "db_error",
+          detail: ins1.error.message,
+          version: SEGMENT_CALL_VERSION,
+          spans_written,
+          spans_write_ok,
+        }),
+        { status: 500, headers: jsonHeaders },
+      );
     }
 
     // retry without segment_metadata (migration is optional)
@@ -363,15 +392,18 @@ Deno.serve(async (req: Request) => {
       .select("id, span_index");
 
     if (ins2.error) {
-      return new Response(JSON.stringify({
-        ok: false,
-        error: "span_creation_failed",
-        error_code: "db_error",
-        detail: ins2.error.message,
-        version: SEGMENT_CALL_VERSION,
-        spans_written,
-        spans_write_ok,
-      }), { status: 500, headers: jsonHeaders });
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "span_creation_failed",
+          error_code: "db_error",
+          detail: ins2.error.message,
+          version: SEGMENT_CALL_VERSION,
+          spans_written,
+          spans_write_ok,
+        }),
+        { status: 500, headers: jsonHeaders },
+      );
     }
 
     insertedSpans = (ins2.data || []) as any;
@@ -479,10 +511,34 @@ Deno.serve(async (req: Request) => {
   );
 
   if (!allSuccess) {
-    return new Response(JSON.stringify({
-      ok: false,
-      error: "chain_failed",
-      error_code: "chain_failed",
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: "chain_failed",
+        error_code: "chain_failed",
+        version: SEGMENT_CALL_VERSION,
+        interaction_id,
+        spans_written,
+        spans_write_ok,
+        span_ids: spanIds,
+        span_count: spanCount,
+        segmenter_version: segmenterVersion,
+        segmenter_warnings: segmenterWarnings,
+        chain: {
+          attempted: true,
+          auth_mode: "X-Edge-Secret",
+          statuses: chainStatuses,
+        },
+        dry_run,
+        ms: Date.now() - t0,
+      }),
+      { status: 500, headers: jsonHeaders },
+    );
+  }
+
+  return new Response(
+    JSON.stringify({
+      ok: true,
       version: SEGMENT_CALL_VERSION,
       interaction_id,
       spans_written,
@@ -498,25 +554,7 @@ Deno.serve(async (req: Request) => {
       },
       dry_run,
       ms: Date.now() - t0,
-    }), { status: 500, headers: jsonHeaders });
-  }
-
-  return new Response(JSON.stringify({
-    ok: true,
-    version: SEGMENT_CALL_VERSION,
-    interaction_id,
-    spans_written,
-    spans_write_ok,
-    span_ids: spanIds,
-    span_count: spanCount,
-    segmenter_version: segmenterVersion,
-    segmenter_warnings: segmenterWarnings,
-    chain: {
-      attempted: true,
-      auth_mode: "X-Edge-Secret",
-      statuses: chainStatuses,
-    },
-    dry_run,
-    ms: Date.now() - t0,
-  }), { status: 200, headers: jsonHeaders });
+    }),
+    { status: 200, headers: jsonHeaders },
+  );
 });

@@ -117,14 +117,13 @@ Deno.serve(async (req: Request) => {
   const provenanceSource = body.source || "unknown";
 
   // Strict auth: X-Edge-Secret + valid provenance
-  const hasValidAuth =
-    expectedSecret &&
+  const hasValidAuth = expectedSecret &&
     edgeSecretHeader === expectedSecret &&
     ALLOWED_PROVENANCE_SOURCES.includes(provenanceSource);
 
   if (!hasValidAuth) {
     console.error(
-      `[segment-llm] Auth failed: source=${provenanceSource}, hasSecret=${!!edgeSecretHeader}`
+      `[segment-llm] Auth failed: source=${provenanceSource}, hasSecret=${!!edgeSecretHeader}`,
     );
     return new Response(
       JSON.stringify({
@@ -134,7 +133,7 @@ Deno.serve(async (req: Request) => {
         hint: "Requires X-Edge-Secret with valid provenance source",
         version: SEGMENT_LLM_VERSION,
       }),
-      { status: 401, headers: { "Content-Type": "application/json" } }
+      { status: 401, headers: { "Content-Type": "application/json" } },
     );
   }
 
@@ -158,7 +157,7 @@ Deno.serve(async (req: Request) => {
         error_code: "bad_request",
         version: SEGMENT_LLM_VERSION,
       }),
-      { status: 400, headers: { "Content-Type": "application/json" } }
+      { status: 400, headers: { "Content-Type": "application/json" } },
     );
   }
 
@@ -170,13 +169,13 @@ Deno.serve(async (req: Request) => {
         error_code: "bad_request",
         version: SEGMENT_LLM_VERSION,
       }),
-      { status: 400, headers: { "Content-Type": "application/json" } }
+      { status: 400, headers: { "Content-Type": "application/json" } },
     );
   }
 
   const transcriptLength = transcript.length;
   console.log(
-    `[segment-llm] Processing: interaction_id=${interaction_id}, len=${transcriptLength}`
+    `[segment-llm] Processing: interaction_id=${interaction_id}, len=${transcriptLength}`,
   );
 
   // ============================================================
@@ -202,7 +201,7 @@ Deno.serve(async (req: Request) => {
         warnings: ["transcript_too_short_for_segmentation"],
         ms: Date.now() - t0,
       } as SegmentLLMOutput),
-      { status: 200, headers: { "Content-Type": "application/json" } }
+      { status: 200, headers: { "Content-Type": "application/json" } },
     );
   }
 
@@ -384,9 +383,7 @@ Deno.serve(async (req: Request) => {
   // Truncate boundary_quote to 50 chars
   segments = segments.map((seg) => ({
     ...seg,
-    boundary_quote: seg.boundary_quote
-      ? seg.boundary_quote.slice(0, 50)
-      : null,
+    boundary_quote: seg.boundary_quote ? seg.boundary_quote.slice(0, 50) : null,
   }));
 
   console.log(`[segment-llm] Produced ${segments.length} segments with ${warnings.length} warnings`);
@@ -399,7 +396,7 @@ Deno.serve(async (req: Request) => {
       warnings,
       ms: Date.now() - t0,
     } as SegmentLLMOutput),
-    { status: 200, headers: { "Content-Type": "application/json" } }
+    { status: 200, headers: { "Content-Type": "application/json" } },
   );
 });
 
@@ -409,7 +406,7 @@ Deno.serve(async (req: Request) => {
 function fallbackResponse(
   transcriptLength: number,
   warnings: string[],
-  t0: number
+  t0: number,
 ): Response {
   console.log(`[segment-llm] Fallback: ${warnings.join(", ")}`);
   return new Response(
@@ -429,6 +426,6 @@ function fallbackResponse(
       warnings: ["llm_failed_fallback", ...warnings],
       ms: Date.now() - t0,
     } as SegmentLLMOutput),
-    { status: 200, headers: { "Content-Type": "application/json" } }
+    { status: 200, headers: { "Content-Type": "application/json" } },
   );
 }
