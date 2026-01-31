@@ -1,9 +1,9 @@
 /**
- * ai-router Edge Function v1.0.0
+ * ai-router Edge Function v1.0.1
  * LLM-based project attribution for conversation spans
  *
- * @version 1.0.0
- * @date 2026-01-30
+ * @version 1.0.1
+ * @date 2026-01-31
  * @purpose Use Claude Haiku to attribute spans to projects with anchored evidence
  *
  * CORE PRINCIPLE: span_attributions is the single source of truth.
@@ -634,33 +634,33 @@ Deno.serve(async (req: Request) => {
     const attribution_lock = applied ? "ai" : null;
     const needs_review = result.decision === "review" || result.decision === "none";
 
-    try {
-      await db.from("span_attributions").upsert({
-        span_id,
-        project_id: result.project_id, // Model's predicted project
-        confidence: result.confidence,
-        decision: result.decision,
-        reasoning: result.reasoning,
-        anchors: result.anchors,
-        suggested_aliases: result.suggested_aliases || [],
-        prompt_version: PROMPT_VERSION,
-        model_id: MODEL_ID,
-        raw_response,
-        tokens_used,
-        inference_ms,
-        attribution_lock,
-        applied_project_id,
-        applied_at_utc: applied ? new Date().toISOString() : null,
-        needs_review,
-        attributed_by: `ai-router-${PROMPT_VERSION}`,
-        attributed_at: new Date().toISOString(),
-      }, {
-        onConflict: "span_id,model_id,prompt_version",
-        ignoreDuplicates: false,
-      });
-    } catch (dbErr: any) {
-      console.error("span_attributions upsert failed:", dbErr.message);
-      // Continue - we still return the result
+    const { error: upsertErr } = await db.from("span_attributions").upsert({
+      span_id,
+      project_id: result.project_id, // Model's predicted project
+      confidence: result.confidence,
+      decision: result.decision,
+      reasoning: result.reasoning,
+      anchors: result.anchors,
+      suggested_aliases: result.suggested_aliases || [],
+      prompt_version: PROMPT_VERSION,
+      model_id: MODEL_ID,
+      raw_response,
+      tokens_used,
+      inference_ms,
+      attribution_lock,
+      applied_project_id,
+      applied_at_utc: applied ? new Date().toISOString() : null,
+      needs_review,
+      attributed_by: `ai-router-${PROMPT_VERSION}`,
+      attributed_at: new Date().toISOString(),
+    }, {
+      onConflict: "span_id,model_id,prompt_version",
+      ignoreDuplicates: false,
+    });
+
+    if (upsertErr) {
+      console.error("[ai-router] span_attributions upsert failed:", upsertErr.message, upsertErr.details);
+      // Continue - we still return the result but log the error
     }
 
     // ========================================
