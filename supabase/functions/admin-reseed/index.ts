@@ -2,7 +2,7 @@
  * admin-reseed Edge Function
  * Re-chunk an interaction's conversation spans (non-destructive)
  *
- * @version 1.0.0
+ * @version 1.1.0
  * @date 2026-01-31
  * @purpose Supersede old spans and create new spans for an interaction
  *
@@ -20,11 +20,11 @@
  * 1. If any active span has human lock: return 409 human_lock_present
  * 2. Idempotency: if idempotency_key exists, return stored receipt (no mutation)
  * 3. Non-destructive: supersede old spans (is_superseded=true), insert new spans
- * 4. After reseed, optionally reroute based on mode
+ * 4. After rechunk, optionally reroute based on mode
  *
- * MODES:
- * - resegment_only (default): Just re-chunk, don't call downstream
- * - resegment_and_reroute: Re-chunk + call context-assembly + ai-router
+ * MODES (legacy names, concept is "rechunk"):
+ * - resegment_only (default): Just rechunk, don't call downstream
+ * - resegment_and_reroute: Rechunk + call context-assembly + ai-router
  *
  * FAIL CLOSED: Any DB write failure returns 500
  */
@@ -32,7 +32,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { requireEdgeSecret, authErrorResponse } from "../_shared/auth.ts";
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const ALLOWED_SOURCES = ["admin-reseed", "system"];
 
 interface ReseedRequest {
@@ -256,7 +256,7 @@ Deno.serve(async (req: Request) => {
   }
 
   // ========================================
-  // 9. FETCH TRANSCRIPT FOR RE-CHUNKING
+  // 9. FETCH TRANSCRIPT FOR RECHUNKING
   // ========================================
   const { data: transcriptData } = await db
     .from("transcripts_comparison")
@@ -270,7 +270,7 @@ Deno.serve(async (req: Request) => {
 
   // ========================================
   // 10. CREATE NEW SPANS (trivial chunker for now)
-  // TODO: Replace with actual chunking logic
+  // TODO: Replace with proper chunking logic (gap-based, topic-based, etc.)
   // ========================================
   const newSpanIds: string[] = [];
 
@@ -401,7 +401,7 @@ Deno.serve(async (req: Request) => {
   // 13. RESPONSE
   // ========================================
   console.log(
-    `[admin-reseed] Completed: interaction=${interaction_id}, before=${spanCountBefore}, after=${newSpanIds.length}, ` +
+    `[admin-reseed] Rechunk completed: interaction=${interaction_id}, spans_before=${spanCountBefore}, spans_after=${newSpanIds.length}, ` +
       `mode=${mode}, reroute=${receipt.reroute_triggered}`,
   );
 
