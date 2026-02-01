@@ -69,3 +69,53 @@ jobs:
           name: proof-pack-${{ github.run_id }}
           path: /tmp/proofs/
           retention-days: 7
+
+  # Big Rock 1: CI hard gates - 4 invariant checks
+  # Source: STRAT TURN:85 tasking
+  invariant-gates:
+    runs-on: ubuntu-latest
+    # Triggers on changes to functions, migrations, or scripts
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && (
+        contains(github.event.pull_request.changed_files, 'supabase/functions/') ||
+        contains(github.event.pull_request.changed_files, 'supabase/migrations/') ||
+        contains(github.event.pull_request.changed_files, 'scripts/') ||
+        contains(github.event.pull_request.changed_files, '.camber/')
+      ))
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify secrets configured
+        id: check-secrets
+        run: |
+          if [[ -z "$SUPABASE_URL" || -z "$SUPABASE_SERVICE_ROLE_KEY" ]]; then
+            echo "::warning::Secrets not configured - invariant gates will be skipped"
+            echo "secrets_ok=false" >> $GITHUB_OUTPUT
+          else
+            echo "secrets_ok=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run invariant gates
+        if: steps.check-secrets.outputs.secrets_ok == 'true'
+        run: |
+          chmod +x ./scripts/invariant_gates.sh
+          ./scripts/invariant_gates.sh --verbose
+        continue-on-error: false
+
+      - name: Save gate results (JSON)
+        if: always() && steps.check-secrets.outputs.secrets_ok == 'true'
+        run: |
+          mkdir -p /tmp/gate-results
+          ./scripts/invariant_gates.sh --json > /tmp/gate-results/gates.json 2>/dev/null || true
+
+      - name: Upload gate results
+        if: always() && steps.check-secrets.outputs.secrets_ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: invariant-gates-${{ github.run_id }}
+          path: /tmp/gate-results/
+          retention-days: 7
