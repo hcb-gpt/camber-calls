@@ -45,10 +45,11 @@ if [[ -z "${DATABASE_URL:-}" ]]; then
   exit 1
 fi
 
-# Check if psql is available
-if ! command -v psql >/dev/null 2>&1; then
+# Use PSQL_PATH if set, otherwise look for psql in PATH
+PSQL="${PSQL_PATH:-psql}"
+if [[ ! -x "$PSQL" ]] && ! command -v "$PSQL" >/dev/null 2>&1; then
   echo "PROOF_PACK_RESULT=FAIL_NO_PSQL headSHA=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-  echo "ERROR: psql not found in PATH." >&2
+  echo "ERROR: psql not found. Set PSQL_PATH or add psql to PATH." >&2
   exit 1
 fi
 
@@ -83,7 +84,7 @@ STRICT_LINE_TXT="$RUN_DIR/strict_line.txt"
 printf '%s\n' "${PASS_LINE:-NO_CRED_CHECK}" > "$CRED_TXT"
 
 # Run proof SQL (streams full report; strict line is inside)
-psql "$DATABASE_URL" \
+"$PSQL" "$DATABASE_URL" \
   -v ON_ERROR_STOP=1 \
   -v interaction_id="$INTERACTION_ID" \
   -v strict_chunking="$STRICT_CHUNKING" \

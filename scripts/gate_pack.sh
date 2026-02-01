@@ -12,7 +12,15 @@ set -euo pipefail
 : "${DATABASE_URL:?DATABASE_URL required}"
 
 need_bin(){ command -v "$1" >/dev/null 2>&1; }
-for b in psql uuidgen git; do
+
+# Use PSQL_PATH if set, otherwise look for psql in PATH
+PSQL="${PSQL_PATH:-psql}"
+if [[ ! -x "$PSQL" ]] && ! command -v "$PSQL" >/dev/null 2>&1; then
+  echo "GATEPACK|FAIL|reason=missing_bin:psql|headSHA=unknown"
+  exit 10
+fi
+
+for b in uuidgen git; do
   need_bin "$b" || { echo "GATEPACK|FAIL|reason=missing_bin:$b|headSHA=unknown"; exit 10; }
 done
 
@@ -41,7 +49,7 @@ interaction_id_bad_single="gatepack_single_${iid_single}"
 
 set +e
 out="$(
-  psql -v ON_ERROR_STOP=1 \
+  "$PSQL" -v ON_ERROR_STOP=1 \
     -v iid_ok="$iid_ok" -v iid_gap="$iid_gap" -v iid_ovl="$iid_ovl" -v iid_single="$iid_single" \
     -v call_ok="$call_ok" -v call_gap="$call_gap" -v call_ovl="$call_ovl" -v call_single="$call_single" \
     -v interaction_id_ok="$interaction_id_ok" \
@@ -56,7 +64,9 @@ out="$(
 rc=$?
 set -e
 
-line="$(printf "%s\n" "$out" | tail -n 1 | tr -d '\r')"
+# Extract the GATEPACK receipt line (not the last line, since ROLLBACK follows)
+# Note: psql output may have leading space, so we trim and match GATEPACK anywhere
+line="$(printf "%s\n" "$out" | grep -E 'GATEPACK\|' | tail -n 1 | tr -d '\r' | sed 's/^ *//')"
 
 if [[ $rc -eq 0 && "$line" =~ ^GATEPACK\|PASS\| ]]; then
   echo "$line"

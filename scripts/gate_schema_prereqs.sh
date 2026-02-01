@@ -45,7 +45,14 @@ if [[ "${REQUIRE_LOAD_ENV:-}" == "true" && -n "$REPO_ROOT" ]]; then
 fi
 
 need_bin(){ command -v "$1" >/dev/null 2>&1; }
-need_bin psql || { echo "PREREQS|FAIL|missing=1|details=missing_bin:psql"; exit 10; }
+
+# Use PSQL_PATH if set, otherwise look for psql in PATH
+PSQL="${PSQL_PATH:-psql}"
+if [[ ! -x "$PSQL" ]] && ! command -v "$PSQL" >/dev/null 2>&1; then
+  echo "PREREQS|FAIL|missing=1|details=missing_bin:psql"
+  exit 10
+fi
+
 need_bin jq || { echo "PREREQS|FAIL|missing=1|details=missing_bin:jq"; exit 10; }
 
 REQ_SQL=$(cat <<'SQL'
@@ -90,7 +97,7 @@ from missing;
 SQL
 )
 
-payload="$(psql -t -A -v ON_ERROR_STOP=1 -c "$REQ_SQL" "$DATABASE_URL" 2>/dev/null || true)"
+payload="$("$PSQL" -t -A -v ON_ERROR_STOP=1 -c "$REQ_SQL" "$DATABASE_URL" 2>/dev/null || true)"
 if [[ -z "$payload" ]]; then
   echo "PREREQS|FAIL|missing=1|details=db_query_failed"
   exit 1
