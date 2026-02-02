@@ -16,7 +16,7 @@
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
-const SEGMENT_LLM_VERSION = "segment-llm_v1.1.0";
+const SEGMENT_LLM_VERSION = "segment-llm_v1.2.0";
 
 // ============================================================
 // STRUCTURED LOGGING (per GPT-DEV-6 spec)
@@ -433,6 +433,151 @@ Deno.serve(async (req: Request) => {
     return fallbackResponse(transcriptLength, ["all_segments_invalid"], t0);
   }
 
+  // ============================================================
+  // RETRY LOGIC: Single span on long transcript (P0 Task)
+  // ============================================================
+  // If transcript > 2000 chars and LLM returned only 1 span, retry with stricter instruction
+  let retriedOnce = false;
+  if (transcriptLength > 2000 && segments.length === 1) {
+    console.log(`[segment-llm] Single span on long transcript (${transcriptLength} chars) - retrying with stricter instruction`);
+    warnings.push("single_span_retry_attempt");
+    retriedOnce = true;
+
+    // Stricter prompt that demands at least 2 chunks
+    const stricterPrompt = `You are a call transcript segmenter for a construction company.
+
+CRITICAL REQUIREMENT: For transcripts over 2000 characters, you MUST produce AT LEAST 2 segments unless the call is genuinely single-topic with NO project switches whatsoever.
+
+Your task: Identify boundaries where the conversation switches from one PROJECT to another.
+
+RULES:
+1. A "project" is a specific construction job (e.g., "Johnson Residence", "Smith Project", "the Hurley job")
+2. For transcripts > 2000 chars: find at least ONE natural break point (topic shift, pause, speaker change on different topic)
+3. If truly single-topic: return 1 segment with high confidence, but this should be rare for long calls
+4. Each segment must be >= {MIN_CHARS} characters (merge smaller ones into previous)
+5. Maximum {MAX_SEGMENTS} segments total
+6. Segments must be contiguous (no gaps, no overlaps)
+
+OUTPUT FORMAT (JSON only, no markdown):
+{
+  "segments": [
+    {
+      "span_index": 0,
+      "char_start": 0,
+      "char_end": <end_char>,
+      "boundary_reason": "initial_project|topic_shift|project_switch|natural_break",
+      "confidence": 0.0-1.0,
+      "boundary_quote": "<exact quote <=50 chars showing the switch>"
+    }
+  ]
+}
+
+TRANSCRIPT:
+{TRANSCRIPT}`;
+
+    const retryPrompt = stricterPrompt
+      .replace("{TRANSCRIPT}", transcript)
+      .replace("{MIN_CHARS}", String(min_segment_chars))
+      .replace("{MAX_SEGMENTS}", String(max_segments));
+
+    try {
+      const retryResp = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${openaiKey}`,
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          max_tokens: 1024,
+          messages: [
+            {
+              role: "user",
+              content: retryPrompt,
+            },
+          ],
+        }),
+      });
+
+      if (retryResp.ok) {
+        const retryData = await retryResp.json();
+        const retryContent = (retryData.choices?.[0]?.message?.content || "")
+          .replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+
+        try {
+          const retryParsed = JSON.parse(retryContent);
+          if (Array.isArray(retryParsed.segments) && retryParsed.segments.length > 0) {
+            // Re-run guardrails on retry result (simplified version)
+            let retrySegments = retryParsed.segments;
+            retrySegments = retrySegments.map((seg: any) => ({
+              ...seg,
+              char_start: Math.max(0, Math.min(seg.char_start, transcriptLength)),
+              char_end: Math.max(0, Math.min(seg.char_end, transcriptLength)),
+            }));
+            retrySegments.sort((a: any, b: any) => a.char_start - b.char_start);
+            retrySegments = retrySegments.map((seg: any, idx: number) => ({ ...seg, span_index: idx }));
+
+            // Make contiguous
+            for (let i = 1; i < retrySegments.length; i++) {
+              if (retrySegments[i].char_start !== retrySegments[i - 1].char_end) {
+                retrySegments[i].char_start = retrySegments[i - 1].char_end;
+              }
+            }
+            if (retrySegments[0].char_start !== 0) retrySegments[0].char_start = 0;
+            if (retrySegments[retrySegments.length - 1].char_end !== transcriptLength) {
+              retrySegments[retrySegments.length - 1].char_end = transcriptLength;
+            }
+
+            // If retry gave us multiple segments, use them!
+            if (retrySegments.length > 1) {
+              console.log(`[segment-llm] Retry successful: ${retrySegments.length} segments`);
+              segments = retrySegments;
+              warnings.push("single_span_retry_successful");
+            } else {
+              warnings.push("single_span_retry_still_single");
+            }
+          }
+        } catch (_retryParseErr) {
+          warnings.push("single_span_retry_parse_error");
+        }
+      } else {
+        warnings.push("single_span_retry_http_error");
+      }
+    } catch (_retryErr: any) {
+      warnings.push("single_span_retry_fetch_error");
+    }
+  }
+
+  // ============================================================
+  // DETERMINISTIC FALLBACK: If still single span after retry
+  // ============================================================
+  if (transcriptLength > 2000 && segments.length === 1) {
+    console.log(`[segment-llm] Still single span after retry - using deterministic fallback split`);
+    warnings.push("deterministic_fallback_applied");
+
+    // Split transcript into 2-4 equal segments based on length
+    const numFallbackSegments = transcriptLength < 5000 ? 2 : transcriptLength < 10000 ? 3 : 4;
+    const segmentSize = Math.floor(transcriptLength / numFallbackSegments);
+
+    segments = [];
+    for (let i = 0; i < numFallbackSegments; i++) {
+      const charStart = i * segmentSize;
+      const charEnd = i === numFallbackSegments - 1 ? transcriptLength : (i + 1) * segmentSize;
+      segments.push({
+        span_index: i,
+        char_start: charStart,
+        char_end: charEnd,
+        boundary_reason: "deterministic_fallback_split",
+        confidence: 0.5, // Lower confidence for fallback
+        boundary_quote: null,
+      });
+    }
+
+    // Mark these segments with fallback metadata flag
+    // This will be added to segment_metadata in segment-call
+    warnings.push(`fallback_split_${numFallbackSegments}_segments`);
+  }
+
   // Truncate boundary_quote to 50 chars
   segments = segments.map((seg) => ({
     ...seg,
@@ -446,6 +591,8 @@ Deno.serve(async (req: Request) => {
   structuredLog("INFO", "segment_llm_response", requestId, interaction_id, {
     segments_returned: segments.length,
     duration_ms: durationMs,
+    retry_attempted: retriedOnce,
+    deterministic_fallback: warnings.includes("deterministic_fallback_applied"),
   });
 
   return new Response(
