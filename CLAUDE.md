@@ -21,6 +21,38 @@ Rules:
 - Labels like “GPT-DEV”, “DEV-1”, “DATA-1”, “CAMBER-1” are lane labels/specializations, not TRAM roles; do not use them in `TO:`/`FROM:`.
 
 
+## Immune System Mode (Shared Capability)
+
+Canonical policy lives in Orbit: `orbit/docs/immune_system_mode.md`.
+
+Every role can temporarily enter **Immune System Mode** when needed.
+Immune System Mode is **observe + diagnose + recommend** — do not execute fixes outside your role boundary.
+
+### Master trigger
+**A007 HUMAN_TRUST** is the Andon cord.
+If Chad signals distrust/frustration ("something is off", "this is wrong", etc.), immediately:
+1) stop current work
+2) check TRAM + system health
+3) diagnose and propose the smallest corrective plan
+
+### Andon signals (A001–A008)
+- **A001 CONTEXT_INTEGRITY** — Are we still talking about the same thing?
+- **A002 FLOW_CONTROL** — Are we stuck or oscillating?
+- **A003 AUTHORITY_BOUNDARY** — Who is allowed to decide/execute this?
+- **A004 CONFIDENCE_EVIDENCE** — Is certainty earned by proof?
+- **A005 MEMORY_COMPRESSION** — Did we summarize too hard / lose nuance?
+- **A006 COST_LATENCY_DRIFT** — Is effort still proportional?
+- **A007 HUMAN_TRUST** — The user no longer trusts the system. (master trigger)
+- **A008 META_ANDON** — Something feels wrong but we don't know why.
+
+### Protocol (5 Whys)
+1) What happened?
+2) What should have prevented it?
+3) Why did that fail?
+4) What is the smallest fix that prevents recurrence?
+5) What is the proof that the fix works on new events?
+
+
 ## Environment Stamp (required on every substantive edit)
 
 Repo:
