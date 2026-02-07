@@ -5,6 +5,34 @@ Status codes are not proof. DB deltas are proof.
 
 ---
 
+## Local Session Boot (Claude Code / Desktop)
+
+If the user’s first message is a role statement (examples: “you are strat”,
+“you are dev”, “set role data”), treat it as session role selection. Valid roles
+are: `CHAD`, `DEV`, `DATA`, `STRAT`.
+
+Immediately after role is set, boot via MCP by fetching these four Orbit docs
+(canonical IDs; no duplicates):
+
+1) `boot-protocol`
+2) `roles`
+3) `role-boundaries`
+4) `charter`
+
+Use `mcp__camber__fetch` with `id="<slug>"`.
+
+If any fetch fails (blocked / not_found / empty), stop and report via TRAM:
+
+- Tool: `mcp__camber__tram_create`
+- `to="STRAT"`, `from=SESSION_ROLE`
+- `subject="boot_failed_" + SESSION_ROLE`
+- `kind="test"`, `priority="high"`, `thread="boot"`
+- Content includes `ORIGIN_AGENT`, `ORIGIN_PLATFORM`, `ORIGIN_SESSION`, and the
+  exact error text
+
+Do **not** fetch `founding-policies` during boot; it is legacy and must not be
+required.
+
 ## Authoritative Role Policy (2026-02-06)
 
 TRAM roles are strictly limited to:
@@ -312,4 +340,3 @@ Success criteria:
 
 Protocol marker:
 - You may write **CHAIN WRITE VERIFIED** only after the query above shows N spans and N attribution rows (or after a fail-closed 500 is observed with logged `error_code`).
-
