@@ -1,292 +1,96 @@
 # CLAUDE.md — CAMBER v4 Operating Manual
 
-This is the single "boot + contract" doc for v4. If it's not here, it's not a rule.
+This is the single “boot + contract” doc for v4. If it’s not here, it’s not a rule.
 Status codes are not proof. DB deltas are proof.
 
 ---
 
-## NEW DEV FAST START (read this first)
+## Local Session Boot (Claude Code / Desktop)
 
-### Canonical Call (everyone uses the same target)
-**interaction_id:** `cll_06DSX0CVZHZK72VCVW54EH9G3C`
+If the user’s first message is a role statement (examples: “you are strat”,
+“you are dev”, “set role data”), treat it as session role selection. Valid roles
+are: `CHAD`, `DEV`, `DATA`, `STRAT`.
 
-This is the real call we use for all proof + replay work.
+Immediately after role is set, boot via MCP by fetching these four Orbit docs
+(canonical IDs; no duplicates):
 
-### One Command to Validate Pipeline
-```bash
-./scripts/replay_call.sh cll_06DSX0CVZHZK72VCVW54EH9G3C --reseed --reroute
-```
+1) `boot-protocol`
+2) `roles`
+3) `role-boundaries`
+4) `charter`
 
-### Strict PASS Template (paste exactly)
-```
-PASS | cll_06DSX0CVZHZK72VCVW54EH9G3C | gen=<n> spans_total=<n> spans_active=<n> attributions=<n> review_queue=<n> gap=<n> reseeds=<n> | headSHA=<sha>
-```
+Use `mcp__camber__fetch` with `id="<slug>"`.
 
-### Current Reality & Next Gate
-- Proof pack is **PASS** on canonical call
-- BUT chunking collapses to single span: `spans_total=1 spans_active=1` (transcript ~10k chars)
-- **Next gate:** Make `spans_total > 1` without breaking PASS
-- Currently warn-only, will become strict gate once fixed
+If any fetch fails (blocked / not_found / empty), stop and report via TRAM:
 
-### P0 Task: Fix Chunking
-**Where:** `supabase/functions/segment-llm` + `supabase/functions/segment-call`
+- Tool: `mcp__camber__tram_create`
+- `to="STRAT"`, `from=SESSION_ROLE`
+- `subject="boot_failed_" + SESSION_ROLE`
+- `kind="test"`, `priority="high"`, `thread="boot"`
+- Content includes `ORIGIN_AGENT`, `ORIGIN_PLATFORM`, `ORIGIN_SESSION`, and the
+  exact error text
 
-**Required behavior:**
-- If `transcript_chars > 2000` AND chunker returns 1 span:
-  1. Retry with stricter instruction ("must produce at least 2 chunks unless truly single-topic")
-  2. If still 1: deterministic fallback split into 2-4 spans by char ranges
-  3. Mark fallback in span metadata (`segment_metadata.fallback=true`)
+Do **not** fetch `founding-policies` during boot; it is legacy and must not be
+required.
 
-**Testing with idempotency:** Use `admin-reseed` with reroute to generate new generation (canonical call already has attributions, so segment-call may refuse re-chunk due to `already_attributed` rule).
+## Authoritative Role Policy (2026-02-06)
 
-**Acceptance:** Canonical call PASS line shows `spans_total > 1` AND `gap=0`.
+TRAM roles are strictly limited to:
+- CHAD (human)
+- DEV
+- DATA
+- STRAT
 
-### Vocabulary Rule
-- **In prose/logs/comments:** say "chunking" / "rechunk"
-- **Legacy slugs remain:** `segment-call`, `segment-llm`, `segment_generation` (don't rename routes mid-sprint)
+Rules:
+- Roles are platform-agnostic (no GPT_BROWSER, no KAIZEN, no SYSTEM, no ALL).
+- Browser-run agents must participate by explicitly selecting one of the four roles at runtime.
+- No sender remap/fallback is permitted.
+- Platform identity belongs in origin metadata (e.g., `ORIGIN_PLATFORM`, `ORIGIN_CLIENT`, `ORIGIN_SESSION`), not in `FROM:`.
+- Labels like “GPT-DEV”, “DEV-1”, “DATA-1”, “CAMBER-1” are lane labels/specializations, not TRAM roles; do not use them in `TO:`/`FROM:`.
 
-### Credential Protocol (mandatory before everything)
 
-**First-time setup (if ~/.camber/ doesn't exist):**
-```bash
-# 1. Create credential store
-mkdir -p ~/.camber
+## Immune System Mode (Shared Capability)
 
-# 2. Copy credentials from source
-# (Chad will provide credentials.env or point to source)
-cp /path/to/credentials.env ~/.camber/credentials.env
-chmod 600 ~/.camber/credentials.env
+Canonical policy lives in Orbit: `orbit/docs/immune_system_mode.md`.
 
-# 3. Install auto-loader in shell profile
-cat >> ~/.zshrc << 'EOF'
-# CAMBER Auto-load credentials
-if [ -f "$HOME/.camber/load-credentials.sh" ]; then
-    source "$HOME/.camber/load-credentials.sh"
-fi
-EOF
+Every role can temporarily enter **Immune System Mode** when needed.
+Immune System Mode is **observe + diagnose + recommend** — do not execute fixes outside your role boundary.
 
-# 4. Copy loader script to ~/.camber/
-cp scripts/load-credentials.sh ~/.camber/
-chmod +x ~/.camber/load-credentials.sh
+### Master trigger
+**A007 HUMAN_TRUST** is the Andon cord.
+If Chad signals distrust/frustration ("something is off", "this is wrong", etc.), immediately:
+1) stop current work
+2) check TRAM + system health
+3) diagnose and propose the smallest corrective plan
 
-# 5. Reload shell
-source ~/.zshrc
-```
+### Andon signals (A001–A008)
+- **A001 CONTEXT_INTEGRITY** — Are we still talking about the same thing?
+- **A002 FLOW_CONTROL** — Are we stuck or oscillating?
+- **A003 AUTHORITY_BOUNDARY** — Who is allowed to decide/execute this?
+- **A004 CONFIDENCE_EVIDENCE** — Is certainty earned by proof?
+- **A005 MEMORY_COMPRESSION** — Did we summarize too hard / lose nuance?
+- **A006 COST_LATENCY_DRIFT** — Is effort still proportional?
+- **A007 HUMAN_TRUST** — The user no longer trusts the system. (master trigger)
+- **A008 META_ANDON** — Something feels wrong but we don't know why.
 
-**Verify credentials work:**
-```bash
-./scripts/test-credentials.sh
-# Expected: ✅ All credentials loaded
-```
+### Protocol (5 Whys)
+1) What happened?
+2) What should have prevented it?
+3) Why did that fail?
+4) What is the smallest fix that prevents recurrence?
+5) What is the proof that the fix works on new events?
 
-All scripts MUST source: `scripts/load-env.sh` (CI enforced).
-
-### Tool Management (permanent, never lost)
-
-**Central tool repository:** `~/.camber/tools/`
-
-**Why:** Tools in repo `scripts/` directories can be lost on branch switches. Canonical versions in `~/.camber/tools/` survive all branch operations.
-
-**Tool inventory (5 essential scripts):**
-1. `replay_call.sh` (8.5K) - Pipeline validation (this file line 16)
-2. `test-credentials.sh` (1.1K) - Credential verification (this file line 78)
-3. `load-env.sh` (1.2K) - Script credential loader (sourced by all scripts)
-4. `shadow-batch.sh` (3.2K) - Batch shadow testing
-5. `test-shadow.sh` (891B) - Individual shadow testing
-
-**Operations:**
-
-**Install tools to current repo/worktree:**
-```bash
-~/.camber/install-tools.sh
-# ✅ All 5 tools installed to ./scripts/
-```
-
-**Check sync status (canonical vs repo):**
-```bash
-~/.camber/sync-tools.sh --check
-# Shows: ✅ in sync / ⚠️ differs / ❌ missing
-```
-
-**Update repo from canonical (safe):**
-```bash
-~/.camber/sync-tools.sh --to-repo
-# Copies canonical → repo (read-only to canonical)
-```
-
-**Update canonical from repo (after PR merge):**
-```bash
-cd /path/to/repo  # Must be on master with merged changes
-~/.camber/sync-tools.sh --from-repo
-# Interactive confirmation for each tool
-```
-
-**Recovery if tools lost:**
-```bash
-# One command restores all from canonical
-~/.camber/install-tools.sh
-```
-
-**Full documentation:** `~/.camber/TOOLS.md`
-
-**Never lost guarantee:** All tools referenced in this file are preserved in `~/.camber/tools/` and can be installed to any repo/worktree with one command.
-
-### Branch Protocol (prevent drift)
-**DO NOT create a branch immediately.** Start on master.
-
-**Workflow:**
-1. Stay on master
-2. Read CLAUDE.md (this file)
-3. Understand your task from STRAT or Phase roadmap
-4. THEN create branch with meaningful name
-
-**Branch naming:**
-- Format: `<type>/<description>`
-- Types: `feat/`, `fix/`, `docs/`, `test/`, `refactor/`
-- Description: what you're actually doing (not random names)
-- Examples:
-  - `feat/chunking-retry-fallback` (Phase 1 P0)
-  - `fix/segment-llm-boundary-clamp`
-  - `feat/review-resolve-endpoints` (Phase 3)
-  - NOT: `my-branch`, `test123`, `dev-work`
-
-**Create branch only when ready:**
-```bash
-# After you know what you're doing:
-git checkout -b feat/chunking-retry-fallback
-```
-
-**Why:** Random branches = documentation drift. Named branches = reviewable intent.
-
-### Auth/Credentials Patterns (fixes "gymnastics" forever)
-
-**Problem:** Shell state doesn't persist between Bash tool invocations. Credentials loaded via `source` disappear on next command.
-
-**WRONG (unreliable):**
-```bash
-source ~/.camber/credentials.env
-curl "$SUPABASE_URL/rest/v1/rpc/some_function"  # ❌ $SUPABASE_URL is empty
-```
-
-**RIGHT (always works):**
-```bash
-# Pattern 1: Export inline (bash scripts)
-export $(grep -v '^#' ~/.camber/credentials.env | xargs) && \
-  curl "$SUPABASE_URL/rest/v1/rpc/some_function"
-
-# Pattern 2: Chain commands with &&
-source ~/.camber/credentials.env && \
-  export SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY EDGE_SHARED_SECRET && \
-  curl "$SUPABASE_URL/rest/v1/rpc/some_function"
-
-# Pattern 3: Use explicit values (scripts)
-SUPABASE_URL=$(grep SUPABASE_URL ~/.camber/credentials.env | cut -d= -f2)
-curl "$SUPABASE_URL/rest/v1/rpc/some_function"
-```
-
-**Edge Function Auth Stack (all layers required):**
-
-| Layer | What's Needed | Why |
-|-------|---------------|-----|
-| **Gateway** | `Authorization: Bearer <SERVICE_ROLE_KEY>` | Gateway rejects without it (even with `verify_jwt=false`) |
-| **Function** | `X-Edge-Secret: <EDGE_SHARED_SECRET>` | Function's own auth logic |
-| **Function** | `source` in allowlist (e.g., `segment-call`) | Provenance verification |
-| **Deploy** | `--no-verify-jwt` flag OR `verify_jwt=false` in config.toml | Otherwise gateway validates JWT before function runs |
-
-**Internal Function-to-Function Calls:**
-
-```typescript
-// ❌ WRONG - Gateway returns 401
-const response = await fetch(`${SUPABASE_URL}/functions/v1/segment-llm`, {
-  headers: {
-    "X-Edge-Secret": edgeSecret,  // Not enough!
-  },
-  body: JSON.stringify({ ... }),
-});
-
-// ✅ RIGHT - Both auth layers
-const response = await fetch(`${SUPABASE_URL}/functions/v1/segment-llm`, {
-  headers: {
-    "Authorization": `Bearer ${Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")}`,  // Gateway auth
-    "X-Edge-Secret": edgeSecret,                                             // Function auth
-    "X-Source": "admin-reseed",                                              // Provenance
-    "Content-Type": "application/json",
-  },
-  body: JSON.stringify({ ... }),
-});
-```
-
-**Deployment for Internal Functions:**
-
-```bash
-# ❌ WRONG - Defaults to verify_jwt=true
-supabase functions deploy segment-llm
-
-# ✅ RIGHT - Explicit no-verify-jwt
-supabase functions deploy segment-llm --no-verify-jwt
-
-# Or in supabase/functions/segment-llm/config.toml:
-[functions.segment-llm]
-verify_jwt = false
-```
-
-**External curl to Edge Functions:**
-
-```bash
-# Always include Authorization header (even for verify_jwt=false functions)
-curl -X POST "${SUPABASE_URL}/functions/v1/admin-reseed" \
-  -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-  -H "X-Edge-Secret: ${EDGE_SHARED_SECRET}" \
-  -H "X-Source: test" \
-  -H "Content-Type: application/json" \
-  -d '{"interaction_id":"cll_test","mode":"resegment_only"}'
-```
-
-**Script Pattern (in repo scripts/):**
-
-```bash
-#!/bin/bash
-set -euo pipefail
-
-# Auto-load credentials
-if [[ -f "$HOME/.camber/load-credentials.sh" ]]; then
-  source "$HOME/.camber/load-credentials.sh" 2>/dev/null || true
-fi
-
-# Verify loaded (fail closed)
-for var in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY EDGE_SHARED_SECRET; do
-  if [[ -z "${!var:-}" ]]; then
-    echo "ERROR: Missing env var: $var" >&2
-    exit 2
-  fi
-done
-
-# Now use credentials (they're in scope for this script)
-curl -X POST "${SUPABASE_URL}/functions/v1/some-function" \
-  -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-  ...
-```
-
-**Key Takeaways:**
-1. **Gateway auth ≠ Function auth** - Both required for internal calls
-2. **Shell state is ephemeral** - Use export pattern or chain with &&
-3. **verify_jwt defaults to true** - Always deploy with `--no-verify-jwt` for internal functions
-4. **Bearer token required** - Even when `verify_jwt=false`, gateway still needs it
-
-**Never:** Assume `source` persists across commands in Bash tool calls.
-
----
 
 ## Environment Stamp (required on every substantive edit)
 
 Repo:
-- org/repo: hcb-gpt/beside-v3.8
-- branch: master
-- HEAD (sha + subject): 4811106 Merge pull request #18 from hcb-gpt/merge-all-branches-to-master
+- org/repo:
+- branch:
+- HEAD (sha + subject):
 Supabase:
-- project ref: rjhdwidddtfetbwqolof
-- functions deployed (names only): process-call, segment-call, segment-llm, context-assembly, ai-router, admin-reseed, eval-ai-router, transcribe-deepgram, transcribe-assemblyai, transcribe-claude, transcribe-whisper, transcribe-audio, review-resolve, sync-google-contacts, test-tma-fetch, dlq-enqueue
-Stamp Date (UTC): 2026-01-31T19:57Z
+- project ref:
+- functions deployed (names only):
+Stamp Date (UTC):
 
 ---
 
@@ -304,103 +108,54 @@ v4 adds LLM-powered segmentation so that a multi-project call produces **N spans
 
 ## B) Roles and division of labor (lane rules)
 
-**Reporting chain (mandatory):**
-- **DEV reports to STRAT** via TRAM messages
-- When blocked or need decisions: write `TO:STRAT FROM:DEV` message with BLOCKED protocol
-- STRAT routes all work, DEV executes
-- Read TRAM daily for new tasks from STRAT
+TRAM roles (`TO:`/`FROM:`) are only: **CHAD**, **DEV**, **DATA**, **STRAT**.
 
-**STRAT (your manager):**
-- Routes work and defines acceptance tests
-- Does **not** code, test, deploy, or rotate secrets
-- Gives you tasks via TRAM (check `/Users/chadbarlow/Library/CloudStorage/GoogleDrive-admin@heartwoodcustombuilders.com/My Drive/_camber/Camber/01_TRAM/` daily)
+Responsibility lanes (NOT TRAM roles):
+- **STRAT** routes work and defines acceptance tests.
+- **DEV** executes patches, runs tests, deploys, rotates secrets, posts receipts.
+- **DATA** owns DB migrations/constraints/views/RPCs and post-deploy measurement.
+- **CHAD** resolves tradeoffs and conflicts; no execution tasks.
 
-**DEV (you):**
-- Applies patches (from GPT-DEV PRs)
-- Runs tests
-- Deploys
-- Rotates secrets
-- Posts receipts back to STRAT via TRAM
-
-**When to write TO:STRAT:**
-- Task complete (with receipt)
-- Blocked and need help (with BLOCKED protocol)
-- Found issue requiring decision
-- Daily status if working multi-day task
-
-**GPT-DEV-* (code writers):**
-- Write code only: diffs + PR descriptions + test steps + rollback notes
-- No deploys
-
-**DATA-1 (database owner):**
-- Migrations/constraints/indexes/views/RPCs
-- Post-deploy measurement
-
-**CAMBER-1 (reviewer + blocker):**
-- Can BLOCK merges/deploys on stopline violations
-
-**Chad (referee only):**
-- Resolves tradeoffs and conflicts, no execution tasks
-
----
+Non-role labels you may see in older docs (do not use in `TO:`/`FROM:`):
+- “GPT-DEV-*” = code-writing assistants (diffs/PRs/test steps/rollback notes; no deploys)
+- “DATA-*” = data workers (delegated by DATA)
+- “CAMBER-*” = review gate / stopline enforcement
 
 ## C) TRAM + async comms protocol (enforced)
 
-**TRAM path (check daily):**
+TRAM path (messages + downloads):
 `/Users/chadbarlow/Library/CloudStorage/GoogleDrive-admin@heartwoodcustombuilders.com/My Drive/_camber/Camber/01_TRAM/`
 
-**TRAM message filename format:**
-`to_{TO}_from_{FROM}_{YYYYMMDDTHHMM}Z_{SUBJECT}.md`
+TRAM message filename format (legacy; do not rely on it):
+`{TO}_{FROM}_{YYYYMMDDTHHMM}Z_{SUBJECT}.md`
 
-Example: `to_STRAT_from_DEV_20260131T2045Z_pr18_merged_ready_for_review.md`
+Rules:
 
-**Message header (first line):**
-```
-TO:STRAT FROM:DEV TURN:5 TS_UTC:2026-01-31T20:45Z RECEIPT:PR#18/headSHA:d5dd14c/CI:pass
-```
-
-**Rules:**
-- First token (TO) is the recipient so Chad can route without opening
-- ≤50 words narration (code blocks don't count)
+- `TO:`/`FROM:` must be one of `CHAD`, `DEV`, `DATA`, `STRAT`.
+- Do not invent roles (no GPT_BROWSER, no KAIZEN, no SYSTEM, no ALL).
+- If you need platform tagging, put it in origin metadata (e.g., `ORIGIN_PLATFORM`, `ORIGIN_CLIENT`, `ORIGIN_SESSION`), not in `FROM:`.
+- First token (TO) is the recipient so Chad can route without opening.
+- ≤50 words narration (code blocks don’t count).
 - Use tags:
   - `⚡ CHAD:` needs a human decision
   - `🚫 BLOCKED:` cannot proceed
   - `✅ DONE:` task complete
 
-**When to write TO:STRAT:**
-1. Task complete → include receipt (commit SHA, PR number, deploy slug)
-2. Blocked → use BLOCKED protocol below
-3. Daily progress → if multi-day task
-4. Found issue → needs decision
-
-**BLOCKED protocol (mandatory when stuck):**
-1. What is blocked
-2. Why
-3. What decision/info unblocks
-4. Who can unblock (usually STRAT)
-
-**No guesswork. No workarounds.** If blocked, write TO:STRAT immediately.
-
-**Example BLOCKED message:**
-```markdown
-TO:STRAT FROM:DEV TURN:12 TS_UTC:2026-02-01T14:30Z RECEIPT:blocked
-
-🚫 BLOCKED: Cannot complete chunking fallback
-
-1. What: Phase 1 P0 task (chunking retry + fallback)
-2. Why: Unclear if fallback should use speaker-turn or paragraph-based split
-3. Unblocks: Decision on fallback algorithm (speaker-turn vs paragraph vs fixed-char)
-4. Who: STRAT (owns acceptance criteria)
-
-Awaiting guidance.
-```
+BLOCKED protocol:
+1) what is blocked
+2) why
+3) what decision/info unblocks
+4) who can unblock
+No guesswork and no workarounds.
 
 ---
 
 ## D) Message headers + receipts (mechanically verifiable)
 
 Every message begins with:
-`TO:<role/team> FROM:<role> TURN:<n> TS_UTC:<YYYY-MM-DDTHH:MMZ> RECEIPT:<artifact>`
+`TO:<role> FROM:<role> TURN:<n> TS_UTC:<YYYY-MM-DDTHH:MMZ> RECEIPT:<artifact>`
+
+Allowed roles for `TO:`/`FROM:`: `CHAD`, `DEV`, `DATA`, `STRAT`.
 
 Allowed RECEIPT formats (choose one primary):
 - `PR#<n>/headSHA:<sha>/CI:<pass|fail>`
@@ -420,33 +175,7 @@ Valid review targeting:
 
 ---
 
-## E) Credential management (established 2026-01-31)
-
-**Central credential store:** `~/.camber/credentials.env` (chmod 600)
-
-All credentials auto-load in new shells via `~/.zshrc`. Scripts should source:
-```bash
-source "$(git rev-parse --show-toplevel)/scripts/load-env.sh"
-```
-
-Available credentials:
-- SUPABASE_URL
-- SUPABASE_SERVICE_ROLE_KEY
-- EDGE_SHARED_SECRET
-- ANTHROPIC_API_KEY
-- OPENAI_API_KEY
-- DEEPGRAM_API_KEY
-- ASSEMBLYAI_API_KEY
-- PIPEDREAM_API_KEY
-- CLI (Supabase access token)
-
-**Never commit credentials to git.** All `.env.local` files are gitignored.
-
-Documentation: `~/.camber/README.md` and `CREDENTIALS.md` in repo.
-
----
-
-## F) Anti-drift protocol (v2)
+## E) Anti-drift protocol (v2)
 
 Drift = prod (runtime) differs from git (reviewable truth).
 
@@ -472,7 +201,7 @@ Drift is closed only when BOTH are true:
 
 ---
 
-## G) v4 Sprint 0 deliverable — LLM segmenter
+## F) v4 Sprint 0 deliverable — LLM segmenter
 
 ### Problem statement
 Current segmenting is trivial (1 call = 1 span). Multi-project calls get forced into one attribution. v4 fixes that by segmenting into multiple spans before routing.
@@ -534,7 +263,7 @@ Segmenter never does:
 
 ---
 
-## H) Orchestration (call → N spans → N attributions)
+## G) Orchestration (call → N spans → N attributions)
 
 Chain:
 `process-call → segment-call → segment-llm → (for each span) context-assembly → ai-router`
@@ -555,7 +284,7 @@ DB note:
 
 ---
 
-## I) Attribution uniqueness decision gate (DATA-A + DATA-1)
+## H) Attribution uniqueness decision gate (DATA-A + DATA-1)
 
 We must choose and enforce ONE meaning:
 
@@ -575,7 +304,7 @@ Until decided: do not change constraints silently; document which option is acti
 
 ---
 
-## J) Acceptance tests (DEV executes)
+## I) Acceptance tests (DEV executes)
 
 Synthetic multi-project (forced switch):
 - Use a transcript with an explicit switch (“Now about Hurley… also Skelton…”)
@@ -611,76 +340,3 @@ Success criteria:
 
 Protocol marker:
 - You may write **CHAIN WRITE VERIFIED** only after the query above shows N spans and N attribution rows (or after a fail-closed 500 is observed with logged `error_code`).
-
----
-
-## K) Phased Roadmap (STRAT TURN 79)
-
-### Phase 1: Fix Chunking Quality
-**Gate:** Canonical call shows `spans_total > 1` AND PASS
-
-**DEV tasks:**
-1. Make single-span on long transcripts self-correcting
-   - If `transcript_chars > 2000` AND chunker returns 1 span: retry with stricter instruction, then fallback to deterministic split
-   - Mark fallback in metadata
-2. Upgrade warning to controlled gate (after fix ships)
-   - Canonical call requires `spans_total > 1`
-   - Keep warn-only for other calls initially
-3. Re-run proof-pack with strict template
-
-**DATA-1 tasks:**
-1. Add `transcript_chars` to scoreboard output
-2. Add chunk quality distribution query (% calls where `transcript_chars > 2000` and `spans_total = 1`)
-
-**CAMBER-1 review:**
-- Verify no correctness regression: fallback chunking preserves idempotency, no partial writes, SSOT unchanged
-- If proof-pack PASS and no new gaps: approve fast
-
-**GPT-DEV tasks:**
-- GPT-DEV-1: Add `--strict-chunking` mode to replay script
-- GPT-DEV-2: Update proof SQL with `expected_min_spans` + FAIL_REASON rows
-- GPT-DEV-3: Draft chunker prompt upgrade for more splits on long calls
-
-### Phase 2: Backfill + Batch Replay + Ops Signals
-**Gate:** `gap_count = 0` AND CI stays green
-
-**DEV tasks:**
-1. Run `scripts/shadow_batch_autopick.sh` nightly
-2. Make failures actionable (retry list + DLQ list output)
-
-**DATA-1 tasks:**
-1. Make `scripts/regression_detector_v2.sql` daily check
-2. Add snapshot retention/pruning
-
-**GPT-DEV tasks:**
-- GPT-DEV-4: Extend autopick to include chunk quality failures
-- GPT-DEV-6: Turn daily digest into scheduled runner (CI cron)
-
-### Phase 3: Review Workbench Backend
-**Gate:** "resolve" action is idempotent + audited + clears queues
-
-**DEV tasks:**
-1. Implement minimal backend endpoints/RPCs:
-   - List open review items
-   - Resolve item (approve/change/unknown) with idempotency key
-2. Every resolve action must:
-   - Write/append span_attributions
-   - Append override_log receipt
-   - Update review_queue status
-3. Add smoke script: create dummy review item → resolve → proof query PASS
-
-**GPT-DEV tasks:**
-- GPT-DEV-5: Provide exact DB write pseudocode for review resolve + idempotency model + smoke-test
-
-### Phase 4: Resolution Layer + Eval Loop
-**Gate:** Proposal→confirm pipeline works on sampled calls
-
-**DEV tasks:**
-1. Add proposal tables for project/contact mapping from span_attributions receipts
-2. Add human confirm action (append-only mappings)
-3. Start eval runs: sample N calls/week, score from receipts, flag K items for spot-check
-
-**GPT-DEV tasks:**
-- GPT-DEV-7: Draft schema + flow for proposals → confirm → append-only mapping + "current mapping" views
-- GPT-DEV-8: Draft alias rollout plan (introduce `chunk-*` aliases without breaking callers)
-
