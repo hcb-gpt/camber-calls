@@ -43,13 +43,14 @@ BEGIN
     CROSS JOIN LATERAL unnest(c.aliases) as alias
     WHERE LOWER(alias) = LOWER(search_term)
 
-    ORDER BY match_type, contact_name;
+    ORDER BY 6, 2;  -- match_type, contact_name (positional for UNION compat)
 END;
 $$ LANGUAGE plpgsql;
 
 COMMENT ON FUNCTION find_contact_by_name_or_alias(text) IS
 'Search for contacts by name or any registered alias. Exact match only (no substring).
-v2: Removed ILIKE substring matching to prevent false positives on short tokens.';
+v2: Removed ILIKE substring matching to prevent false positives on short tokens.
+v2.1: Fixed ORDER BY to use positional refs for UNION compatibility.';
 
 
 -- 2) match_text_to_contact: was using ILIKE '%alias%' (substring in text)
