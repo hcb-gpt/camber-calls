@@ -1,0 +1,409 @@
+{
+  "version": "1.0.0",
+  "description": "Identity matching eval pairs for CI. Reconstructed from TRAM receipts by DEV-1.",
+  "source_receipts": [
+    "eval_pairs_fixture_v1_ready_for_ci",
+    "eval_pairs_supplement_100_pair_complete",
+    "production_eval_pairs_and_failure_modes"
+  ],
+  "config": {
+    "phonetic_algorithm": "double_metaphone",
+    "similarity_metric": "jaro_winkler",
+    "thresholds": {
+      "standard": 0.85,
+      "short_code_4char": 0.90,
+      "reject_below_chars": 3
+    },
+    "short_token_min_length": 4,
+    "weak_confidence_cap": 0.35
+  },
+  "nickname_whitelist": {
+    "bob": "robert",
+    "jim": "james",
+    "joe": "joseph",
+    "dan": "daniel",
+    "ben": "benjamin",
+    "tom": "thomas",
+    "tim": "timothy",
+    "sam": "samuel",
+    "pat": "patrick",
+    "ray": "raymond",
+    "roy": "roy",
+    "lee": "lee",
+    "liz": "elizabeth",
+    "ann": "anne",
+    "sue": "susan",
+    "deb": "deborah",
+    "debbie": "deborah",
+    "rob": "robert",
+    "ted": "theodore",
+    "hal": "harold",
+    "kat": "katherine",
+    "max": "maxwell",
+    "rex": "rex",
+    "dot": "dorothy",
+    "fay": "faye",
+    "gus": "augustus",
+    "bud": "buddy",
+    "art": "arthur",
+    "randy": "randall",
+    "mitch": "mitchell",
+    "bo": "joseph",
+    "lou": "louise",
+    "zack": "zachary"
+  },
+  "test_cases": {
+    "name_pairs": [
+      {
+        "id": "NP-01",
+        "name_a": "Bob Smith",
+        "name_b": "Robert Smith",
+        "expected_decision": "MATCH",
+        "reason": "nickname whitelist: Bob -> Robert"
+      },
+      {
+        "id": "NP-02",
+        "name_a": "Bo Hurley",
+        "name_b": "Joseph Hurley",
+        "expected_decision": "MATCH",
+        "reason": "known alias in contacts table"
+      },
+      {
+        "id": "NP-03",
+        "name_a": "Brian Dove",
+        "name_b": "Brian Young",
+        "expected_decision": "REJECT",
+        "reason": "different last names — same first name is insufficient"
+      },
+      {
+        "id": "NP-04",
+        "name_a": "Debbie Permar",
+        "name_b": "Deborah Permar",
+        "expected_decision": "MATCH",
+        "reason": "nickname whitelist: Debbie -> Deborah"
+      },
+      {
+        "id": "NP-05",
+        "name_a": "Dave Woodbery",
+        "name_b": "David Woodbery",
+        "expected_decision": "MATCH",
+        "reason": "nickname whitelist: Dave -> David"
+      },
+      {
+        "id": "NP-06",
+        "name_a": "Dave Woodbery",
+        "name_b": "David Woodberry",
+        "expected_decision": "MATCH",
+        "reason": "phonetic match on last name + nickname"
+      },
+      {
+        "id": "NP-07",
+        "name_a": "Jimmy Chastain",
+        "name_b": "Jim Chastain",
+        "expected_decision": "MATCH",
+        "reason": "nickname whitelist: Jim -> James, Jimmy is diminutive"
+      },
+      {
+        "id": "NP-08",
+        "name_a": "Zack Sittler",
+        "name_b": "Zachary Sittler",
+        "expected_decision": "MATCH",
+        "reason": "nickname whitelist: Zack -> Zachary"
+      },
+      {
+        "id": "NP-09",
+        "name_a": "Lou Winship",
+        "name_b": "Louise Winship",
+        "expected_decision": "MATCH",
+        "reason": "nickname whitelist: Lou -> Louise"
+      },
+      {
+        "id": "NP-10",
+        "name_a": "Daniel Napier",
+        "name_b": "Dan Napier",
+        "expected_decision": "MATCH",
+        "reason": "nickname whitelist: Dan -> Daniel"
+      },
+      {
+        "id": "NP-11",
+        "name_a": "Al Smith",
+        "name_b": "Albert Smith",
+        "expected_decision": "POSSIBLE",
+        "reason": "short token Al (2 chars) — below min length, not in whitelist"
+      },
+      {
+        "id": "NP-12",
+        "name_a": "Ed Johnson",
+        "name_b": "Edward Johnson",
+        "expected_decision": "POSSIBLE",
+        "reason": "short token Ed (2 chars) — below min length"
+      },
+      {
+        "id": "NP-13",
+        "name_a": "Smith",
+        "name_b": "Smyth",
+        "expected_decision": "MATCH",
+        "reason": "phonetic match — Double Metaphone SM0/XMT"
+      },
+      {
+        "id": "NP-14",
+        "name_a": "Johnson",
+        "name_b": "Johnston",
+        "expected_decision": "MATCH",
+        "reason": "phonetic match"
+      },
+      {
+        "id": "NP-15",
+        "name_a": "Catherine",
+        "name_b": "Katherine",
+        "expected_decision": "MATCH",
+        "reason": "phonetic match — same metaphone code"
+      },
+      {
+        "id": "NP-16",
+        "name_a": "Stephen",
+        "name_b": "Steven",
+        "expected_decision": "MATCH",
+        "reason": "phonetic match"
+      },
+      {
+        "id": "NP-17",
+        "name_a": "Sean",
+        "name_b": "Shawn",
+        "expected_decision": "MATCH",
+        "reason": "phonetic match"
+      },
+      {
+        "id": "NP-18",
+        "name_a": "Michael",
+        "name_b": "Michele",
+        "expected_decision": "POSSIBLE",
+        "reason": "phonetic similar but potentially different gender/person"
+      },
+      {
+        "id": "NP-19",
+        "name_a": "Chris Brown",
+        "name_b": "Chris Browne",
+        "expected_decision": "MATCH",
+        "reason": "first exact + last phonetic match"
+      },
+      {
+        "id": "NP-20",
+        "name_a": "Chris Brown",
+        "name_b": "Chris Green",
+        "expected_decision": "REJECT",
+        "reason": "different last names"
+      },
+      {
+        "id": "NP-21",
+        "name_a": "Randy Williams",
+        "name_b": "Randall Williams",
+        "expected_decision": "MATCH",
+        "reason": "nickname whitelist: Randy -> Randall"
+      },
+      {
+        "id": "NP-22",
+        "name_a": "Mitch Davis",
+        "name_b": "Mitchell Davis",
+        "expected_decision": "MATCH",
+        "reason": "nickname whitelist: Mitch -> Mitchell"
+      },
+      {
+        "id": "NP-23",
+        "name_a": "J",
+        "name_b": "James",
+        "expected_decision": "REJECT",
+        "reason": "single initial — too short, no phonetic value"
+      },
+      {
+        "id": "NP-24",
+        "name_a": "JC",
+        "name_b": "Jimmy Chastain",
+        "expected_decision": "REJECT",
+        "reason": "initials only — not matchable phonetically"
+      },
+      {
+        "id": "NP-25",
+        "name_a": "Woodbery",
+        "name_b": "Woodbury",
+        "expected_decision": "MATCH",
+        "reason": "phonetic match — last name variants"
+      },
+      {
+        "id": "NP-26",
+        "name_a": "Permar",
+        "name_b": "Permer",
+        "expected_decision": "MATCH",
+        "reason": "phonetic match — vowel variation"
+      },
+      {
+        "id": "NP-27",
+        "name_a": "Chad Barlow",
+        "name_b": "Chad Barlowe",
+        "expected_decision": "MATCH",
+        "reason": "phonetic match — silent e"
+      },
+      {
+        "id": "NP-28",
+        "name_a": "Madison",
+        "name_b": "Mattison",
+        "expected_decision": "MATCH",
+        "reason": "phonetic match"
+      },
+      {
+        "id": "NP-29",
+        "name_a": "",
+        "name_b": "John Smith",
+        "expected_decision": "REJECT",
+        "reason": "empty name — cannot match"
+      },
+      {
+        "id": "NP-30",
+        "name_a": "N/A",
+        "name_b": "John Smith",
+        "expected_decision": "REJECT",
+        "reason": "placeholder name — not a real identity"
+      }
+    ],
+    "anchor_integration": [
+      {
+        "id": "AI-01",
+        "name_a": "Bob Smith",
+        "name_b": "Robert Smith",
+        "anchor": { "type": "phone", "value": "+15551234567" },
+        "expected_decision": "AUTO_MERGE",
+        "reason": "phonetic match + phone anchor"
+      },
+      {
+        "id": "AI-02",
+        "name_a": "Bob Smith",
+        "name_b": "Robert Smith",
+        "anchor": null,
+        "expected_decision": "SUGGEST",
+        "reason": "phonetic match but no anchor"
+      },
+      {
+        "id": "AI-03",
+        "name_a": "John Doe",
+        "name_b": "John Doe",
+        "anchor": { "type": "phone", "value": "+15551234567" },
+        "expected_decision": "AUTO_MERGE",
+        "reason": "exact match + phone anchor"
+      },
+      {
+        "id": "AI-04",
+        "name_a": "John Doe",
+        "name_b": "John Doe",
+        "anchor": null,
+        "expected_decision": "SUGGEST",
+        "reason": "exact match but no anchor — could be different people with same name"
+      },
+      {
+        "id": "AI-05",
+        "name_a": "Brian Dove",
+        "name_b": "Brian Young",
+        "anchor": { "type": "phone", "value": "+15551234567" },
+        "expected_decision": "BLOCK",
+        "reason": "different last names + same phone = conflict (possible data error)"
+      },
+      {
+        "id": "AI-06",
+        "name_a": "Debbie Permar",
+        "name_b": "Deborah Permar",
+        "anchor": { "type": "email", "value": "debbie@example.com" },
+        "expected_decision": "AUTO_MERGE",
+        "reason": "nickname match + email anchor"
+      },
+      {
+        "id": "AI-07",
+        "name_a": "Chris Smith",
+        "name_b": "Chris Smith",
+        "anchor": { "type": "project", "value": "project_123" },
+        "expected_decision": "AUTO_MERGE",
+        "reason": "exact match + project anchor"
+      },
+      {
+        "id": "AI-08",
+        "name_a": "Dave W",
+        "name_b": "David Woodbery",
+        "anchor": { "type": "phone", "value": "+15559876543" },
+        "expected_decision": "SUGGEST",
+        "reason": "partial name — weak match even with anchor"
+      },
+      {
+        "id": "AI-09",
+        "name_a": "Jimmy",
+        "name_b": "Jimmy Chastain",
+        "anchor": null,
+        "expected_decision": "POSSIBLE",
+        "reason": "first-name-only = weak, no anchor"
+      },
+      {
+        "id": "AI-10",
+        "name_a": "Jimmy",
+        "name_b": "Jimmy Chastain",
+        "anchor": { "type": "phone", "value": "+15551112222" },
+        "expected_decision": "SUGGEST",
+        "reason": "first-name-only = weak even with anchor — needs human review"
+      },
+      {
+        "id": "AI-11",
+        "name_a": "Zack Sittler",
+        "name_b": "Zachary Sittler",
+        "anchor": { "type": "address", "value": "123 Main St" },
+        "expected_decision": "AUTO_MERGE",
+        "reason": "nickname match + address anchor"
+      },
+      {
+        "id": "AI-12",
+        "name_a": "Contact A",
+        "name_b": "Contact B",
+        "anchor": { "type": "phone", "value": "+15551234567" },
+        "conflicts": ["different_contact_type"],
+        "expected_decision": "BLOCK",
+        "reason": "conflict detected — different contact types with same phone"
+      }
+    ],
+    "camber_edge_cases": [
+      {
+        "id": "CE-01",
+        "name_a": "Unknown Caller",
+        "name_b": "Unknown",
+        "expected_decision": "REJECT",
+        "reason": "placeholder names — not real identities"
+      },
+      {
+        "id": "CE-02",
+        "name_a": "Madison",
+        "name_b": "Madison Project",
+        "context": "transcript mentions 'heading to Madison'",
+        "expected_decision": "REJECT",
+        "reason": "Madison is a place name matched as person — entity type filter needed"
+      },
+      {
+        "id": "CE-03",
+        "name_a": "Hurley",
+        "name_b": "Bo Hurley",
+        "context": "last name only in transcript",
+        "expected_decision": "MATCH",
+        "reason": "last-name match is strong evidence"
+      },
+      {
+        "id": "CE-04",
+        "name_a": "Chad",
+        "name_b": "Chad Barlow",
+        "context": "first name only mentioned in call",
+        "expected_decision": "POSSIBLE",
+        "reason": "first-name-only = weak (phonetic-adjacent-only policy)"
+      },
+      {
+        "id": "CE-05",
+        "name_a": "Sittler job",
+        "name_b": "Zack Sittler",
+        "context": "project reference in transcript",
+        "expected_decision": "MATCH",
+        "reason": "last-name match via project alias — strong evidence"
+      }
+    ]
+  }
+}
