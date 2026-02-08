@@ -1,23 +1,48 @@
-# Deploy Supabase Edge Functions on push to main
-# 
-# Required secrets:
-#   SUPABASE_ACCESS_TOKEN - From https://supabase.com/dashboard/account/tokens
-#   SUPABASE_PROJECT_ID - rjhdwidddtfetbwqolof
-
 name: Deploy Edge Functions
 
 on:
   push:
     branches:
+      - master
       - main
     paths:
       - 'supabase/functions/**'
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
 
 jobs:
-  deploy:
+  discover-functions:
     runs-on: ubuntu-latest
-    
+    outputs:
+      functions: ${{ steps.discover.outputs.functions }}
+      count: ${{ steps.discover.outputs.count }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Discover deployable functions
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t funcs < <(find supabase/functions -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort | grep -Ev '^(_shared)$')
+          if [[ "${#funcs[@]}" -eq 0 ]]; then
+            echo "No deployable functions found under supabase/functions" >&2
+            exit 1
+          fi
+          json=$(printf '%s\n' "${funcs[@]}" | jq -Rsc 'split("\n")[:-1]')
+          echo "functions=$json" >> "$GITHUB_OUTPUT"
+          echo "count=${#funcs[@]}" >> "$GITHUB_OUTPUT"
+          echo "Discovered ${#funcs[@]} deployable functions"
+          printf '%s\n' "${funcs[@]}"
+
+  deploy:
+    needs: discover-functions
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        function: ${{ fromJson(needs.discover-functions.outputs.functions) }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -27,20 +52,33 @@ jobs:
         with:
           version: latest
 
-      - name: Deploy process-call function
+      - name: Deploy function
         run: |
-          supabase functions deploy process-call \
+          supabase functions deploy "${{ matrix.function }}" \
             --project-ref ${{ secrets.SUPABASE_PROJECT_ID }} \
             --no-verify-jwt
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
 
+      - name: Verify deployed function endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint="https://${{ secrets.SUPABASE_PROJECT_ID }}.supabase.co/functions/v1/${{ matrix.function }}"
+          status=$(curl -sS -o /tmp/edge-function-response.txt -w "%{http_code}" "$endpoint" || true)
+          if [[ "$status" == "000" || "$status" == "404" ]]; then
+            echo "Function verification failed for ${{ matrix.function }} (HTTP $status)"
+            cat /tmp/edge-function-response.txt || true
+            exit 1
+          fi
+          echo "Verified ${{ matrix.function }} (HTTP $status)"
+
       - name: Deployment summary
         run: |
-          echo "## Edge Function Deployed 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "## Edge Function Deploy Result 🚀" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Function | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| process-call | ✅ Deployed |" >> $GITHUB_STEP_SUMMARY
+          echo "| ${{ matrix.function }} | ✅ Deployed + Verified |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Endpoint: \`https://rjhdwidddtfetbwqolof.supabase.co/functions/v1/process-call\`" >> $GITHUB_STEP_SUMMARY
+          echo "Endpoint: \`https://${{ secrets.SUPABASE_PROJECT_ID }}.supabase.co/functions/v1/${{ matrix.function }}\`" >> $GITHUB_STEP_SUMMARY
