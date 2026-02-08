@@ -16,8 +16,9 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  -- Scoring cap: once an interaction has a project_id, do not count it again.
-  IF TG_OP = 'UPDATE' AND OLD.project_id IS NOT NULL THEN
+  -- Scoring cap: suppress duplicate updates that re-set the same project_id.
+  -- (Postgres UPDATE triggers fire if project_id is in the SET list even if the value is unchanged.)
+  IF TG_OP = 'UPDATE' AND OLD.project_id IS NOT NULL AND OLD.project_id = NEW.project_id THEN
     INSERT INTO pipeline_logs (
       interaction_id,
       channel,
@@ -36,7 +37,7 @@ BEGIN
       'info',
       jsonb_build_object(
         'type', 'duplicate_affinity_score_suppressed',
-        'reason', 'interaction already had project_id; suppressing duplicate affinity increment',
+        'reason', 'project_id unchanged; suppressing duplicate affinity increment',
         'contact_id', NEW.contact_id,
         'old_project_id', OLD.project_id,
         'new_project_id', NEW.project_id
@@ -86,4 +87,3 @@ $$ LANGUAGE plpgsql;
 
 COMMENT ON FUNCTION update_correspondent_project_affinity IS
   'Auto-maintains correspondent_project_affinity on interaction upsert. Includes a scoring cap: only the first project_id assignment for an interaction contributes to affinity; later updates are suppressed + logged to pipeline_logs.';
-
