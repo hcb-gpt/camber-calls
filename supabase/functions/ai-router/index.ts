@@ -132,12 +132,12 @@ function buildReasonCodes(opts: { modelReasons?: string[] | null; quoteVerified:
   return Array.from(new Set(reasons.filter(Boolean)));
 }
 
-async function upsertReviewQueue(db: ReturnType<typeof createClient>, payload: { span_id: string; interaction_id: string; reasons: string[]; context_payload: Record<string, unknown> }) {
+async function upsertReviewQueue(db: any, payload: { span_id: string; interaction_id: string; reasons: string[]; context_payload: Record<string, unknown> }) {
   const { error } = await db.from("review_queue").upsert({ span_id: payload.span_id, interaction_id: payload.interaction_id, status: "pending", reason_codes: payload.reasons, reasons: payload.reasons, context_payload: payload.context_payload }, { onConflict: "span_id" });
   if (error) console.error("[ai-router] review_queue upsert failed:", error.message);
 }
 
-async function resolveReviewQueue(db: ReturnType<typeof createClient>, spanId: string, notes: string) {
+async function resolveReviewQueue(db: any, spanId: string, notes: string) {
   const { error } = await db.from("review_queue").update({ status: "resolved", resolved_at: new Date().toISOString(), resolved_by: "ai-router", resolution_action: "confirmed", resolution_notes: notes }).eq("span_id", spanId).eq("status", "pending");
   if (error) console.error("[ai-router] review_queue resolve failed:", error.message);
 }

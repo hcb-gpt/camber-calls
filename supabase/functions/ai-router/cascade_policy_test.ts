@@ -1,4 +1,7 @@
-import { assert, assertEquals } from "https://deno.land/std@0.218.0/assert/mod.ts";
+import {
+  assert,
+  assertEquals,
+} from "https://deno.land/std@0.218.0/assert/mod.ts";
 
 type Decision = "assign" | "review" | "none";
 
@@ -30,7 +33,10 @@ function isStrongAssign(result: ProviderResult | null): boolean {
     result.strong_anchor;
 }
 
-function chooseHigherConfidence(a: ProviderResult | null, b: ProviderResult | null): ProviderResult | null {
+function chooseHigherConfidence(
+  a: ProviderResult | null,
+  b: ProviderResult | null,
+): ProviderResult | null {
   if (!a) return b;
   if (!b) return a;
   if (a.confidence === b.confidence) return a;
@@ -47,7 +53,9 @@ function simulateCascade(stages: StagePair[]) {
     const stage = i + 1;
     const openai = stages[i].openai;
     const anthropic = stages[i].anthropic;
-    const stageResults = [openai, anthropic].filter((r): r is ProviderResult => !!r);
+    const stageResults = [openai, anthropic].filter((r): r is ProviderResult =>
+      !!r
+    );
 
     for (const result of stageResults) {
       if (!result.ok || result.error_code) {
@@ -94,7 +102,8 @@ function simulateCascade(stages: StagePair[]) {
         ...fallbackWinner.result,
         project_id: null,
         decision: "review",
-        reasoning: `${fallbackWinner.result.reasoning} [downgraded: model_disagreement_after_final_stage]`,
+        reasoning:
+          `${fallbackWinner.result.reasoning} [downgraded: model_disagreement_after_final_stage]`,
       },
     };
     reasonCodes.add("model_disagreement");
