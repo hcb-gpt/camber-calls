@@ -27,6 +27,33 @@ parse the base role (`DEV`, `DATA`) as `SESSION_ROLE` and store the instance in
 origin metadata (for example `origin_session=dev-3`). Numbered labels are not
 new roles.
 
+Reboot / refresh command (mid-session): treat these as full boot refresh
+commands without opening a new session:
+- `reboot`
+- `reboot as <role>` or `reboot as <role>-<instance>`
+- `refresh role`
+- `refresh as <role>` or `refresh as <role>-<instance>`
+
+Behavior for reboot/refresh:
+- Parse role + instance with the same rules as initial role selection.
+- If no role is provided, keep current role and `origin_session`.
+- If same role is provided, still run full refresh to pick up updated docs.
+- Re-fetch the full boot deck, send fresh activation confirmation, then run
+  `tram_unread` and `tram_work_items` before continuing.
+
+Capabilities in activation (required): include:
+- `CAPABILITIES_VERSION: v1`
+- `CAPABILITIES:` comma-separated tags from
+  `shell_cli,gcloud,mcp_supabase,mcp_github,mcp_drive,browser_ui,file_io`
+
+Structured roll call responses (required): no free-text blobs. Use key/value
+lines with:
+- `ROLE`, `ORIGIN_SESSION`, `ORIGIN_PLATFORM`, `ORIGIN_CLIENT`, `ONLINE`
+- `CURRENT_TASK`, `ETA_MIN`, `CAPABILITIES_VERSION`, `CAPABILITIES`, `BLOCKERS`
+
+Capability-aware delegation: for capability-constrained work, STRAT should
+route only to online sessions whose reported capabilities satisfy requirements.
+
 Immediately after role is set, boot via MCP by fetching these four Orbit docs
 (canonical IDs; no duplicates):
 
