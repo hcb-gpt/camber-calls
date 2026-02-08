@@ -439,7 +439,9 @@ Deno.serve(async (req: Request) => {
   // If transcript > 2000 chars and LLM returned only 1 span, retry with stricter instruction
   let retriedOnce = false;
   if (transcriptLength > 2000 && segments.length === 1) {
-    console.log(`[segment-llm] Single span on long transcript (${transcriptLength} chars) - retrying with stricter instruction`);
+    console.log(
+      `[segment-llm] Single span on long transcript (${transcriptLength} chars) - retrying with stricter instruction`,
+    );
     warnings.push("single_span_retry_attempt");
     retriedOnce = true;
 
