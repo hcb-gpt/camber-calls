@@ -1,37 +1,34 @@
-# CAMBER Edge Functions
+# CAMBER Calls
 
-Supabase Edge Functions for the CAMBER call processing pipeline.
+Supabase Edge Functions and scripts for CAMBER call ingestion, segmentation,
+attribution, and replay tooling.
 
-## Structure
+## Core Functions
 
-```
-camber-edge-functions/
-├── .github/
-│   └── workflows/
-│       └── deploy-edge-functions.yml   # Auto-deploy on push to main
-├── supabase/
-│   ├── config.toml                     # Project config
-│   └── functions/
-│       └── process-call/
-│           └── index.ts                # v3.8 call pipeline
-└── README.md
-```
+- `process-call`: ingress pipeline, idempotency, persistence, and orchestration.
+- `segment-call`: span producer + per-span context/attribution chaining.
+- `segment-llm`: transcript segmentation with staged OpenAI/Anthropic cascade
+  and deterministic fallback split.
+- `context-assembly`: candidate building and evidence packaging.
+- `ai-router`: staged OpenAI/Anthropic attribution cascade with conservative
+  disagreement handling.
+- `admin-reseed`: replay/resegment utilities for correction and backfill
+  workflows.
 
-## Functions
+## Cascade Configuration
 
-### process-call
+The following env vars control staged dual-provider cascade behavior:
 
-Full v3.6+ call processing pipeline:
-- Idempotency check
-- Event audit (write-ahead)
-- M1: Normalize payload
-- Contact lookup (RPC)
-- Project attribution
-- M4: Gatekeeper
-- Persist to `calls_raw`, `interactions`
-- Final audit update
+- `SEGMENT_LLM_OPENAI_MODELS` (comma-separated)
+- `SEGMENT_LLM_ANTHROPIC_MODELS` (comma-separated)
+- `AI_ROUTER_OPENAI_MODELS` (comma-separated)
+- `AI_ROUTER_ANTHROPIC_MODELS` (comma-separated)
+- `CASCADE_STAGE_TIMEOUT_MS` (per-stage timeout)
+- `CASCADE_MAX_STAGES` (caps ladder depth)
+- `CASCADE_BOUNDARY_TOLERANCE_CHARS` (segment boundary agreement window)
 
-**Endpoint:** `https://rjhdwidddtfetbwqolof.supabase.co/functions/v1/process-call`
+If a provider model is unavailable (permission/404/etc), cascade skips it and
+continues.
 
 ## Local Development
 
@@ -39,36 +36,39 @@ Full v3.6+ call processing pipeline:
 # Install Supabase CLI
 brew install supabase/tap/supabase
 
-# Link to project
+# Link project (if needed)
 supabase link --project-ref rjhdwidddtfetbwqolof
 
-# Serve locally
-supabase functions serve process-call --env-file .env.local
-
-# Deploy manually
-supabase functions deploy process-call --no-verify-jwt
+# Serve selected functions locally
+supabase functions serve segment-llm --env-file .env.local
+supabase functions serve ai-router --env-file .env.local
 ```
+
+## Smoke Validation
+
+Run the push-button cascade smoke script:
+
+```bash
+source ./scripts/load-env.sh
+./scripts/smoke_cascade.sh
+```
+
+What it checks:
+
+- `segment-llm` returns `ok=true` with multi-segment-capable output/warnings.
+- `ai-router` returns `ok=true` in `dry_run=true` mode with cascade metadata.
+- No DB writes from router smoke path.
+
+Optional override:
+
+- `SUPABASE_FUNCTIONS_BASE_URL` to target local or alternate function base URL.
+- `CASCADE_TRANSCRIPT_FILE` to supply a custom transcript fixture.
 
 ## CI/CD
 
-Push to `main` triggers automatic deployment via GitHub Actions.
+Pushes to `main` deploy via GitHub Actions.
 
-**Required GitHub Secrets:**
-- `SUPABASE_ACCESS_TOKEN` - From [Supabase Dashboard](https://supabase.com/dashboard/account/tokens)
-- `SUPABASE_PROJECT_ID` - `rjhdwidddtfetbwqolof`
+Required secrets:
 
-## Versioning
-
-Edge function versions tracked in code comments and `router_version` field written to `idempotency_keys`.
-
-| Version | Date | Changes |
-|---------|------|---------|
-| v3.8.3 | 2026-01-30 | Initial Git-tracked version |
-| v3.8.2 | 2026-01-30 | Fixed interactions schema |
-| v3.8.1 | 2026-01-30 | Fixed contact_id extraction |
-| v3.8.0 | 2026-01-30 | Initial Edge Function port |
-
-## Related
-
-- **Pipedream Workflow:** Minimal relay at `https://eopz0oyin0j45bv.m.pipedream.net`
-- **Supabase Project:** `rjhdwidddtfetbwqolof`
+- `SUPABASE_ACCESS_TOKEN`
+- `SUPABASE_PROJECT_ID` (`rjhdwidddtfetbwqolof`)
