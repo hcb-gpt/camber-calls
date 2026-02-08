@@ -1,9 +1,9 @@
 /**
- * segment-llm Edge Function v1.0.0
+ * segment-llm Edge Function v1.4.0
  * LLM-powered call segmenter: identifies project-switch boundaries in transcripts
  *
- * @version 1.0.0
- * @date 2026-01-31
+ * @version 1.4.0
+ * @date 2026-02-08
  * @purpose Segment transcripts into N spans for multi-project attribution
  *
  * Auth: X-Edge-Secret + provenance allowlist (verify_jwt: false)
@@ -16,7 +16,7 @@
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
-const SEGMENT_LLM_VERSION = "segment-llm_v1.2.0";
+const SEGMENT_LLM_VERSION = "segment-llm_v1.4.0";
 
 // ============================================================
 // STRUCTURED LOGGING (per GPT-DEV-6 spec)
@@ -60,6 +60,20 @@ const ALLOWED_PROVENANCE_SOURCES = ["segment-call", "admin-reseed", "edge", "tes
 // ============================================================
 const DEFAULT_MAX_SEGMENTS = 10;
 const DEFAULT_MIN_SEGMENT_CHARS = 200;
+const DEFAULT_CASCADE_STAGE_TIMEOUT_MS = 12000;
+const DEFAULT_CASCADE_BOUNDARY_TOLERANCE_CHARS = 120;
+const DEFAULT_SEGMENT_LLM_OPENAI_MODELS = [
+  "gpt-4o-mini",
+  "gpt-4o",
+  "gpt-4.1-mini",
+  "gpt-4.1",
+];
+const DEFAULT_SEGMENT_LLM_ANTHROPIC_MODELS = [
+  "claude-3-haiku-20240307",
+  "claude-3-5-haiku-20241022",
+  "claude-3-5-sonnet-20241022",
+  "claude-3-7-sonnet-20250219",
+];
 
 // ============================================================
 // TYPES
@@ -80,6 +94,37 @@ interface SegmentLLMOutput {
   warnings: string[];
   error_code?: string;
   ms?: number;
+}
+
+type Provider = "openai" | "anthropic";
+
+interface ProviderCallResult {
+  ok: boolean;
+  provider: Provider;
+  model: string;
+  ms: number;
+  segments?: Segment[];
+  warnings?: string[];
+  error_code?: string;
+  error_class?: string;
+}
+
+interface CascadeCandidate {
+  provider: Provider;
+  model: string;
+  stage: number;
+  segments: Segment[];
+  warnings: string[];
+}
+
+interface CascadeMetadata {
+  provider: Provider;
+  model: string;
+  stage: number;
+  openai_models: string[];
+  anthropic_models: string[];
+  stage_timeout_ms: number;
+  boundary_tolerance_chars: number;
 }
 
 // ============================================================
@@ -116,6 +161,528 @@ OUTPUT FORMAT (JSON only, no markdown):
 
 TRANSCRIPT:
 {TRANSCRIPT}`;
+
+function parseModelList(envKey: string, defaults: string[]): string[] {
+  const raw = Deno.env.get(envKey);
+  if (!raw) return defaults;
+  const parsed = raw.split(",").map((m) => m.trim()).filter(Boolean);
+  return parsed.length > 0 ? parsed : defaults;
+}
+
+function parsePositiveIntEnv(envKey: string, defaultValue: number): number {
+  const raw = Deno.env.get(envKey);
+  if (!raw) return defaultValue;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeoutHandle: number | undefined;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timeoutHandle = setTimeout(() => reject(new Error(`${label}_timeout`)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+  }
+}
+
+function stripCodeFences(raw: string): string {
+  return (raw || "").replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+}
+
+function parseSegmentsJson(raw: string): Segment[] {
+  const cleaned = stripCodeFences(raw);
+  const parsed = JSON.parse(cleaned);
+  if (!Array.isArray(parsed?.segments) || parsed.segments.length === 0) {
+    throw new Error("no_segments");
+  }
+  return parsed.segments as Segment[];
+}
+
+function applySegmentGuardrails(
+  inputSegments: Segment[],
+  transcript: string,
+  transcriptLength: number,
+  minSegmentChars: number,
+  maxSegments: number,
+): { segments: Segment[]; warnings: string[] } {
+  const warnings: string[] = [];
+  let segments = inputSegments.map((seg, idx) => {
+    const charStart = Number(seg.char_start);
+    const charEnd = Number(seg.char_end);
+    const confidence = Number(seg.confidence);
+    return {
+      span_index: idx,
+      char_start: Number.isFinite(charStart) ? charStart : 0,
+      char_end: Number.isFinite(charEnd) ? charEnd : transcriptLength,
+      boundary_reason: typeof seg.boundary_reason === "string" && seg.boundary_reason.length > 0
+        ? seg.boundary_reason
+        : "model_boundary",
+      confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : 0.5,
+      boundary_quote: typeof seg.boundary_quote === "string" ? seg.boundary_quote : null,
+    };
+  });
+
+  segments = segments.map((seg) => ({
+    ...seg,
+    char_start: Math.max(0, Math.min(seg.char_start, transcriptLength)),
+    char_end: Math.max(0, Math.min(seg.char_end, transcriptLength)),
+  }));
+
+  segments.sort((a, b) => a.char_start - b.char_start);
+  segments = segments.map((seg, idx) => ({ ...seg, span_index: idx }));
+
+  for (let i = 1; i < segments.length; i++) {
+    if (segments[i].char_start !== segments[i - 1].char_end) {
+      warnings.push(`gap_fixed_at_index_${i}`);
+      segments[i].char_start = segments[i - 1].char_end;
+    }
+  }
+
+  if (segments[0].char_start !== 0) {
+    warnings.push("first_segment_start_fixed");
+    segments[0].char_start = 0;
+  }
+  if (segments[segments.length - 1].char_end !== transcriptLength) {
+    warnings.push("last_segment_end_fixed");
+    segments[segments.length - 1].char_end = transcriptLength;
+  }
+
+  let merged = true;
+  while (merged && segments.length > 1) {
+    merged = false;
+    for (let i = segments.length - 1; i >= 0; i--) {
+      const size = segments[i].char_end - segments[i].char_start;
+      if (size < minSegmentChars && segments.length > 1) {
+        if (i > 0) {
+          segments[i - 1].char_end = segments[i].char_end;
+          segments[i - 1].boundary_reason += "_merged_undersized";
+          segments.splice(i, 1);
+          warnings.push(`merged_undersized_segment_${i}`);
+          merged = true;
+          break;
+        }
+        if (i === 0 && segments.length > 1) {
+          segments[1].char_start = segments[0].char_start;
+          segments.splice(0, 1);
+          warnings.push("merged_undersized_first_segment");
+          merged = true;
+          break;
+        }
+      }
+    }
+  }
+
+  segments = segments.map((seg, idx) => ({ ...seg, span_index: idx }));
+
+  while (segments.length > maxSegments) {
+    let minConfIdx = 1;
+    let minConf = segments[1].confidence;
+    for (let i = 2; i < segments.length; i++) {
+      if (segments[i].confidence < minConf) {
+        minConf = segments[i].confidence;
+        minConfIdx = i;
+      }
+    }
+    segments[minConfIdx - 1].char_end = segments[minConfIdx].char_end;
+    segments.splice(minConfIdx, 1);
+    warnings.push(`merged_low_confidence_segment_${minConfIdx}`);
+  }
+
+  segments = segments.filter((seg) => {
+    if (seg.char_end <= seg.char_start) {
+      warnings.push(`removed_zero_length_segment_${seg.span_index}`);
+      return false;
+    }
+    return true;
+  }).map((seg, idx) => ({ ...seg, span_index: idx }));
+
+  segments = segments.map((seg) => {
+    const quote = seg.boundary_quote ? seg.boundary_quote.slice(0, 50) : null;
+    if (quote && transcript && !transcript.includes(quote)) {
+      warnings.push(`boundary_quote_not_found_${seg.span_index}`);
+      return { ...seg, boundary_quote: null };
+    }
+    return { ...seg, boundary_quote: quote };
+  });
+
+  return { segments, warnings };
+}
+
+function segmentsAgreeWithinTolerance(
+  a: Segment[],
+  b: Segment[],
+  toleranceChars: number,
+): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const startDiff = Math.abs(a[i].char_start - b[i].char_start);
+    const endDiff = Math.abs(a[i].char_end - b[i].char_end);
+    if (startDiff > toleranceChars || endDiff > toleranceChars) return false;
+  }
+  return true;
+}
+
+function pickDisagreementWinner(a: ProviderCallResult, b: ProviderCallResult): ProviderCallResult {
+  const aWarnings = a.warnings?.length || 0;
+  const bWarnings = b.warnings?.length || 0;
+  const aSegments = a.segments?.length || 0;
+  const bSegments = b.segments?.length || 0;
+  const aScore = (aSegments * 10) - aWarnings;
+  const bScore = (bSegments * 10) - bWarnings;
+  return aScore >= bScore ? a : b;
+}
+
+async function callOpenAIModel(
+  model: string,
+  prompt: string,
+  apiKey: string,
+  transcript: string,
+  transcriptLength: number,
+  minSegmentChars: number,
+  maxSegments: number,
+): Promise<ProviderCallResult> {
+  const t0 = Date.now();
+  try {
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 1024,
+        temperature: 0,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    if (!resp.ok) {
+      const errorText = await resp.text();
+      const isUnavailable = resp.status === 401 || resp.status === 403 || resp.status === 404;
+      return {
+        ok: false,
+        provider: "openai",
+        model,
+        ms: Date.now() - t0,
+        error_code: isUnavailable ? "model_unavailable" : "openai_http_error",
+        error_class: `status_${resp.status}:${errorText.slice(0, 120)}`,
+      };
+    }
+
+    const payload = await resp.json();
+    const rawContent = payload?.choices?.[0]?.message?.content || "";
+    const parsedSegments = parseSegmentsJson(rawContent);
+    const guarded = applySegmentGuardrails(
+      parsedSegments,
+      transcript,
+      transcriptLength,
+      minSegmentChars,
+      maxSegments,
+    );
+
+    if (guarded.segments.length === 0) {
+      return {
+        ok: false,
+        provider: "openai",
+        model,
+        ms: Date.now() - t0,
+        error_code: "all_segments_invalid",
+        error_class: "guardrail_filtered",
+      };
+    }
+
+    return {
+      ok: true,
+      provider: "openai",
+      model,
+      ms: Date.now() - t0,
+      segments: guarded.segments,
+      warnings: guarded.warnings,
+    };
+  } catch (error: any) {
+    return {
+      ok: false,
+      provider: "openai",
+      model,
+      ms: Date.now() - t0,
+      error_code: "openai_fetch_error",
+      error_class: error?.message || "unknown_error",
+    };
+  }
+}
+
+async function callAnthropicModel(
+  model: string,
+  prompt: string,
+  apiKey: string,
+  transcript: string,
+  transcriptLength: number,
+  minSegmentChars: number,
+  maxSegments: number,
+): Promise<ProviderCallResult> {
+  const t0 = Date.now();
+  try {
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model,
+        max_tokens: 1024,
+        temperature: 0,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    if (!resp.ok) {
+      const errorText = await resp.text();
+      const isUnavailable = resp.status === 401 || resp.status === 403 || resp.status === 404;
+      return {
+        ok: false,
+        provider: "anthropic",
+        model,
+        ms: Date.now() - t0,
+        error_code: isUnavailable ? "model_unavailable" : "anthropic_http_error",
+        error_class: `status_${resp.status}:${errorText.slice(0, 120)}`,
+      };
+    }
+
+    const payload = await resp.json();
+    const textBlock = (payload?.content || []).find((block: any) => block?.type === "text");
+    const rawContent = textBlock?.text || "";
+    const parsedSegments = parseSegmentsJson(rawContent);
+    const guarded = applySegmentGuardrails(
+      parsedSegments,
+      transcript,
+      transcriptLength,
+      minSegmentChars,
+      maxSegments,
+    );
+
+    if (guarded.segments.length === 0) {
+      return {
+        ok: false,
+        provider: "anthropic",
+        model,
+        ms: Date.now() - t0,
+        error_code: "all_segments_invalid",
+        error_class: "guardrail_filtered",
+      };
+    }
+
+    return {
+      ok: true,
+      provider: "anthropic",
+      model,
+      ms: Date.now() - t0,
+      segments: guarded.segments,
+      warnings: guarded.warnings,
+    };
+  } catch (error: any) {
+    return {
+      ok: false,
+      provider: "anthropic",
+      model,
+      ms: Date.now() - t0,
+      error_code: "anthropic_fetch_error",
+      error_class: error?.message || "unknown_error",
+    };
+  }
+}
+
+async function runSegmentationCascade(params: {
+  prompt: string;
+  transcript: string;
+  transcriptLength: number;
+  minSegmentChars: number;
+  maxSegments: number;
+  openaiModels: string[];
+  anthropicModels: string[];
+  openaiKey: string | null;
+  anthropicKey: string | null;
+  stageTimeoutMs: number;
+  maxStages: number;
+  boundaryToleranceChars: number;
+}): Promise<{ candidate: CascadeCandidate | null; warnings: string[]; trace: Record<string, unknown>[] }> {
+  const warnings: string[] = [];
+  const trace: Record<string, unknown>[] = [];
+  let disagreementFallback: CascadeCandidate | null = null;
+
+  for (let i = 0; i < params.maxStages; i++) {
+    const stage = i + 1;
+    const openaiModel = params.openaiModels[i];
+    const anthropicModel = params.anthropicModels[i];
+    if (!openaiModel && !anthropicModel) break;
+
+    const openaiPromise = openaiModel && params.openaiKey
+      ? withTimeout(
+        callOpenAIModel(
+          openaiModel,
+          params.prompt,
+          params.openaiKey,
+          params.transcript,
+          params.transcriptLength,
+          params.minSegmentChars,
+          params.maxSegments,
+        ),
+        params.stageTimeoutMs,
+        `openai_stage_${stage}`,
+      ).catch((error: any) =>
+        ({
+          ok: false,
+          provider: "openai",
+          model: openaiModel,
+          ms: params.stageTimeoutMs,
+          error_code: "provider_timeout",
+          error_class: error?.message || "timeout",
+        }) as ProviderCallResult
+      )
+      : Promise.resolve(
+        openaiModel
+          ? ({
+            ok: false,
+            provider: "openai",
+            model: openaiModel,
+            ms: 0,
+            error_code: "missing_api_key",
+            error_class: "OPENAI_API_KEY_not_set",
+          } as ProviderCallResult)
+          : null,
+      );
+
+    const anthropicPromise = anthropicModel && params.anthropicKey
+      ? withTimeout(
+        callAnthropicModel(
+          anthropicModel,
+          params.prompt,
+          params.anthropicKey,
+          params.transcript,
+          params.transcriptLength,
+          params.minSegmentChars,
+          params.maxSegments,
+        ),
+        params.stageTimeoutMs,
+        `anthropic_stage_${stage}`,
+      ).catch((error: any) =>
+        ({
+          ok: false,
+          provider: "anthropic",
+          model: anthropicModel,
+          ms: params.stageTimeoutMs,
+          error_code: "provider_timeout",
+          error_class: error?.message || "timeout",
+        }) as ProviderCallResult
+      )
+      : Promise.resolve(
+        anthropicModel
+          ? ({
+            ok: false,
+            provider: "anthropic",
+            model: anthropicModel,
+            ms: 0,
+            error_code: "missing_api_key",
+            error_class: "ANTHROPIC_API_KEY_not_set",
+          } as ProviderCallResult)
+          : null,
+      );
+
+    const [openaiResult, anthropicResult] = await Promise.all([openaiPromise, anthropicPromise]);
+
+    trace.push({
+      stage,
+      openai: openaiResult
+        ? {
+          ok: openaiResult.ok,
+          model: openaiResult.model,
+          segments: openaiResult.segments?.length ?? 0,
+          error_code: openaiResult.error_code || null,
+          error_class: openaiResult.error_class || null,
+          ms: openaiResult.ms,
+        }
+        : null,
+      anthropic: anthropicResult
+        ? {
+          ok: anthropicResult.ok,
+          model: anthropicResult.model,
+          segments: anthropicResult.segments?.length ?? 0,
+          error_code: anthropicResult.error_code || null,
+          error_class: anthropicResult.error_class || null,
+          ms: anthropicResult.ms,
+        }
+        : null,
+    });
+
+    const openaiValid = !!openaiResult?.ok && !!openaiResult.segments?.length;
+    const anthropicValid = !!anthropicResult?.ok && !!anthropicResult.segments?.length;
+
+    if (openaiValid && anthropicValid) {
+      const agreed = segmentsAgreeWithinTolerance(
+        openaiResult!.segments!,
+        anthropicResult!.segments!,
+        params.boundaryToleranceChars,
+      );
+
+      if (agreed) {
+        const preferred = pickDisagreementWinner(openaiResult!, anthropicResult!);
+        warnings.push(`cascade_stage_${stage}_agreement`);
+        return {
+          candidate: {
+            provider: preferred.provider,
+            model: preferred.model,
+            stage,
+            segments: preferred.segments!,
+            warnings: preferred.warnings || [],
+          },
+          warnings,
+          trace,
+        };
+      }
+
+      const tieBreak = pickDisagreementWinner(openaiResult!, anthropicResult!);
+      disagreementFallback = {
+        provider: tieBreak.provider,
+        model: tieBreak.model,
+        stage,
+        segments: tieBreak.segments!,
+        warnings: tieBreak.warnings || [],
+      };
+      warnings.push(`cascade_stage_${stage}_disagreement`);
+      continue;
+    }
+
+    if (openaiValid !== anthropicValid) {
+      const winner = openaiValid ? openaiResult! : anthropicResult!;
+      warnings.push(`cascade_stage_${stage}_single_provider_accept_${winner.provider}`);
+      return {
+        candidate: {
+          provider: winner.provider,
+          model: winner.model,
+          stage,
+          segments: winner.segments!,
+          warnings: winner.warnings || [],
+        },
+        warnings,
+        trace,
+      };
+    }
+
+    warnings.push(`cascade_stage_${stage}_no_valid_output`);
+  }
+
+  if (disagreementFallback) {
+    warnings.push("cascade_final_stage_disagreement_tiebreak");
+    return { candidate: disagreementFallback, warnings, trace };
+  }
+
+  return { candidate: null, warnings, trace };
+}
 
 // ============================================================
 // MAIN HANDLER
@@ -247,354 +814,99 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  // ============================================================
-  // LLM CALL (OpenAI)
-  // ============================================================
-  const openaiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!openaiKey) {
-    console.error("[segment-llm] OPENAI_API_KEY not configured");
-    return fallbackResponse(transcriptLength, ["config_error_no_api_key"], t0);
-  }
-
   const prompt = SEGMENTATION_PROMPT
     .replace("{TRANSCRIPT}", transcript)
     .replace("{MIN_CHARS}", String(min_segment_chars))
     .replace("{MAX_SEGMENTS}", String(max_segments));
 
-  let llmResponse: any;
-  try {
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${openaiKey}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        max_tokens: 1024,
-        messages: [
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
-      }),
-    });
+  const openaiKey = Deno.env.get("OPENAI_API_KEY") ?? null;
+  const anthropicKey = Deno.env.get("ANTHROPIC_API_KEY") ?? null;
+  const openaiModels = parseModelList("SEGMENT_LLM_OPENAI_MODELS", DEFAULT_SEGMENT_LLM_OPENAI_MODELS);
+  const anthropicModels = parseModelList(
+    "SEGMENT_LLM_ANTHROPIC_MODELS",
+    DEFAULT_SEGMENT_LLM_ANTHROPIC_MODELS,
+  );
+  const stageTimeoutMs = parsePositiveIntEnv("CASCADE_STAGE_TIMEOUT_MS", DEFAULT_CASCADE_STAGE_TIMEOUT_MS);
+  const boundaryToleranceChars = parsePositiveIntEnv(
+    "CASCADE_BOUNDARY_TOLERANCE_CHARS",
+    DEFAULT_CASCADE_BOUNDARY_TOLERANCE_CHARS,
+  );
+  const configuredMaxStages = parsePositiveIntEnv(
+    "CASCADE_MAX_STAGES",
+    Math.max(openaiModels.length, anthropicModels.length),
+  );
+  const maxStages = Math.max(1, Math.min(configuredMaxStages, Math.max(openaiModels.length, anthropicModels.length)));
 
-    if (!resp.ok) {
-      const errText = await resp.text();
-      console.error(`[segment-llm] LLM API error: ${resp.status} ${errText}`);
-      // Structured log: segment_llm_error
-      structuredLog("ERROR", "segment_llm_error", requestId, interaction_id, {
-        error_code: `llm_api_${resp.status}`,
-        error_class: "openai_http_error",
-        duration_ms: Date.now() - t0,
-      });
-      return fallbackResponse(transcriptLength, [`llm_api_error_${resp.status}`], t0);
-    }
-
-    llmResponse = await resp.json();
-  } catch (fetchErr: any) {
-    console.error(`[segment-llm] LLM fetch error: ${fetchErr.message}`);
-    // Structured log: segment_llm_error
+  if (!openaiKey && !anthropicKey) {
     structuredLog("ERROR", "segment_llm_error", requestId, interaction_id, {
-      error_code: "llm_fetch_error",
-      error_class: fetchErr.message || "unknown",
+      error_code: "missing_all_provider_keys",
+      error_class: "config_error",
       duration_ms: Date.now() - t0,
     });
-    return fallbackResponse(transcriptLength, [`llm_fetch_error`], t0);
+    return fallbackResponse(transcriptLength, ["config_error_no_provider_api_keys"], t0);
   }
 
-  // ============================================================
-  // PARSE LLM OUTPUT (OpenAI format)
-  // ============================================================
-  let rawContent = "";
-  try {
-    rawContent = llmResponse.choices?.[0]?.message?.content || "";
-    // Strip markdown code fences if present
-    rawContent = rawContent.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-  } catch {
-    console.error("[segment-llm] Failed to extract LLM text");
-    return fallbackResponse(transcriptLength, ["llm_parse_error_extract"], t0);
-  }
-
-  let parsed: { segments?: Segment[] };
-  try {
-    parsed = JSON.parse(rawContent);
-  } catch (_parseErr) {
-    console.error(`[segment-llm] JSON parse failed: ${rawContent.slice(0, 200)}`);
-    return fallbackResponse(transcriptLength, ["llm_parse_error_json"], t0);
-  }
-
-  if (!Array.isArray(parsed.segments) || parsed.segments.length === 0) {
-    console.error("[segment-llm] No segments array in LLM output");
-    return fallbackResponse(transcriptLength, ["llm_output_invalid_no_segments"], t0);
-  }
-
-  // ============================================================
-  // GUARDRAILS: Validate and fix segments
-  // ============================================================
-  const warnings: string[] = [];
-  let segments = parsed.segments;
-
-  // 1. Clamp boundaries to [0, transcriptLength]
-  segments = segments.map((seg) => ({
-    ...seg,
-    char_start: Math.max(0, Math.min(seg.char_start, transcriptLength)),
-    char_end: Math.max(0, Math.min(seg.char_end, transcriptLength)),
-  }));
-
-  // 2. Sort by char_start and fix span_index
-  segments.sort((a, b) => a.char_start - b.char_start);
-  segments = segments.map((seg, idx) => ({ ...seg, span_index: idx }));
-
-  // 3. Make contiguous (no gaps, no overlaps)
-  for (let i = 1; i < segments.length; i++) {
-    if (segments[i].char_start !== segments[i - 1].char_end) {
-      warnings.push(`gap_fixed_at_index_${i}`);
-      segments[i].char_start = segments[i - 1].char_end;
-    }
-  }
-
-  // 4. Ensure first starts at 0, last ends at transcriptLength
-  if (segments[0].char_start !== 0) {
-    warnings.push("first_segment_start_fixed");
-    segments[0].char_start = 0;
-  }
-  if (segments[segments.length - 1].char_end !== transcriptLength) {
-    warnings.push("last_segment_end_fixed");
-    segments[segments.length - 1].char_end = transcriptLength;
-  }
-
-  // 5. Merge undersized segments into previous
-  let merged = true;
-  while (merged && segments.length > 1) {
-    merged = false;
-    for (let i = segments.length - 1; i >= 0; i--) {
-      const size = segments[i].char_end - segments[i].char_start;
-      if (size < min_segment_chars && segments.length > 1) {
-        if (i > 0) {
-          // Merge into previous
-          segments[i - 1].char_end = segments[i].char_end;
-          segments[i - 1].boundary_reason += "_merged_undersized";
-          segments.splice(i, 1);
-          warnings.push(`merged_undersized_segment_${i}`);
-          merged = true;
-          break;
-        } else if (i === 0 && segments.length > 1) {
-          // First segment undersized - merge with next
-          segments[1].char_start = segments[0].char_start;
-          segments.splice(0, 1);
-          warnings.push("merged_undersized_first_segment");
-          merged = true;
-          break;
-        }
-      }
-    }
-  }
-
-  // 6. Re-index after merges
-  segments = segments.map((seg, idx) => ({ ...seg, span_index: idx }));
-
-  // 7. Enforce max_segments by merging lowest-confidence boundaries
-  while (segments.length > max_segments) {
-    // Find lowest confidence segment (excluding first)
-    let minConfIdx = 1;
-    let minConf = segments[1].confidence;
-    for (let i = 2; i < segments.length; i++) {
-      if (segments[i].confidence < minConf) {
-        minConf = segments[i].confidence;
-        minConfIdx = i;
-      }
-    }
-    // Merge with previous
-    segments[minConfIdx - 1].char_end = segments[minConfIdx].char_end;
-    segments.splice(minConfIdx, 1);
-    warnings.push(`merged_low_confidence_segment_${minConfIdx}`);
-  }
-
-  // 8. Final re-index
-  segments = segments.map((seg, idx) => ({ ...seg, span_index: idx }));
-
-  // 9. Validate no zero-length segments
-  segments = segments.filter((seg) => {
-    if (seg.char_end <= seg.char_start) {
-      warnings.push(`removed_zero_length_segment_${seg.span_index}`);
-      return false;
-    }
-    return true;
+  const cascade = await runSegmentationCascade({
+    prompt,
+    transcript,
+    transcriptLength,
+    minSegmentChars: min_segment_chars,
+    maxSegments: max_segments,
+    openaiModels,
+    anthropicModels,
+    openaiKey,
+    anthropicKey,
+    stageTimeoutMs,
+    maxStages,
+    boundaryToleranceChars,
   });
 
-  // 10. Final re-index
-  segments = segments.map((seg, idx) => ({ ...seg, span_index: idx }));
-
-  // If all segments got filtered out, fallback
-  if (segments.length === 0) {
-    return fallbackResponse(transcriptLength, ["all_segments_invalid"], t0);
+  if (!cascade.candidate) {
+    structuredLog("ERROR", "segment_llm_error", requestId, interaction_id, {
+      error_code: "cascade_no_valid_output",
+      error_class: "provider_exhausted",
+      duration_ms: Date.now() - t0,
+      cascade_trace: cascade.trace,
+    });
+    return fallbackResponse(transcriptLength, ["cascade_no_valid_output", ...cascade.warnings], t0);
   }
 
-  // ============================================================
-  // RETRY LOGIC: Single span on long transcript (P0 Task)
-  // ============================================================
-  // If transcript > 2000 chars and LLM returned only 1 span, retry with stricter instruction
-  let retriedOnce = false;
+  const warnings = [...cascade.warnings, ...cascade.candidate.warnings];
+  let segments = cascade.candidate.segments;
+
   if (transcriptLength > 2000 && segments.length === 1) {
-    console.log(
-      `[segment-llm] Single span on long transcript (${transcriptLength} chars) - retrying with stricter instruction`,
-    );
-    warnings.push("single_span_retry_attempt");
-    retriedOnce = true;
-
-    // Stricter prompt that demands at least 2 chunks
-    const stricterPrompt = `You are a call transcript segmenter for a construction company.
-
-CRITICAL REQUIREMENT: For transcripts over 2000 characters, you MUST produce AT LEAST 2 segments unless the call is genuinely single-topic with NO project switches whatsoever.
-
-Your task: Identify boundaries where the conversation switches from one PROJECT to another.
-
-RULES:
-1. A "project" is a specific construction job (e.g., "Johnson Residence", "Smith Project", "the Hurley job")
-2. For transcripts > 2000 chars: find at least ONE natural break point (topic shift, pause, speaker change on different topic)
-3. If truly single-topic: return 1 segment with high confidence, but this should be rare for long calls
-4. Each segment must be >= {MIN_CHARS} characters (merge smaller ones into previous)
-5. Maximum {MAX_SEGMENTS} segments total
-6. Segments must be contiguous (no gaps, no overlaps)
-
-OUTPUT FORMAT (JSON only, no markdown):
-{
-  "segments": [
-    {
-      "span_index": 0,
-      "char_start": 0,
-      "char_end": <end_char>,
-      "boundary_reason": "initial_project|topic_shift|project_switch|natural_break",
-      "confidence": 0.0-1.0,
-      "boundary_quote": "<exact quote <=50 chars showing the switch>"
-    }
-  ]
-}
-
-TRANSCRIPT:
-{TRANSCRIPT}`;
-
-    const retryPrompt = stricterPrompt
-      .replace("{TRANSCRIPT}", transcript)
-      .replace("{MIN_CHARS}", String(min_segment_chars))
-      .replace("{MAX_SEGMENTS}", String(max_segments));
-
-    try {
-      const retryResp = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${openaiKey}`,
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          max_tokens: 1024,
-          messages: [
-            {
-              role: "user",
-              content: retryPrompt,
-            },
-          ],
-        }),
-      });
-
-      if (retryResp.ok) {
-        const retryData = await retryResp.json();
-        const retryContent = (retryData.choices?.[0]?.message?.content || "")
-          .replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-
-        try {
-          const retryParsed = JSON.parse(retryContent);
-          if (Array.isArray(retryParsed.segments) && retryParsed.segments.length > 0) {
-            // Re-run guardrails on retry result (simplified version)
-            let retrySegments = retryParsed.segments;
-            retrySegments = retrySegments.map((seg: any) => ({
-              ...seg,
-              char_start: Math.max(0, Math.min(seg.char_start, transcriptLength)),
-              char_end: Math.max(0, Math.min(seg.char_end, transcriptLength)),
-            }));
-            retrySegments.sort((a: any, b: any) => a.char_start - b.char_start);
-            retrySegments = retrySegments.map((seg: any, idx: number) => ({ ...seg, span_index: idx }));
-
-            // Make contiguous
-            for (let i = 1; i < retrySegments.length; i++) {
-              if (retrySegments[i].char_start !== retrySegments[i - 1].char_end) {
-                retrySegments[i].char_start = retrySegments[i - 1].char_end;
-              }
-            }
-            if (retrySegments[0].char_start !== 0) retrySegments[0].char_start = 0;
-            if (retrySegments[retrySegments.length - 1].char_end !== transcriptLength) {
-              retrySegments[retrySegments.length - 1].char_end = transcriptLength;
-            }
-
-            // If retry gave us multiple segments, use them!
-            if (retrySegments.length > 1) {
-              console.log(`[segment-llm] Retry successful: ${retrySegments.length} segments`);
-              segments = retrySegments;
-              warnings.push("single_span_retry_successful");
-            } else {
-              warnings.push("single_span_retry_still_single");
-            }
-          }
-        } catch (_retryParseErr) {
-          warnings.push("single_span_retry_parse_error");
-        }
-      } else {
-        warnings.push("single_span_retry_http_error");
-      }
-    } catch (_retryErr: any) {
-      warnings.push("single_span_retry_fetch_error");
-    }
-  }
-
-  // ============================================================
-  // DETERMINISTIC FALLBACK: If still single span after retry
-  // ============================================================
-  if (transcriptLength > 2000 && segments.length === 1) {
-    console.log(`[segment-llm] Still single span after retry - using deterministic fallback split`);
-    warnings.push("deterministic_fallback_applied");
-
-    // Split transcript into 2-4 equal segments based on length
     const numFallbackSegments = transcriptLength < 5000 ? 2 : transcriptLength < 10000 ? 3 : 4;
     const segmentSize = Math.floor(transcriptLength / numFallbackSegments);
-
-    segments = [];
+    const fallbackSegments: Segment[] = [];
     for (let i = 0; i < numFallbackSegments; i++) {
       const charStart = i * segmentSize;
       const charEnd = i === numFallbackSegments - 1 ? transcriptLength : (i + 1) * segmentSize;
-      segments.push({
+      fallbackSegments.push({
         span_index: i,
         char_start: charStart,
         char_end: charEnd,
         boundary_reason: "deterministic_fallback_split",
-        confidence: 0.5, // Lower confidence for fallback
+        confidence: 0.5,
         boundary_quote: null,
       });
     }
-
-    // Mark these segments with fallback metadata flag
-    // This will be added to segment_metadata in segment-call
+    segments = fallbackSegments;
+    warnings.push("deterministic_fallback_split");
     warnings.push(`fallback_split_${numFallbackSegments}_segments`);
   }
 
-  // Truncate boundary_quote to 50 chars
-  segments = segments.map((seg) => ({
-    ...seg,
-    boundary_quote: seg.boundary_quote ? seg.boundary_quote.slice(0, 50) : null,
-  }));
-
   const durationMs = Date.now() - t0;
-  console.log(`[segment-llm] Produced ${segments.length} segments with ${warnings.length} warnings`);
+  console.log(
+    `[segment-llm] Produced ${segments.length} segments (provider=${cascade.candidate.provider}, model=${cascade.candidate.model}, stage=${cascade.candidate.stage})`,
+  );
 
-  // Structured log: segment_llm_response
   structuredLog("INFO", "segment_llm_response", requestId, interaction_id, {
     segments_returned: segments.length,
     duration_ms: durationMs,
-    retry_attempted: retriedOnce,
-    deterministic_fallback: warnings.includes("deterministic_fallback_applied"),
+    deterministic_fallback: warnings.includes("deterministic_fallback_split"),
+    cascade_winner_provider: cascade.candidate.provider,
+    cascade_winner_model: cascade.candidate.model,
+    cascade_winner_stage: cascade.candidate.stage,
   });
 
   return new Response(
