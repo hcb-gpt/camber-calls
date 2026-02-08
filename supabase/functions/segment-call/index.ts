@@ -15,7 +15,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const SEGMENT_CALL_VERSION = "v2.2.0";
+const SEGMENT_CALL_VERSION = "v2.3.0";
 
 const ALLOWED_PROVENANCE_SOURCES = [
   "process-call",
@@ -336,9 +336,18 @@ Deno.serve(async (req: Request) => {
   }
 
   const now = new Date().toISOString();
+  const isDeterministicFallback = segmenterWarnings.includes("deterministic_fallback_applied");
   const spanRowsWithMetadata = segments.map((seg) => {
     const segmentText = spanTranscript!.slice(seg.char_start, seg.char_end);
     const wordCount = segmentText.split(/\s+/).filter(Boolean).length;
+    const metadata: Record<string, any> = {
+      confidence: seg.confidence,
+      boundary_quote: seg.boundary_quote,
+    };
+    // Mark segments created by deterministic fallback
+    if (isDeterministicFallback) {
+      metadata.fallback = true;
+    }
     return {
       interaction_id,
       span_index: seg.span_index,
@@ -348,10 +357,7 @@ Deno.serve(async (req: Request) => {
       word_count: wordCount,
       segmenter_version: segmenterVersion,
       segment_reason: seg.boundary_reason,
-      segment_metadata: {
-        confidence: seg.confidence,
-        boundary_quote: seg.boundary_quote,
-      },
+      segment_metadata: metadata,
       is_superseded: false,
       segment_generation: 1,
       created_at: now,

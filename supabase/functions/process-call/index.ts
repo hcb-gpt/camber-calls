@@ -15,7 +15,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const PROCESS_CALL_VERSION = "v4.0.1";
+const PROCESS_CALL_VERSION = "v4.1.0"; // phonetic-adjacent-only: match quality gating
 const GATE = { PASS: "PASS", SKIP: "SKIP", NEEDS_REVIEW: "NEEDS_REVIEW" };
 const ID_PATTERN = /^cll_[a-zA-Z0-9_]+$/;
 
@@ -88,6 +88,44 @@ function normalizeAliasTerms(terms: string[]): string[] {
 }
 
 // ============================================================
+// PHONETIC-ADJACENT-ONLY: Match quality classification
+// ============================================================
+/** Classify whether an alias match is strong or weak.
+ *  - "strong": exact project name, multi-word alias, last-name match, or location
+ *  - "weak": single short first-name-only token (< 6 chars) with no corroboration
+ *  Rule: first-name-only phonetic = "possible" only, never auto-merge */
+function classifyMatchStrength(
+  term: string,
+  matchType: string,
+  projectName: string,
+): "strong" | "weak" {
+  const termLower = term.toLowerCase();
+  const nameLower = projectName.toLowerCase();
+
+  // Exact project name match is always strong
+  if (termLower === nameLower || matchType === "name_match") return "strong";
+
+  // Multi-word terms are strong (full name, address, etc.)
+  if (term.trim().includes(" ")) return "strong";
+
+  // Location matches are strong
+  if (matchType === "location_match" || matchType === "city_or_location") return "strong";
+
+  // Check if this is a last-name component match (strong)
+  const nameParts = nameLower.split(/\s+/);
+  if (nameParts.length >= 2) {
+    const lastName = nameParts[nameParts.length - 1];
+    if (termLower === lastName) return "strong";
+  }
+
+  // Single-word alias match >= 6 chars is strong (distinctive enough)
+  if (term.length >= 6 && matchType === "alias_match") return "strong";
+
+  // Everything else (short single-word, first-name-only, db_scan short tokens) = weak
+  return "weak";
+}
+
+// ============================================================
 // CANDIDATE TYPES
 // ============================================================
 type CandidateProject = {
@@ -98,6 +136,7 @@ type CandidateProject = {
   sources: string[];
   alias_matches: { term: string; match_type: string }[];
   rank_score: number;
+  weak_only: boolean; // true if ALL alias evidence is weak (first-name-only, short token)
 };
 
 // ============================================================
@@ -573,6 +612,7 @@ Deno.serve(async (req: Request) => {
     const rankedCandidates: CandidateProject[] = [];
 
     for (const [pid, meta] of candidatesById) {
+      const pName = projectNameById.get(pid) || pid;
       const isExistingProject = meta.sources.includes(
         "interactions_existing_project",
       );
@@ -581,26 +621,38 @@ Deno.serve(async (req: Request) => {
       );
       const hasAliasEvidence = meta.alias_matches.length > 0;
 
+      // PHONETIC-ADJACENT-ONLY: Classify each alias match
+      const hasStrongMatch = meta.alias_matches.some(
+        (m) => classifyMatchStrength(m.term, m.match_type, pName) === "strong",
+      );
+      const weakOnly = hasAliasEvidence && !hasStrongMatch && !meta.assigned;
+
       // V3 ranking formula (from context_assembly v4.0.22)
       // - assigned via project_contacts: +100
       // - existing_project with evidence: +80, without evidence: +20
       // - mentioned non-floater contact: +40
       // - affinity weight: +min(weight*10, 50)
       // - alias/name matches: +min(count*20, 60)
+      //   PHONETIC-ADJACENT-ONLY: weak-only matches capped at +10 per match (was +20)
+      const aliasScore = weakOnly
+        ? Math.min(meta.alias_matches.length * 10, 30) // Weak: capped lower
+        : Math.min(meta.alias_matches.length * 20, 60); // Strong: original
+
       const rank_score = (meta.assigned ? 100 : 0) +
         (isExistingProject ? (hasAliasEvidence ? 80 : 20) : 0) +
         (hasMentionedContact ? 40 : 0) +
         Math.min(Math.max(meta.affinity_weight * 10, 0), 50) +
-        Math.min(meta.alias_matches.length * 20, 60);
+        aliasScore;
 
       rankedCandidates.push({
         project_id: pid,
-        project_name: projectNameById.get(pid) || pid,
+        project_name: pName,
         assigned: meta.assigned,
         affinity_weight: meta.affinity_weight,
         sources: meta.sources,
         alias_matches: meta.alias_matches,
         rank_score,
+        weak_only: weakOnly,
       });
     }
 
@@ -620,6 +672,7 @@ Deno.serve(async (req: Request) => {
 
     // ========================================
     // SELECT WINNER (for candidates, NOT for direct assignment)
+    // PHONETIC-ADJACENT-ONLY: weak-only winners get capped confidence
     // ========================================
     if (rankedCandidates.length > 0) {
       const winner = rankedCandidates[0];
@@ -637,6 +690,14 @@ Deno.serve(async (req: Request) => {
       }
       if (winner.alias_matches.length >= 2) {
         project_confidence = Math.min(project_confidence + 0.05, 0.99);
+      }
+
+      // PHONETIC-ADJACENT-ONLY: Cap confidence for weak-only winners
+      // First-name-only or short-token-only matches = "possible", never high confidence
+      if (winner.weak_only) {
+        project_confidence = Math.min(project_confidence, 0.35);
+        warnings.push("weak_alias_evidence_only");
+        project_source = project_source + "+weak_only";
       }
     }
 
@@ -670,6 +731,7 @@ Deno.serve(async (req: Request) => {
           score: c.rank_score,
           sources: c.sources,
           matches: c.alias_matches.length,
+          weak_only: c.weak_only,
         })),
         sources_used,
         warnings,
