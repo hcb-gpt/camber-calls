@@ -27,9 +27,9 @@
  * Output:
  *   - context_package JSON with meta, span, contact, candidates, place_mentions
  *
- * AUTH:
- * - Accepts service role JWT (verify_jwt=false in config)
- * - Also accepts X-Edge-Secret for internal function-to-function calls
+ * AUTH (v1.3.0 — simplified from PR-9/PR-10):
+ * - X-Edge-Secret header (internal pipeline / CLI calls)
+ * - Bearer service-role-key (backwards compat)
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -49,15 +49,7 @@ const VALID_PROJECT_STATUSES = ["active", "warranty", "estimating"];
 // PR-11 (STRAT TURN14): Filter by project_kind to exclude internal/owner projects
 const VALID_PROJECT_KIND = "client";
 
-// ============================================================
-// ADMIN ALLOWLIST (PR-10 hardening)
-// Hard-coded admin user IDs as second-layer gate
-// REQUIRED: At least one of ADMIN_USER_IDS or ALLOWED_EMAILS must match
-// ============================================================
-const ADMIN_USER_IDS: string[] = [
-  // Add Supabase auth.users.id values here
-  // Example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-];
+// Auth: X-Edge-Secret or service-role Bearer (simplified from PR-9/PR-10)
 
 // ============================================================
 // ENROUTE VERB PATTERNS (STRAT-1 POLICY: VERB-DRIVEN ONLY)
@@ -364,14 +356,22 @@ Deno.serve(async (req: Request) => {
   }
 
   // ========================================
-  // AUTH GATE: Require valid JWT (PR-9 hotfix)
+  // AUTH GATE: X-Edge-Secret OR service-role Bearer token
+  // Simplified from PR-9/PR-10 multi-layer auth (v1.3.0)
   // ========================================
+  const edgeSecret = req.headers.get("X-Edge-Secret") || req.headers.get("x-edge-secret");
+  const expectedSecret = Deno.env.get("EDGE_SHARED_SECRET");
   const authHeader = req.headers.get("Authorization");
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return new Response(JSON.stringify({ error: "missing_auth", hint: "Authorization: Bearer <token> required" }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+
+  const secretOk = expectedSecret && edgeSecret === expectedSecret;
+  const bearerOk = serviceRoleKey && authHeader === `Bearer ${serviceRoleKey}`;
+
+  if (!secretOk && !bearerOk) {
+    return new Response(
+      JSON.stringify({ error: "unauthorized", hint: "Provide X-Edge-Secret header or Bearer service-role token" }),
+      { status: 401, headers: { "Content-Type": "application/json" } },
+    );
   }
 
   let body: any;
@@ -388,52 +388,6 @@ Deno.serve(async (req: Request) => {
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
   );
-
-  // Verify JWT is valid (will fail if token invalid/expired)
-  const anonClient = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_ANON_KEY")!,
-    { global: { headers: { Authorization: authHeader } } },
-  );
-  const { data: { user }, error: authErr } = await anonClient.auth.getUser();
-  if (authErr || !user) {
-    return new Response(JSON.stringify({ error: "invalid_token", detail: authErr?.message }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  // ========================================
-  // AUTHORIZATION GATE (PR-10 hardening)
-  // Two-layer check: ADMIN_USER_IDS (hard-coded) OR ALLOWED_EMAILS (env)
-  // At least one gate must be configured; user must pass at least one
-  // ========================================
-  const allowedEmails = (Deno.env.get("ALLOWED_EMAILS") || "").split(",").map(
-    (e) => e.trim().toLowerCase(),
-  ).filter(Boolean);
-
-  const userEmail = (user.email || "").toLowerCase();
-  const userId = user.id;
-
-  // Check if user passes either gate
-  const isAdmin = ADMIN_USER_IDS.length > 0 && ADMIN_USER_IDS.includes(userId);
-  const isAllowedEmail = allowedEmails.length > 0 && allowedEmails.includes(userEmail);
-
-  // At least one gate must be configured
-  if (ADMIN_USER_IDS.length === 0 && allowedEmails.length === 0) {
-    return new Response(
-      JSON.stringify({ error: "config_error", hint: "Neither ADMIN_USER_IDS nor ALLOWED_EMAILS configured" }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
-    );
-  }
-
-  // User must pass at least one gate
-  if (!isAdmin && !isAllowedEmail) {
-    return new Response(JSON.stringify({ error: "forbidden", hint: "User not authorized" }), {
-      status: 403,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
 
   const truncations: string[] = [];
   const warnings: string[] = [];
