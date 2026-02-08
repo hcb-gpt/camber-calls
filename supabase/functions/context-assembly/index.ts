@@ -34,7 +34,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const ASSEMBLY_VERSION = "v1.2.8";
+const ASSEMBLY_VERSION = "v1.3.0"; // phonetic-adjacent-only: match quality gating
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_TRANSCRIPT_CHARS = 8000;
@@ -111,6 +111,7 @@ interface CandidateEvidence {
   assigned: boolean;
   alias_matches: AliasMatch[];
   geo_distance_km?: number;
+  weak_only?: boolean; // true if ALL alias evidence is weak (first-name-only, short token)
 }
 
 interface Candidate {
@@ -204,6 +205,40 @@ function normalizeAliasTerms(terms: string[]): string[] {
     out.push(t);
   }
   return out;
+}
+
+/** PHONETIC-ADJACENT-ONLY: Classify whether an alias match is strong or weak.
+ *  - "strong": exact project name, multi-word alias, last-name match, or location
+ *  - "weak": single short first-name-only token with no corroboration */
+function classifyMatchStrength(
+  term: string,
+  matchType: string,
+  projectName: string,
+): "strong" | "weak" {
+  const termLower = term.toLowerCase();
+  const nameLower = projectName.toLowerCase();
+
+  // Exact project name match is always strong
+  if (termLower === nameLower || matchType === "exact_project_name" || matchType === "name_match") return "strong";
+
+  // Multi-word terms are strong (full name, address, etc.)
+  if (term.trim().includes(" ")) return "strong";
+
+  // Location matches are strong
+  if (matchType === "city_or_location" || matchType === "location_match") return "strong";
+
+  // Check if this is a last-name component match (strong)
+  const nameParts = nameLower.split(/\s+/);
+  if (nameParts.length >= 2) {
+    const lastName = nameParts[nameParts.length - 1];
+    if (termLower === lastName) return "strong";
+  }
+
+  // Single-word alias match >= 6 chars is strong (distinctive enough)
+  if (term.length >= 6 && (matchType === "alias" || matchType === "alias_match")) return "strong";
+
+  // Everything else (short single-word, first-name-only, db_scan short tokens) = weak
+  return "weak";
 }
 
 /** Extract snippet around a match position */
@@ -967,12 +1002,24 @@ Deno.serve(async (req: Request) => {
 
     // ========================================
     // BUILD CANDIDATES ARRAY
+    // PHONETIC-ADJACENT-ONLY: classify match strength, flag weak-only candidates
     // ========================================
     const candidates: Candidate[] = [];
 
     for (const [pid, meta] of candidatesById) {
       const details = projectDetailsById.get(pid);
       if (!details) continue;
+
+      // Classify each alias match as strong or weak
+      const hasAliasEvidence = meta.alias_matches.length > 0;
+      const hasStrongMatch = meta.alias_matches.some(
+        (m) => classifyMatchStrength(m.term, m.match_type, details.name) === "strong",
+      );
+      const weakOnly = hasAliasEvidence && !hasStrongMatch && !meta.assigned;
+
+      if (weakOnly) {
+        warnings.push(`weak_alias_only:${details.name}`);
+      }
 
       candidates.push({
         project_id: pid,
@@ -988,13 +1035,19 @@ Deno.serve(async (req: Request) => {
           assigned: meta.assigned,
           alias_matches: meta.alias_matches,
           geo_distance_km: meta.geo_distance_km,
+          weak_only: weakOnly || undefined,
         },
       });
     }
 
     // Sort by evidence strength
+    // PHONETIC-ADJACENT-ONLY: weak-only candidates sort below strong candidates
     candidates.sort((a, b) => {
       if (a.evidence.assigned !== b.evidence.assigned) return a.evidence.assigned ? -1 : 1;
+      // Strong evidence beats weak evidence
+      const aWeak = a.evidence.weak_only === true;
+      const bWeak = b.evidence.weak_only === true;
+      if (aWeak !== bWeak) return aWeak ? 1 : -1;
       if (b.evidence.alias_matches.length !== a.evidence.alias_matches.length) {
         return b.evidence.alias_matches.length - a.evidence.alias_matches.length;
       }
