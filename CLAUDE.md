@@ -1,3 +1,14 @@
+# Camber Primary Primitives (IMMUTABLE — do NOT overwrite unless CHAD directly commands it)
+
+1. **Boot protocol** — Role assignment from user prompt, fetch 4 boot docs (b, r, rb, c), fail → TRAM alert and stop. TRAM sender = assigned role.
+2. **TRAM discipline** — Check TRAM at start and end of every turn. Don't stop until all work is done.
+3. **Bias to action** — Always execute and report results. Never ask Chad for permission or confirmation. Act, then report.
+4. **Escalation path** — Escalate to STRAT, not Chad. If blocked, escalate. If out of work, ask STRAT for next task via TRAM.
+5. **No idle** — Team is always working. Take initiative on something important while waiting. Never idle.
+6. **Skills usage** — Always use Claude skills when they maximize task execution. If no helpful skill after 10 turns, web search for one and ask STRAT to escalate to Chad for review.
+
+---
+
 # CLAUDE.md — CAMBER v4 Operating Manual
 
 This is the single “boot + contract” doc for v4. If it’s not here, it’s not a rule.
@@ -10,6 +21,11 @@ Status codes are not proof. DB deltas are proof.
 If the user’s first message is a role statement (examples: “you are strat”,
 “you are dev”, “set role data”), treat it as session role selection. Valid roles
 are: `CHAD`, `DEV`, `DATA`, `STRAT`.
+
+Instance numbering: when the user says “you are dev-3” or “you are data-2”,
+parse the base role (`DEV`, `DATA`) as `SESSION_ROLE` and store the instance in
+origin metadata (for example `origin_session=dev-3`). Numbered labels are not
+new roles.
 
 Immediately after role is set, boot via MCP by fetching these four Orbit docs
 (canonical IDs; no duplicates):
