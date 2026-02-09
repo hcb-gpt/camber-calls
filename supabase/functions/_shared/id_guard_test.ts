@@ -1,12 +1,5 @@
-import {
-  assert,
-  assertEquals,
-} from "https://deno.land/std@0.218.0/assert/mod.ts";
-import {
-  hasIdGuardErrors,
-  summarizeIdGuardWarnings,
-  validateAttributionIds,
-} from "./id_guard.ts";
+import { assert, assertEquals } from "https://deno.land/std@0.218.0/assert/mod.ts";
+import { hasIdGuardErrors, summarizeIdGuardWarnings, validateAttributionIds } from "./id_guard.ts";
 
 Deno.test("id_guard: accepts canonical interaction_id and span_id", () => {
   const issues = validateAttributionIds({

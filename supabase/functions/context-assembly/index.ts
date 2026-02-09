@@ -170,9 +170,9 @@ interface JournalOpenLoop {
 interface ProjectJournalState {
   project_id: string;
   active_claims_count: number;
-  recent_claims: JournalClaim[];   // Last 5 active claims
-  open_loops: JournalOpenLoop[];   // Open loops for this project
-  last_journal_activity: string | null;  // Timestamp of most recent claim
+  recent_claims: JournalClaim[]; // Last 5 active claims
+  open_loops: JournalOpenLoop[]; // Open loops for this project
+  last_journal_activity: string | null; // Timestamp of most recent claim
 }
 
 interface ContextPackage {
@@ -196,14 +196,14 @@ interface ContextPackage {
     contact_id: string | null;
     contact_name: string | null;
     phone_e164_last4: string | null;
-    floater_flag: boolean;          // Backwards compat: derived from fanout_class
-    fanout_class: string;           // v1.5.0: anchored|semi_anchored|drifter|floater|unknown
-    effective_fanout: number;       // v1.5.0: number of active projects
+    floater_flag: boolean; // Backwards compat: derived from fanout_class
+    fanout_class: string; // v1.5.0: anchored|semi_anchored|drifter|floater|unknown
+    effective_fanout: number; // v1.5.0: number of active projects
     recent_projects: RecentProject[];
   };
   candidates: Candidate[];
   place_mentions: PlaceMention[];
-  project_journal: ProjectJournalState[];  // v1.4.0: journal-derived state per candidate project
+  project_journal: ProjectJournalState[]; // v1.4.0: journal-derived state per candidate project
 }
 
 // ============================================================
@@ -429,10 +429,13 @@ Deno.serve(async (req: Request) => {
   // Path 2: External JWT auth (only if no valid edge secret)
   if (!hasValidEdgeSecret) {
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return new Response(JSON.stringify({ error: "missing_auth", hint: "X-Edge-Secret or Authorization: Bearer <token> required" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json" },
-      });
+      return new Response(
+        JSON.stringify({ error: "missing_auth", hint: "X-Edge-Secret or Authorization: Bearer <token> required" }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
     }
 
     // Verify JWT is valid (will fail if token invalid/expired)

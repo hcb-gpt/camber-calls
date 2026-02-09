@@ -36,23 +36,23 @@ const jsonHeaders = { "Content-Type": "application/json" };
 // SIGNAL TAXONOMY
 // ============================================================
 const VALID_SIGNAL_TYPES = [
-  "decision_point",        // A choice is being made or deferred
-  "scope_change",          // Work is being added, removed, or redefined
-  "financial_signal",      // Money, cost, budget, change order, payment
-  "relationship_tension",  // Disagreement, frustration, concern, apology
-  "commitment",            // Someone is promising something specific
-  "escalation",            // Issue being raised to higher authority or urgency
-  "surprise",              // Information that catches someone off guard
-  "threshold",             // A before/after moment ("we need to decide by Friday")
+  "decision_point", // A choice is being made or deferred
+  "scope_change", // Work is being added, removed, or redefined
+  "financial_signal", // Money, cost, budget, change order, payment
+  "relationship_tension", // Disagreement, frustration, concern, apology
+  "commitment", // Someone is promising something specific
+  "escalation", // Issue being raised to higher authority or urgency
+  "surprise", // Information that catches someone off guard
+  "threshold", // A before/after moment ("we need to decide by Friday")
 ] as const;
 
 type SignalType = typeof VALID_SIGNAL_TYPES[number];
 
 interface StrikingSignal {
   type: SignalType;
-  text: string;          // Short description of what was detected
-  quote: string;         // Exact quote from transcript
-  confidence: number;    // 0.0–1.0
+  text: string; // Short description of what was detected
+  quote: string; // Exact quote from transcript
+  confidence: number; // 0.0–1.0
 }
 
 interface StrikingResult {

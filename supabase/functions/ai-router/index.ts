@@ -56,7 +56,7 @@ interface JournalReference {
   project_id: string;
   claim_type: string;
   claim_text: string;
-  relevance: string;  // How the claim relates to the transcript
+  relevance: string; // How the claim relates to the transcript
 }
 
 interface AttributionResult {
@@ -67,7 +67,7 @@ interface AttributionResult {
   reasoning: string;
   anchors: Anchor[];
   suggested_aliases?: SuggestedAlias[];
-  journal_references?: JournalReference[];  // v1.7.0: which journal claims influenced decision
+  journal_references?: JournalReference[]; // v1.7.0: which journal claims influenced decision
 }
 
 // v1.6.0: Journal-derived project state (from context-assembly v1.4.0)
@@ -105,9 +105,9 @@ interface ContextPackage {
   contact: {
     contact_id: string | null;
     contact_name: string | null;
-    floater_flag: boolean;          // Backwards compat
-    fanout_class?: string;          // v1.7.0: anchored|semi_anchored|drifter|floater|unknown
-    effective_fanout?: number;      // v1.7.0: project count
+    floater_flag: boolean; // Backwards compat
+    fanout_class?: string; // v1.7.0: anchored|semi_anchored|drifter|floater|unknown
+    effective_fanout?: number; // v1.7.0: project count
     recent_projects: Array<{ project_id: string; project_name: string }>;
   };
   candidates: Array<{
@@ -125,7 +125,7 @@ interface ContextPackage {
       alias_matches: Array<{ term: string; match_type: string; snippet?: string }>;
     };
   }>;
-  project_journal?: ProjectJournalState[];  // v1.6.0: journal-derived state per candidate
+  project_journal?: ProjectJournalState[]; // v1.6.0: journal-derived state per candidate
 }
 
 // ============================================================
@@ -459,10 +459,10 @@ function buildUserPrompt(ctx: ContextPackage): string {
     let journalSummary = "   - Journal: No prior context";
     if (journalState && (journalState.recent_claims.length > 0 || journalState.open_loops.length > 0)) {
       const claimsSummary = journalState.recent_claims.slice(0, 3).map(
-        (cl) => `[${cl.claim_type}] ${cl.claim_text}`
+        (cl) => `[${cl.claim_type}] ${cl.claim_text}`,
       ).join("; ");
       const loopsSummary = journalState.open_loops.map(
-        (l) => `[${l.loop_type}] ${l.description}`
+        (l) => `[${l.loop_type}] ${l.description}`,
       ).join("; ");
       journalSummary = `   - Journal (${journalState.active_claims_count} active claims):`;
       if (claimsSummary) journalSummary += `\n     Recent: ${claimsSummary}`;
@@ -615,7 +615,9 @@ Deno.serve(async (req: Request) => {
     const anchors: Anchor[] = Array.isArray(parsed.anchors) ? parsed.anchors : [];
     const suggested_aliases: SuggestedAlias[] = Array.isArray(parsed.suggested_aliases) ? parsed.suggested_aliases : [];
     // v1.7.0: Extract journal references from model response
-    const journal_references: JournalReference[] = Array.isArray(parsed.journal_references) ? parsed.journal_references : [];
+    const journal_references: JournalReference[] = Array.isArray(parsed.journal_references)
+      ? parsed.journal_references
+      : [];
 
     // HARD GUARDRAIL: decision="assign" requires transcript-grounded anchor
     // Quote must ACTUALLY APPEAR in the transcript (substring match)
@@ -793,7 +795,8 @@ Deno.serve(async (req: Request) => {
         quoteVerified,
         strongAnchor: strongAnchorPresent,
         modelError: model_error,
-        ambiguousContact: (context_package.contact?.fanout_class === "floater" || context_package.contact?.fanout_class === "drifter") || (context_package.contact?.floater_flag === true),
+        ambiguousContact: (context_package.contact?.fanout_class === "floater" ||
+          context_package.contact?.fanout_class === "drifter") || (context_package.contact?.floater_flag === true),
         geoOnly: !strongAnchorPresent && result.anchors.some((a) => a.match_type === "city_or_location"),
       });
 

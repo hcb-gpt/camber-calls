@@ -16,8 +16,7 @@ export interface IdGuardrailResult {
   warnings: IdGuardrailWarning[];
 }
 
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const INTERACTION_ID_RE = /^cll_[A-Za-z0-9]+$/;
 const CONFUSABLE_INTERACTION_PREFIX_RE = /^c[1il|][1il|]_$/i;
 
@@ -207,4 +206,3 @@ export function normalizeIdsForAttribution(input: {
     warnings,
   };
 }
-

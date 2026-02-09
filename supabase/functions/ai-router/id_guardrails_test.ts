@@ -63,4 +63,3 @@ Deno.test("id guardrail: valid IDs pass without warnings", () => {
   assertEquals(out.interaction_id, "cll_06E0P6KYB5V7S5VYQA8ZTRQM4W", "valid interaction_id should remain unchanged");
   assertEquals(out.warnings.length, 0, "expected no warnings for valid IDs");
 });
-
