@@ -1,21 +1,29 @@
 /**
- * process-call Edge Function v4.0.0
+ * process-call Edge Function v4.3.0
  * Full v3.6 pipeline in Supabase - Ported from v4.0.22 context_assembly
  *
- * @version 4.0.0
- * @date 2026-01-31
+ * @version 4.3.0
+ * @date 2026-02-09
  * @port context_assembly v4.0.22 - 6-source ranking, word boundaries, speaker stripping
  *
  * PR-12 HARDENING:
  * - JWT + provenance gate (like context-assembly)
- * - REMOVED interactions.project_id write (POLICY: only human review-resolve may write)
  * - project_kind='client' + status filters on all candidate sources
  * - No silent OK paths
+ *
+ * v4.2.0 CHANGES (attribution gap fix):
+ * - Write candidate_projects to interactions
+ * - Call auto_assign_project() after upsert to close PR-12 policy gap
+ *
+ * v4.3.0 CHANGES (pipeline chain fix):
+ * - Chain to segment-call after successful ingestion (fire-and-forget)
+ * - Only fires when transcript >= 10 chars and gate decision is PASS
+ * - Closes the attribution gap: calls now flow through full pipeline
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const PROCESS_CALL_VERSION = "v4.1.0"; // phonetic-adjacent-only: match quality gating
+const PROCESS_CALL_VERSION = "v4.3.0"; // pipeline chain fix: segment-call after ingestion
 const GATE = { PASS: "PASS", SKIP: "SKIP", NEEDS_REVIEW: "NEEDS_REVIEW" };
 const ID_PATTERN = /^cll_[a-zA-Z0-9_]+$/;
 
@@ -268,6 +276,12 @@ Deno.serve(async (req: Request) => {
   let project_id: string | null = null, project_name: string | null = null;
   let project_source: string | null = null;
   let project_confidence: number | null = null;
+
+  // v4.2.0: auto-assign tracking
+  let auto_assign_result: any = null;
+  // v4.3.0: segment-call chain tracking
+  let segment_call_fired = false;
+  let segment_call_status: number | null = null;
 
   // V3 ported: candidate tracking
   const candidatesById = new Map<string, {
@@ -740,8 +754,21 @@ Deno.serve(async (req: Request) => {
     if (cr) cr_uuid = cr.id;
 
     // ========================================
-    // INTERACTIONS (PR-12: NO project_id write)
-    // POLICY: Only review-resolve (human) may write interactions.project_id
+    // v4.2.0: Build candidate_projects JSON for interactions
+    // ========================================
+    const candidateProjectsJson = rankedCandidates.slice(0, 5).map((c) => ({
+      id: c.project_id,
+      name: c.project_name,
+      score: c.rank_score,
+      confidence: c.rank_score / (100 + 80 + 40 + 50 + 60),
+      sources: c.sources,
+      matches: c.alias_matches.length,
+      weak_only: c.weak_only,
+    }));
+
+    // ========================================
+    // INTERACTIONS
+    // v4.2.0: Write candidate_projects so auto_assign_project can read them
     // ========================================
     if (g.decision === "PASS" || g.decision === "NEEDS_REVIEW") {
       await db.from("interactions").upsert({
@@ -751,14 +778,78 @@ Deno.serve(async (req: Request) => {
         contact_name: contact_name || null,
         contact_phone: phone || null,
         owner_phone: n.from_phone || null,
-        // PR-12: REMOVED project_id write - only human review-resolve may set this
-        // project_id: project_id || null,  // REMOVED
+        candidate_projects: candidateProjectsJson.length > 0 ? candidateProjectsJson : null,
         event_at_utc: n.event_at_utc || null,
-        needs_review: true, // PR-12: Always needs review since AI doesn't assign
+        needs_review: true, // Default true; auto_assign_project may override below
         review_reasons: [...g.reasons, "ai_candidate_only"],
         project_attribution_confidence: project_confidence,
         transcript_chars: n.transcript?.length || 0,
       }, { onConflict: "interaction_id" });
+
+      // ========================================
+      // v4.2.0: AUTO-ASSIGN PROJECT
+      // ========================================
+      if (contact_id && candidateProjectsJson.length > 0) {
+        try {
+          const { data: assignResult, error: assignErr } = await db.rpc(
+            "auto_assign_project",
+            { p_interaction_id: iid },
+          );
+
+          if (!assignErr && assignResult) {
+            auto_assign_result = assignResult;
+            if (assignResult.assigned) {
+              project_id = assignResult.project_id;
+              project_source = (project_source || "") + "+auto_assigned_" + assignResult.reason;
+              sources_used.push("auto_assign_project");
+            }
+          } else if (assignErr) {
+            warnings.push(`auto_assign_error: ${assignErr.message}`);
+          }
+        } catch (e: any) {
+          warnings.push(`auto_assign_exception: ${e.message}`);
+        }
+      }
+
+      // ========================================
+      // v4.3.0: CHAIN TO SEGMENT-CALL
+      // Fire segment-call for full attribution pipeline:
+      //   segment-call → segment-llm → context-assembly → ai-router → span_attributions
+      // Only when we have a real transcript (>= 10 chars) and gate PASS.
+      // Fire-and-forget: segment-call failures do NOT block process-call response.
+      // ========================================
+      const transcriptLen = n.transcript?.length || 0;
+      if (g.decision === "PASS" && transcriptLen >= 10) {
+        const edgeSecretVal = Deno.env.get("EDGE_SHARED_SECRET");
+        const segmentCallUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/segment-call`;
+        if (edgeSecretVal) {
+          try {
+            const segResp = await fetch(segmentCallUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-Edge-Secret": edgeSecretVal,
+              },
+              body: JSON.stringify({
+                interaction_id: iid,
+                transcript: n.transcript,
+                source: "process-call",
+              }),
+            });
+            segment_call_fired = true;
+            segment_call_status = segResp.status;
+            if (!segResp.ok) {
+              const errBody = await segResp.text().catch(() => "unknown");
+              warnings.push(`segment_call_http_${segResp.status}: ${errBody.slice(0, 200)}`);
+            }
+          } catch (e: any) {
+            segment_call_fired = true;
+            warnings.push(`segment_call_exception: ${e.message}`);
+          }
+        } else {
+          warnings.push("segment_call_skipped: EDGE_SHARED_SECRET not set");
+        }
+      }
     }
 
     // CONTACT STATS (optional, ignore errors)
@@ -790,7 +881,6 @@ Deno.serve(async (req: Request) => {
         reasons: g.reasons,
         contact_id,
         contact_name,
-        // PR-12: Renamed to "candidate" to clarify not assigned
         candidate_project_id: project_id,
         candidate_project_name: project_name,
         candidate_project_source: project_source,
@@ -801,6 +891,13 @@ Deno.serve(async (req: Request) => {
           name: c.project_name,
           score: c.rank_score,
         })),
+        // v4.2.0: auto-assign result
+        auto_assign: auto_assign_result,
+        // v4.3.0: segment-call chain
+        segment_call: {
+          fired: segment_call_fired,
+          status: segment_call_status,
+        },
         sources_used,
         warnings,
         audit_id,
