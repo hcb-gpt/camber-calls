@@ -1,13 +1,18 @@
 /**
- * context-assembly Edge Function v1.2.0
+ * context-assembly Edge Function v1.4.0
  * Assembles LLM-ready context_package from span_id (SPAN-FIRST)
  *
- * @version 1.2.0
- * @date 2026-01-30
+ * @version 1.4.0
+ * @date 2026-02-09
  * @purpose Provide rich context for AI Router project attribution
  * @port 6-source candidate collection from process-call v3.9.6
  *
  * CORE PRINCIPLE: span_id is the unit of truth. Calls are containers only.
+ *
+ * v1.4.0 Changes (Journal/World Model integration):
+ * - NEW: journal-derived project state injected into context package
+ * - For each candidate project, fetches active journal_claims and open_loops
+ * - New field: context_package.project_journal (per-project state summaries)
  *
  * v1.2.0 Changes (PR-7 Phase 2: Enroute Detection):
  * - VERB-DRIVEN role tagging: destination/origin/proximity
@@ -25,7 +30,7 @@
  *   - interaction_id + span_index: (debug convenience) - resolves to span_id first
  *
  * Output:
- *   - context_package JSON with meta, span, contact, candidates, place_mentions
+ *   - context_package JSON with meta, span, contact, candidates, place_mentions, project_journal
  *
  * AUTH:
  * - Accepts service role JWT (verify_jwt=false in config)
@@ -34,7 +39,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const ASSEMBLY_VERSION = "v1.3.0"; // phonetic-adjacent-only: match quality gating
+const ASSEMBLY_VERSION = "v1.4.0"; // v1.4.0: journal-derived project state + phonetic-adjacent-only
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_TRANSCRIPT_CHARS = 8000;
@@ -142,6 +147,28 @@ interface PlaceMention {
   snippet: string;
 }
 
+// v1.4.0: Journal-derived project state
+interface JournalClaim {
+  claim_type: string;
+  claim_text: string;
+  epistemic_status: string;
+  created_at: string;
+}
+
+interface JournalOpenLoop {
+  loop_type: string;
+  description: string;
+  status: string;
+}
+
+interface ProjectJournalState {
+  project_id: string;
+  active_claims_count: number;
+  recent_claims: JournalClaim[];   // Last 5 active claims
+  open_loops: JournalOpenLoop[];   // Open loops for this project
+  last_journal_activity: string | null;  // Timestamp of most recent claim
+}
+
 interface ContextPackage {
   meta: {
     assembly_version: string;
@@ -168,6 +195,7 @@ interface ContextPackage {
   };
   candidates: Candidate[];
   place_mentions: PlaceMention[];
+  project_journal: ProjectJournalState[];  // v1.4.0: journal-derived state per candidate project
 }
 
 // ============================================================
@@ -1082,6 +1110,90 @@ Deno.serve(async (req: Request) => {
     }
 
     // ========================================
+    // v1.4.0: JOURNAL-DERIVED PROJECT STATE
+    // Fetch active claims and open loops for each candidate project
+    // This gives the ai-router knowledge of what's currently happening
+    // on each candidate project (the "world model" context).
+    // Non-fatal: if journal tables are empty or query fails, we skip.
+    // ========================================
+    const project_journal: ProjectJournalState[] = [];
+    const candidateProjectIds = finalCandidates.map((c) => c.project_id).filter(Boolean);
+
+    if (candidateProjectIds.length > 0) {
+      try {
+        // Fetch recent active claims for candidate projects (max 5 per project)
+        const { data: claimsData, error: claimsErr } = await db
+          .from("journal_claims")
+          .select("project_id, claim_type, claim_text, epistemic_status, created_at")
+          .in("project_id", candidateProjectIds)
+          .eq("active", true)
+          .order("created_at", { ascending: false })
+          .limit(candidateProjectIds.length * 5); // Rough limit, we'll group below
+
+        // Fetch open loops for candidate projects
+        const { data: loopsData, error: loopsErr } = await db
+          .from("journal_open_loops")
+          .select("project_id, loop_type, description, status")
+          .in("project_id", candidateProjectIds)
+          .eq("status", "open")
+          .limit(candidateProjectIds.length * 3);
+
+        if (!claimsErr && !loopsErr) {
+          // Group claims by project
+          const claimsByProject = new Map<string, JournalClaim[]>();
+          for (const c of (claimsData || [])) {
+            if (!c.project_id) continue;
+            if (!claimsByProject.has(c.project_id)) claimsByProject.set(c.project_id, []);
+            const arr = claimsByProject.get(c.project_id)!;
+            if (arr.length < 5) { // Cap at 5 per project
+              arr.push({
+                claim_type: c.claim_type,
+                claim_text: (c.claim_text || "").slice(0, 200),
+                epistemic_status: c.epistemic_status,
+                created_at: c.created_at,
+              });
+            }
+          }
+
+          // Group open loops by project
+          const loopsByProject = new Map<string, JournalOpenLoop[]>();
+          for (const l of (loopsData || [])) {
+            if (!l.project_id) continue;
+            if (!loopsByProject.has(l.project_id)) loopsByProject.set(l.project_id, []);
+            const arr = loopsByProject.get(l.project_id)!;
+            if (arr.length < 3) { // Cap at 3 per project
+              arr.push({
+                loop_type: l.loop_type,
+                description: (l.description || "").slice(0, 200),
+                status: l.status,
+              });
+            }
+          }
+
+          // Build per-project state
+          for (const pid of candidateProjectIds) {
+            const claims = claimsByProject.get(pid) || [];
+            const loops = loopsByProject.get(pid) || [];
+
+            if (claims.length > 0 || loops.length > 0) {
+              project_journal.push({
+                project_id: pid,
+                active_claims_count: claims.length, // Note: this is capped at 5, actual count may be higher
+                recent_claims: claims,
+                open_loops: loops,
+                last_journal_activity: claims.length > 0 ? claims[0].created_at : null,
+              });
+              sources_used.push("journal_claims");
+            }
+          }
+        }
+      } catch (_journalErr) {
+        // Non-fatal: journal tables may not be populated yet
+        warnings.push("journal_state_skipped");
+      }
+    }
+
+    // ========================================
     // BUILD CONTEXT PACKAGE
     // ========================================
     const context_package: ContextPackage = {
@@ -1110,6 +1222,7 @@ Deno.serve(async (req: Request) => {
       },
       candidates: finalCandidates,
       place_mentions,
+      project_journal,
     };
 
     return new Response(

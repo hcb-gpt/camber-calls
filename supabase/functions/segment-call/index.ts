@@ -15,7 +15,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const SEGMENT_CALL_VERSION = "v2.3.0";
+const SEGMENT_CALL_VERSION = "v2.4.0";
 
 const ALLOWED_PROVENANCE_SOURCES = [
   "process-call",
@@ -30,6 +30,8 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SEGMENT_LLM_URL = `${SUPABASE_URL}/functions/v1/segment-llm`;
 const CONTEXT_ASSEMBLY_URL = `${SUPABASE_URL}/functions/v1/context-assembly`;
 const AI_ROUTER_URL = `${SUPABASE_URL}/functions/v1/ai-router`;
+const STRIKING_DETECT_URL = `${SUPABASE_URL}/functions/v1/striking-detect`;
+const JOURNAL_EXTRACT_URL = `${SUPABASE_URL}/functions/v1/journal-extract`;
 
 type SegmentFromLLM = {
   span_index: number;
@@ -47,6 +49,9 @@ type SpanChainStatus = {
   ai_router_status: number | null;
   error_code: string | null;
   error_detail: string | null;
+  // v2.4.0: async post-attribution hooks
+  striking_detect_fired: boolean;
+  journal_extract_fired: boolean;
 };
 
 const jsonHeaders = { "Content-Type": "application/json" };
@@ -443,6 +448,8 @@ Deno.serve(async (req: Request) => {
       ai_router_status: null,
       error_code: null,
       error_detail: null,
+      striking_detect_fired: false,
+      journal_extract_fired: false,
     };
 
     // context-assembly
@@ -505,6 +512,64 @@ Deno.serve(async (req: Request) => {
         status.error_detail = await routerResp.text();
         chainStatuses.push(status);
         continue;
+      }
+
+      // ============================================================
+      // v2.4.0: ASYNC POST-ATTRIBUTION HOOKS (fire-and-forget)
+      // These are supplementary — failures do NOT block the pipeline.
+      // ============================================================
+      let routerData: any = null;
+      try {
+        routerData = await routerResp.json();
+      } catch {
+        // If we can't parse router response, skip hooks but don't fail
+      }
+
+      // HOOK 1: striking-detect (runs on every span)
+      try {
+        fetch(STRIKING_DETECT_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Edge-Secret": edgeSecret,
+          },
+          body: JSON.stringify({
+            span_id: span.id,
+            interaction_id,
+            source: "segment-call",
+          }),
+        }).catch((e: any) => {
+          console.error(`[segment-call] striking-detect fire-and-forget error: ${e?.message}`);
+        });
+        status.striking_detect_fired = true;
+      } catch {
+        // Non-fatal
+      }
+
+      // HOOK 2: journal-extract (only when attribution assigned a project)
+      const appliedProjectId = routerData?.gatekeeper?.applied_project_id;
+      const routerDecision = routerData?.decision;
+      if (routerDecision === "assign" && appliedProjectId) {
+        try {
+          fetch(JOURNAL_EXTRACT_URL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Edge-Secret": edgeSecret,
+            },
+            body: JSON.stringify({
+              span_id: span.id,
+              interaction_id,
+              project_id: appliedProjectId,
+              source: "segment-call",
+            }),
+          }).catch((e: any) => {
+            console.error(`[segment-call] journal-extract fire-and-forget error: ${e?.message}`);
+          });
+          status.journal_extract_fired = true;
+        } catch {
+          // Non-fatal
+        }
       }
     } catch (e: any) {
       status.error_code = "ai_router_exception";
