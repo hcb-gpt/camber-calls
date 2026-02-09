@@ -148,6 +148,11 @@ BLOCKED protocol:
 4) who can unblock
 No guesswork and no workarounds.
 
+Auth/collision escalation (Charter §9-10):
+- Any 401/403/secret mismatch → STRAT immediately via TRAM (priority=HIGH). Same turn.
+- Two agents writing same resource → STRAT immediately via TRAM (priority=HIGH). Same turn.
+- Include evidence: failing function/resource, caller/agents, auth method, status code.
+
 ---
 
 ## D) Message headers + receipts (mechanically verifiable)
