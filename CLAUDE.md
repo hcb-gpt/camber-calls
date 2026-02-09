@@ -153,6 +153,12 @@ Auth/collision escalation (Charter §9-10):
 - Two agents writing same resource → STRAT immediately via TRAM (priority=HIGH). Same turn.
 - Include evidence: failing function/resource, caller/agents, auth method, status code.
 
+Deploy/commit ownership (Charter §11):
+- Declare deploy intent via TRAM BEFORE deploying or committing to shared resources.
+- One owner per resource at a time. If claimed, coordinate first.
+- Commit after every deliverable. End-of-session commit required.
+- Deploy receipts must include: DEPLOY_PROOF, supabase_version, verify_jwt setting.
+
 ---
 
 ## D) Message headers + receipts (mechanically verifiable)
