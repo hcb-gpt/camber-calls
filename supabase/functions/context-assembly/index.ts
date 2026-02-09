@@ -1,13 +1,19 @@
 /**
- * context-assembly Edge Function v1.4.1
+ * context-assembly Edge Function v1.5.0
  * Assembles LLM-ready context_package from span_id (SPAN-FIRST)
  *
- * @version 1.4.1
+ * @version 1.5.0
  * @date 2026-02-09
  * @purpose Provide rich context for AI Router project attribution
  * @port 6-source candidate collection from process-call v3.9.6
  *
  * CORE PRINCIPLE: span_id is the unit of truth. Calls are containers only.
+ *
+ * v1.5.0 Changes (Contact Fanout Integration — DATA-9 D4 spec):
+ * - REPLACED: contacts.floats_between_projects boolean → contact_fanout table lookup
+ * - NEW: context_package.contact.fanout_class (anchored|semi_anchored|drifter|floater|unknown)
+ * - NEW: context_package.contact.effective_fanout (integer project count)
+ * - PRESERVED: floater_flag for backwards compat (derived from fanout_class)
  *
  * v1.4.0 Changes (Journal/World Model integration):
  * - NEW: journal-derived project state injected into context package
@@ -39,7 +45,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const ASSEMBLY_VERSION = "v1.4.1"; // v1.4.1: X-Edge-Secret auth for internal calls + journal-derived project state
+const ASSEMBLY_VERSION = "v1.5.0"; // v1.5.0: contact_fanout integration (replaces floats_between_projects boolean)
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_TRANSCRIPT_CHARS = 8000;
@@ -190,7 +196,9 @@ interface ContextPackage {
     contact_id: string | null;
     contact_name: string | null;
     phone_e164_last4: string | null;
-    floater_flag: boolean;
+    floater_flag: boolean;          // Backwards compat: derived from fanout_class
+    fanout_class: string;           // v1.5.0: anchored|semi_anchored|drifter|floater|unknown
+    effective_fanout: number;       // v1.5.0: number of active projects
     recent_projects: RecentProject[];
   };
   candidates: Candidate[];
@@ -564,7 +572,9 @@ Deno.serve(async (req: Request) => {
     let contact_id: string | null = null;
     let contact_name: string | null = null;
     let contact_phone: string | null = null;
-    let floater_flag = false;
+    let fanout_class = "unknown";
+    let effective_fanout = 0;
+    let floater_flag = false; // Backwards compat: derived from fanout_class
 
     const { data: interaction } = await db
       .from("interactions")
@@ -578,15 +588,33 @@ Deno.serve(async (req: Request) => {
       contact_phone = interaction.contact_phone;
     }
 
+    // v1.5.0: Fetch fanout data from contact_fanout table (DATA-9 D4 spec)
+    // Replaces the boolean contacts.floats_between_projects
     if (contact_id) {
-      const { data: contact } = await db
-        .from("contacts")
-        .select("floats_between_projects")
-        .eq("id", contact_id)
+      const { data: fanoutRow } = await db
+        .from("contact_fanout")
+        .select("fanout_class, effective_fanout")
+        .eq("contact_id", contact_id)
         .single();
 
-      if (contact) {
-        floater_flag = !!contact.floats_between_projects;
+      if (fanoutRow) {
+        fanout_class = fanoutRow.fanout_class || "unknown";
+        effective_fanout = fanoutRow.effective_fanout || 0;
+        // Backwards compat: floater_flag = true if floater or drifter (per DATA-9 D4 spec)
+        floater_flag = fanout_class === "floater" || fanout_class === "drifter";
+      } else {
+        // Fallback: if no fanout row, check legacy boolean
+        const { data: contact } = await db
+          .from("contacts")
+          .select("floats_between_projects")
+          .eq("id", contact_id)
+          .single();
+
+        if (contact) {
+          floater_flag = !!contact.floats_between_projects;
+          // Infer fanout_class from legacy flag
+          fanout_class = floater_flag ? "floater" : "unknown";
+        }
       }
     }
 
@@ -1233,6 +1261,8 @@ Deno.serve(async (req: Request) => {
         contact_name,
         phone_e164_last4,
         floater_flag,
+        fanout_class,
+        effective_fanout,
         recent_projects,
       },
       candidates: finalCandidates,

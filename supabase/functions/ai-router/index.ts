@@ -1,13 +1,19 @@
 /**
- * ai-router Edge Function v1.0.1
+ * ai-router Edge Function v1.7.0
  * LLM-based project attribution for conversation spans
  *
- * @version 1.0.1
- * @date 2026-01-31
+ * @version 1.7.0
+ * @date 2026-02-09
  * @purpose Use Claude Haiku to attribute spans to projects with anchored evidence
  *
  * CORE PRINCIPLE: span_attributions is the single source of truth.
  * NO writes to interactions.project_id from this path.
+ *
+ * v1.7.0 Changes (P1: Contact Fanout + Journal References):
+ * - Prompt includes fanout_class + effective_fanout per contact (DATA-9 D4 spec)
+ * - Prompt explains fanout signal strength (anchored=strong, floater=anti-signal)
+ * - Output includes journal_references: which journal claims influenced the decision
+ * - Replaces boolean floater_flag with richer fanout context
  *
  * Input:
  *   - context_package: ContextPackage (from context-assembly)
@@ -20,7 +26,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 
-const PROMPT_VERSION = "v1.6.0"; // v1.6.0: journal-aware attribution
+const PROMPT_VERSION = "v1.7.0"; // v1.7.0: fanout-aware + journal_references output
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
 
@@ -45,6 +51,14 @@ interface SuggestedAlias {
   rationale: string;
 }
 
+// v1.7.0: Journal references — which journal claims influenced the decision
+interface JournalReference {
+  project_id: string;
+  claim_type: string;
+  claim_text: string;
+  relevance: string;  // How the claim relates to the transcript
+}
+
 interface AttributionResult {
   span_id: string;
   project_id: string | null;
@@ -53,6 +67,7 @@ interface AttributionResult {
   reasoning: string;
   anchors: Anchor[];
   suggested_aliases?: SuggestedAlias[];
+  journal_references?: JournalReference[];  // v1.7.0: which journal claims influenced decision
 }
 
 // v1.6.0: Journal-derived project state (from context-assembly v1.4.0)
@@ -90,7 +105,9 @@ interface ContextPackage {
   contact: {
     contact_id: string | null;
     contact_name: string | null;
-    floater_flag: boolean;
+    floater_flag: boolean;          // Backwards compat
+    fanout_class?: string;          // v1.7.0: anchored|semi_anchored|drifter|floater|unknown
+    effective_fanout?: number;      // v1.7.0: project count
     recent_projects: Array<{ project_id: string; project_name: string }>;
   };
   candidates: Array<{
@@ -351,7 +368,12 @@ STRICT RULES FOR STAFF NAMES:
 RULES:
 1. Look for explicit mentions of project names, addresses (including partial addresses like street names), CLIENT names (not staff), or known aliases in the transcript
 2. The caller's project assignments (assigned=true) and call history (affinity) are SECONDARY signals - use them only when transcript evidence is ambiguous
-3. If the contact is a "floater" (works across many projects), assignment is NOT reliable - prioritize transcript anchors
+3. CONTACT FANOUT determines how much weight to give the contact's identity:
+   - anchored (fanout=1): Contact works on ONE project. Their identity is a STRONG attribution signal (near smoking gun)
+   - semi_anchored (fanout=2): Useful with corroboration from transcript
+   - drifter (fanout=3-4): Contextual only, needs strong transcript grounding
+   - floater (fanout>=5): ANTI-SIGNAL. Treat like HCB staff for attribution — prioritize transcript anchors only
+   - unknown (fanout=0): No project association — no signal from identity
 4. If multiple projects are mentioned, choose the PRIMARY topic of discussion
 5. If uncertain, choose "review" with confidence 0.50-0.74
 6. If no clear project match exists in the transcript, choose "none" with confidence <0.50
@@ -397,6 +419,14 @@ OUTPUT FORMAT (JSON only, no markdown):
       "candidate_project_id": "<uuid of the project this evidence supports>",
       "match_type": "<exact_project_name|alias|address_fragment|city_or_location|client_name|mentioned_contact|phonetic_or_pronunciation|continuity_callback|other>",
       "quote": "<EXACT quote from transcript, max 50 chars>"
+    }
+  ],
+  "journal_references": [
+    {
+      "project_id": "<uuid>",
+      "claim_type": "<claim type from journal>",
+      "claim_text": "<the journal claim that influenced your decision>",
+      "relevance": "<how this claim relates to the transcript>"
     }
   ],
   "suggested_aliases": [
@@ -456,6 +486,19 @@ ${journalSummary}`;
     ? ctx.contact.recent_projects.map((p) => p.project_name).join(", ")
     : "None";
 
+  // v1.7.0: Fanout context for caller
+  const fanoutClass = ctx.contact.fanout_class || (ctx.contact.floater_flag ? "floater" : "unknown");
+  const effectiveFanout = ctx.contact.effective_fanout ?? (ctx.contact.floater_flag ? 5 : 0);
+  const fanoutSignal = fanoutClass === "anchored"
+    ? "STRONG signal — contact works on only 1 project"
+    : fanoutClass === "semi_anchored"
+    ? "Moderate signal — contact works on 2 projects, needs corroboration"
+    : fanoutClass === "drifter"
+    ? "Weak signal — contact works on 3-4 projects, needs transcript grounding"
+    : fanoutClass === "floater"
+    ? "ANTI-signal — contact works on 5+ projects, treat like staff"
+    : "No signal — no project association";
+
   return `TRANSCRIPT SEGMENT:
 """
 ${ctx.span.transcript_text}
@@ -463,14 +506,17 @@ ${ctx.span.transcript_text}
 
 CALLER INFO:
 - Name: ${ctx.contact.contact_name || "Unknown"}
-- Is Floater (works across many projects): ${ctx.contact.floater_flag}
+- Fanout: ${effectiveFanout} projects (${fanoutClass})
+- Signal strength: ${fanoutSignal}
 - Recent Projects: ${recentProjectList}
 
 CANDIDATE PROJECTS (${ctx.candidates.length} total):
 ${candidateList || "No candidates found"}
 
 Analyze the transcript and determine which project (if any) this conversation is about.
+Consider the contact's fanout class — an anchored contact (fanout=1) on a single project is strong evidence; a floater (fanout>=5) provides no identity signal.
 Consider the journal context for each project — if the conversation topic matches known commitments, decisions, or open loops for a project, that strengthens the attribution.
+If journal claims influenced your decision, include them in journal_references.
 Remember: You MUST include an exact quote from the transcript to use decision="assign".`;
 }
 
@@ -568,6 +614,8 @@ Deno.serve(async (req: Request) => {
     const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
     const anchors: Anchor[] = Array.isArray(parsed.anchors) ? parsed.anchors : [];
     const suggested_aliases: SuggestedAlias[] = Array.isArray(parsed.suggested_aliases) ? parsed.suggested_aliases : [];
+    // v1.7.0: Extract journal references from model response
+    const journal_references: JournalReference[] = Array.isArray(parsed.journal_references) ? parsed.journal_references : [];
 
     // HARD GUARDRAIL: decision="assign" requires transcript-grounded anchor
     // Quote must ACTUALLY APPEAR in the transcript (substring match)
@@ -620,6 +668,7 @@ Deno.serve(async (req: Request) => {
       reasoning: parsed.reasoning || "No reasoning provided",
       anchors: validatedAnchors, // Use filtered anchors, not original
       suggested_aliases: suggested_aliases.length > 0 ? suggested_aliases : undefined,
+      journal_references: journal_references.length > 0 ? journal_references : undefined,
     };
   } catch (e: any) {
     console.error("AI Router inference error:", e.message);
@@ -701,6 +750,7 @@ Deno.serve(async (req: Request) => {
       decision: result.decision,
       reasoning: result.reasoning,
       anchors: result.anchors,
+      journal_references: result.journal_references || [],
       suggested_aliases: result.suggested_aliases || [],
       prompt_version: PROMPT_VERSION,
       model_id: MODEL_ID,
@@ -743,7 +793,7 @@ Deno.serve(async (req: Request) => {
         quoteVerified,
         strongAnchor: strongAnchorPresent,
         modelError: model_error,
-        ambiguousContact: context_package.contact?.floater_flag === true,
+        ambiguousContact: (context_package.contact?.fanout_class === "floater" || context_package.contact?.fanout_class === "drifter") || (context_package.contact?.floater_flag === true),
         geoOnly: !strongAnchorPresent && result.anchors.some((a) => a.match_type === "city_or_location"),
       });
 
@@ -788,6 +838,7 @@ Deno.serve(async (req: Request) => {
       decision: result.decision,
       reasoning: result.reasoning,
       anchors: result.anchors,
+      journal_references: result.journal_references,
       suggested_aliases: result.suggested_aliases,
       gatekeeper: {
         applied,
