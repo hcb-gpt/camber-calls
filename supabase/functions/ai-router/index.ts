@@ -20,7 +20,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 
-const PROMPT_VERSION = "v1.5.0";
+const PROMPT_VERSION = "v1.6.0"; // v1.6.0: journal-aware attribution
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
 
@@ -55,6 +55,28 @@ interface AttributionResult {
   suggested_aliases?: SuggestedAlias[];
 }
 
+// v1.6.0: Journal-derived project state (from context-assembly v1.4.0)
+interface JournalClaim {
+  claim_type: string;
+  claim_text: string;
+  epistemic_status: string;
+  created_at: string;
+}
+
+interface JournalOpenLoop {
+  loop_type: string;
+  description: string;
+  status: string;
+}
+
+interface ProjectJournalState {
+  project_id: string;
+  active_claims_count: number;
+  recent_claims: JournalClaim[];
+  open_loops: JournalOpenLoop[];
+  last_journal_activity: string | null;
+}
+
 interface ContextPackage {
   meta: {
     span_id: string;
@@ -86,6 +108,7 @@ interface ContextPackage {
       alias_matches: Array<{ term: string; match_type: string; snippet?: string }>;
     };
   }>;
+  project_journal?: ProjectJournalState[];  // v1.6.0: journal-derived state per candidate
 }
 
 // ============================================================
@@ -333,6 +356,18 @@ RULES:
 5. If uncertain, choose "review" with confidence 0.50-0.74
 6. If no clear project match exists in the transcript, choose "none" with confidence <0.50
 
+PROJECT JOURNAL CONTEXT (when available):
+Some candidate projects may include journal state — recent claims, decisions,
+commitments, and open loops extracted from prior calls. Use this context to inform
+your reasoning:
+- If the transcript discusses a topic matching an open loop or recent commitment
+  for a project, that's corroborating evidence for attribution to that project
+- If someone references a deadline or decision that appears in a project's journal,
+  that strengthens the match
+- Journal context is SUPPLEMENTARY — it does not replace transcript-grounded anchors
+- A project with rich journal activity matching the conversation topic is more
+  likely the correct attribution than one with no prior context
+
 CONFIDENCE THRESHOLDS:
 - 0.75-1.00: Strong transcript-grounded evidence, safe to auto-assign
 - 0.50-0.74: Moderate evidence, needs human review
@@ -376,10 +411,33 @@ OUTPUT FORMAT (JSON only, no markdown):
 IMPORTANT: The "quote" field in anchors must contain text that ACTUALLY APPEARS in the transcript segment provided.`;
 
 function buildUserPrompt(ctx: ContextPackage): string {
+  // Build journal state index for quick lookup
+  const journalByProject = new Map<string, ProjectJournalState>();
+  if (ctx.project_journal && Array.isArray(ctx.project_journal)) {
+    for (const pj of ctx.project_journal) {
+      journalByProject.set(pj.project_id, pj);
+    }
+  }
+
   const candidateList = ctx.candidates.map((c, i) => {
     const aliasMatchSummary = c.evidence.alias_matches.length > 0
       ? `Matches in transcript: ${c.evidence.alias_matches.map((m) => `"${m.term}" (${m.match_type})`).join(", ")}`
       : "No direct transcript matches";
+
+    // v1.6.0: Include journal state per candidate if available
+    const journalState = journalByProject.get(c.project_id);
+    let journalSummary = "   - Journal: No prior context";
+    if (journalState && (journalState.recent_claims.length > 0 || journalState.open_loops.length > 0)) {
+      const claimsSummary = journalState.recent_claims.slice(0, 3).map(
+        (cl) => `[${cl.claim_type}] ${cl.claim_text}`
+      ).join("; ");
+      const loopsSummary = journalState.open_loops.map(
+        (l) => `[${l.loop_type}] ${l.description}`
+      ).join("; ");
+      journalSummary = `   - Journal (${journalState.active_claims_count} active claims):`;
+      if (claimsSummary) journalSummary += `\n     Recent: ${claimsSummary}`;
+      if (loopsSummary) journalSummary += `\n     Open loops: ${loopsSummary}`;
+    }
 
     return `${i + 1}. ${c.project_name}
    - ID: ${c.project_id}
@@ -390,7 +448,8 @@ function buildUserPrompt(ctx: ContextPackage): string {
    - Evidence: assigned=${c.evidence.assigned}, affinity=${c.evidence.affinity_weight.toFixed(2)}, sources=[${
       c.evidence.sources.join(",")
     }]
-   - ${aliasMatchSummary}`;
+   - ${aliasMatchSummary}
+${journalSummary}`;
   }).join("\n\n");
 
   const recentProjectList = ctx.contact.recent_projects.length > 0
@@ -411,6 +470,7 @@ CANDIDATE PROJECTS (${ctx.candidates.length} total):
 ${candidateList || "No candidates found"}
 
 Analyze the transcript and determine which project (if any) this conversation is about.
+Consider the journal context for each project — if the conversation topic matches known commitments, decisions, or open loops for a project, that strengthens the attribution.
 Remember: You MUST include an exact quote from the transcript to use decision="assign".`;
 }
 

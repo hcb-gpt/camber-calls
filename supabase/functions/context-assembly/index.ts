@@ -1171,6 +1171,7 @@ Deno.serve(async (req: Request) => {
           }
 
           // Build per-project state
+          let journalSourceAdded = false;
           for (const pid of candidateProjectIds) {
             const claims = claimsByProject.get(pid) || [];
             const loops = loopsByProject.get(pid) || [];
@@ -1183,7 +1184,10 @@ Deno.serve(async (req: Request) => {
                 open_loops: loops,
                 last_journal_activity: claims.length > 0 ? claims[0].created_at : null,
               });
-              sources_used.push("journal_claims");
+              if (!journalSourceAdded) {
+                sources_used.push("journal_claims");
+                journalSourceAdded = true;
+              }
             }
           }
         }
