@@ -1,8 +1,8 @@
 /**
- * context-assembly Edge Function v1.4.0
+ * context-assembly Edge Function v1.4.1
  * Assembles LLM-ready context_package from span_id (SPAN-FIRST)
  *
- * @version 1.4.0
+ * @version 1.4.1
  * @date 2026-02-09
  * @purpose Provide rich context for AI Router project attribution
  * @port 6-source candidate collection from process-call v3.9.6
@@ -39,7 +39,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const ASSEMBLY_VERSION = "v1.4.0"; // v1.4.0: journal-derived project state + phonetic-adjacent-only
+const ASSEMBLY_VERSION = "v1.4.1"; // v1.4.1: X-Edge-Secret auth for internal calls + journal-derived project state
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_TRANSCRIPT_CHARS = 8000;
@@ -392,15 +392,16 @@ Deno.serve(async (req: Request) => {
   }
 
   // ========================================
-  // AUTH GATE: Require valid JWT (PR-9 hotfix)
+  // AUTH GATE: X-Edge-Secret (internal) OR JWT (external)
+  // v1.4.1: Added X-Edge-Secret path for function-to-function calls
+  //         (segment-call sends X-Edge-Secret, not JWT)
   // ========================================
+  const edgeSecretHeader = req.headers.get("X-Edge-Secret");
+  const expectedSecret = Deno.env.get("EDGE_SHARED_SECRET");
   const authHeader = req.headers.get("Authorization");
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return new Response(JSON.stringify({ error: "missing_auth", hint: "Authorization: Bearer <token> required" }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+
+  // Path 1: Internal function-to-function via X-Edge-Secret
+  const hasValidEdgeSecret = !!(expectedSecret && edgeSecretHeader && edgeSecretHeader === expectedSecret);
 
   let body: any;
   try {
@@ -417,50 +418,60 @@ Deno.serve(async (req: Request) => {
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
   );
 
-  // Verify JWT is valid (will fail if token invalid/expired)
-  const anonClient = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_ANON_KEY")!,
-    { global: { headers: { Authorization: authHeader } } },
-  );
-  const { data: { user }, error: authErr } = await anonClient.auth.getUser();
-  if (authErr || !user) {
-    return new Response(JSON.stringify({ error: "invalid_token", detail: authErr?.message }), {
-      status: 401,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+  // Path 2: External JWT auth (only if no valid edge secret)
+  if (!hasValidEdgeSecret) {
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return new Response(JSON.stringify({ error: "missing_auth", hint: "X-Edge-Secret or Authorization: Bearer <token> required" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
 
-  // ========================================
-  // AUTHORIZATION GATE (PR-10 hardening)
-  // Two-layer check: ADMIN_USER_IDS (hard-coded) OR ALLOWED_EMAILS (env)
-  // At least one gate must be configured; user must pass at least one
-  // ========================================
-  const allowedEmails = (Deno.env.get("ALLOWED_EMAILS") || "").split(",").map(
-    (e) => e.trim().toLowerCase(),
-  ).filter(Boolean);
-
-  const userEmail = (user.email || "").toLowerCase();
-  const userId = user.id;
-
-  // Check if user passes either gate
-  const isAdmin = ADMIN_USER_IDS.length > 0 && ADMIN_USER_IDS.includes(userId);
-  const isAllowedEmail = allowedEmails.length > 0 && allowedEmails.includes(userEmail);
-
-  // At least one gate must be configured
-  if (ADMIN_USER_IDS.length === 0 && allowedEmails.length === 0) {
-    return new Response(
-      JSON.stringify({ error: "config_error", hint: "Neither ADMIN_USER_IDS nor ALLOWED_EMAILS configured" }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
+    // Verify JWT is valid (will fail if token invalid/expired)
+    const anonClient = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_ANON_KEY")!,
+      { global: { headers: { Authorization: authHeader } } },
     );
-  }
+    const { data: { user }, error: authErr } = await anonClient.auth.getUser();
+    if (authErr || !user) {
+      return new Response(JSON.stringify({ error: "invalid_token", detail: authErr?.message }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
 
-  // User must pass at least one gate
-  if (!isAdmin && !isAllowedEmail) {
-    return new Response(JSON.stringify({ error: "forbidden", hint: "User not authorized" }), {
-      status: 403,
-      headers: { "Content-Type": "application/json" },
-    });
+    // ========================================
+    // AUTHORIZATION GATE (PR-10 hardening)
+    // Two-layer check: ADMIN_USER_IDS (hard-coded) OR ALLOWED_EMAILS (env)
+    // At least one gate must be configured; user must pass at least one
+    // ========================================
+    const allowedEmails = (Deno.env.get("ALLOWED_EMAILS") || "").split(",").map(
+      (e) => e.trim().toLowerCase(),
+    ).filter(Boolean);
+
+    const userEmail = (user.email || "").toLowerCase();
+    const userId = user.id;
+
+    // Check if user passes either gate
+    const isAdmin = ADMIN_USER_IDS.length > 0 && ADMIN_USER_IDS.includes(userId);
+    const isAllowedEmail = allowedEmails.length > 0 && allowedEmails.includes(userEmail);
+
+    // At least one gate must be configured
+    if (ADMIN_USER_IDS.length === 0 && allowedEmails.length === 0) {
+      return new Response(
+        JSON.stringify({ error: "config_error", hint: "Neither ADMIN_USER_IDS nor ALLOWED_EMAILS configured" }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    // User must pass at least one gate
+    if (!isAdmin && !isAllowedEmail) {
+      return new Response(JSON.stringify({ error: "forbidden", hint: "User not authorized" }), {
+        status: 403,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
   }
 
   const truncations: string[] = [];
