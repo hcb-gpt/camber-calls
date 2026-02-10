@@ -588,18 +588,11 @@ Deno.serve(async (req: Request) => {
           };
         });
 
-        const { data: insertedCountRaw, error: claimErr } = await db.rpc("insert_journal_claims_dedup", {
-          p_rows: claimRows,
-        });
-
+        const { error: claimErr } = await db.from("journal_claims").insert(claimRows);
         if (claimErr) {
           console.error("[journal-extract] journal_claims insert failed:", claimErr.message);
         } else {
-          const insertedCount =
-            typeof insertedCountRaw === "number"
-              ? insertedCountRaw
-              : Number.parseInt(String(insertedCountRaw ?? "0"), 10);
-          claims_written = Number.isFinite(insertedCount) ? insertedCount : 0;
+          claims_written = claimRows.length;
         }
 
         const openLoopClaims = extraction.claims.filter(c => c.is_open_loop);
