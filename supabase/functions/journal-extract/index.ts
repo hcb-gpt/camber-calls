@@ -1,10 +1,14 @@
 /**
- * journal-extract Edge Function v1.1.1
+ * journal-extract Edge Function v1.1.2
  * Extracts structured epistemic claims from attributed conversation spans
  *
- * @version 1.1.1
+ * @version 1.1.2
  * @date 2026-02-10
  * @purpose D1 deliverable - journal claim extraction from spans
+ *
+ * v1.1.2 changes (DEV-10):
+ *   - Use insert_journal_claims_dedup RPC for ON CONFLICT DO NOTHING dedup
+ *     (belt-and-suspenders with application-level idempotency guard)
  *
  * v1.1.1 changes (DEV-10):
  *   - Fix: skip DB insert when project_id is null (FK constraint on projects(id))
@@ -23,7 +27,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const FUNCTION_VERSION = "v1.1.1";
+const FUNCTION_VERSION = "v1.1.2";
 const PROMPT_VERSION = "journal-extract-v1";
 const MAX_TOKENS = 4096;
 const DEFAULT_MODEL = "claude-3-haiku-20240307";
@@ -588,11 +592,20 @@ Deno.serve(async (req: Request) => {
           };
         });
 
-        const { error: claimErr } = await db.from("journal_claims").insert(claimRows);
+        // Use insert_journal_claims_dedup RPC for ON CONFLICT DO NOTHING
+        // (belt-and-suspenders with application-level idempotency guard above)
+        const { data: insertedCountRaw, error: claimErr } = await db.rpc("insert_journal_claims_dedup", {
+          p_rows: claimRows,
+        });
+
         if (claimErr) {
           console.error("[journal-extract] journal_claims insert failed:", claimErr.message);
         } else {
-          claims_written = claimRows.length;
+          const insertedCount =
+            typeof insertedCountRaw === "number"
+              ? insertedCountRaw
+              : Number.parseInt(String(insertedCountRaw ?? "0"), 10);
+          claims_written = Number.isFinite(insertedCount) ? insertedCount : 0;
         }
 
         const openLoopClaims = extraction.claims.filter(c => c.is_open_loop);
