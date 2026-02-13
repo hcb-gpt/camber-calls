@@ -1,9 +1,9 @@
 /**
- * ai-router Edge Function v1.7.0
+ * ai-router Edge Function v1.8.0
  * LLM-based project attribution for conversation spans
  *
- * @version 1.7.0
- * @date 2026-02-09
+ * @version 1.8.0
+ * @date 2026-02-10
  * @purpose Use Claude Haiku to attribute spans to projects with anchored evidence
  *
  * CORE PRINCIPLE: span_attributions is the single source of truth.
@@ -14,6 +14,10 @@
  * - Prompt explains fanout signal strength (anchored=strong, floater=anti-signal)
  * - Output includes journal_references: which journal claims influenced the decision
  * - Replaces boolean floater_flag with richer fanout context
+ *
+ * v1.8.0 Changes (Gmail weak corroboration):
+ * - Prompt includes bounded email_context summaries when present
+ * - Explicitly treats email context as weak corroboration only
  *
  * Input:
  *   - context_package: ContextPackage (from context-assembly)
@@ -26,7 +30,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 
-const PROMPT_VERSION = "v1.7.0"; // v1.7.0: fanout-aware + journal_references output
+const PROMPT_VERSION = "v1.8.0"; // v1.8.0: adds bounded gmail weak corroboration
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
 
@@ -92,6 +96,27 @@ interface ProjectJournalState {
   last_journal_activity: string | null;
 }
 
+interface EmailContextItem {
+  message_id: string;
+  thread_id: string | null;
+  date: string | null;
+  from: string | null;
+  to: string | null;
+  subject: string | null;
+  subject_keywords: string[];
+  project_mentions: string[];
+  mentioned_project_ids: string[];
+  amounts_mentioned: string[];
+  evidence_locator: string;
+}
+
+interface EmailLookupMeta {
+  returned_count?: number;
+  cached?: boolean;
+  warnings?: string[];
+  date_range?: string | null;
+}
+
 interface ContextPackage {
   meta: {
     span_id: string;
@@ -126,6 +151,8 @@ interface ContextPackage {
     };
   }>;
   project_journal?: ProjectJournalState[]; // v1.6.0: journal-derived state per candidate
+  email_context?: EmailContextItem[];
+  email_lookup_meta?: EmailLookupMeta | null;
 }
 
 // ============================================================
@@ -390,6 +417,12 @@ your reasoning:
 - A project with rich journal activity matching the conversation topic is more
   likely the correct attribution than one with no prior context
 
+EMAIL CONTEXT (when available):
+- Email context is WEAK corroboration only (subject keywords, mentions, amounts).
+- Never auto-assign based only on email context.
+- Use email context to break ties only when transcript-grounded anchors already exist.
+- If email context conflicts with transcript anchors, trust the transcript.
+
 CONFIDENCE THRESHOLDS:
 - 0.75-1.00: Strong transcript-grounded evidence, safe to auto-assign
 - 0.50-0.74: Moderate evidence, needs human review
@@ -499,6 +532,27 @@ ${journalSummary}`;
     ? "ANTI-signal — contact works on 5+ projects, treat like staff"
     : "No signal — no project association";
 
+  const emailItems = Array.isArray(ctx.email_context) ? ctx.email_context.slice(0, 5) : [];
+  const emailLookupMeta = ctx.email_lookup_meta || null;
+  const emailLookupSummary = emailLookupMeta
+    ? `returned=${Number(emailLookupMeta.returned_count || emailItems.length)}, cached=${
+      emailLookupMeta.cached === true ? "yes" : "no"
+    }, range=${emailLookupMeta.date_range || "unknown"}`
+    : "not_run";
+  const emailWarnings = emailLookupMeta?.warnings?.length ? emailLookupMeta.warnings.slice(0, 4).join(", ") : "none";
+  const emailContextSummary = emailItems.length > 0
+    ? emailItems.map((item, idx) => {
+      const mentions = item.project_mentions?.length ? item.project_mentions.slice(0, 3).join(", ") : "none";
+      const amounts = item.amounts_mentioned?.length ? item.amounts_mentioned.slice(0, 3).join(", ") : "none";
+      const keywords = item.subject_keywords?.length ? item.subject_keywords.slice(0, 5).join(", ") : "none";
+      const subject = (item.subject || "no subject").replace(/\s+/g, " ").slice(0, 120);
+      const when = item.date || "unknown_date";
+      return `${
+        idx + 1
+      }. ${when} | subject="${subject}" | mentions=[${mentions}] | amounts=[${amounts}] | keywords=[${keywords}]`;
+    }).join("\n")
+    : "No recent vendor email context";
+
   return `TRANSCRIPT SEGMENT:
 """
 ${ctx.span.transcript_text}
@@ -510,12 +564,18 @@ CALLER INFO:
 - Signal strength: ${fanoutSignal}
 - Recent Projects: ${recentProjectList}
 
+EMAIL CONTEXT (WEAK CORROBORATION):
+- Lookup: ${emailLookupSummary}
+- Warnings: ${emailWarnings}
+${emailContextSummary}
+
 CANDIDATE PROJECTS (${ctx.candidates.length} total):
 ${candidateList || "No candidates found"}
 
 Analyze the transcript and determine which project (if any) this conversation is about.
 Consider the contact's fanout class — an anchored contact (fanout=1) on a single project is strong evidence; a floater (fanout>=5) provides no identity signal.
 Consider the journal context for each project — if the conversation topic matches known commitments, decisions, or open loops for a project, that strengthens the attribution.
+Treat email context as weak corroboration only; never use email context alone for decision="assign".
 If journal claims influenced your decision, include them in journal_references.
 Remember: You MUST include an exact quote from the transcript to use decision="assign".`;
 }
@@ -597,7 +657,7 @@ Deno.serve(async (req: Request) => {
     raw_response = response;
 
     // Parse response
-    const textBlock = response.content.find((b) => b.type === "text");
+    const textBlock = response.content.find((b: any) => b.type === "text");
     const responseText = textBlock?.type === "text" ? textBlock.text : "";
 
     // Extract JSON from response (handle potential markdown wrapping)

@@ -20,3 +20,6 @@ verify_jwt = false
 
 [functions.ai-router]
 verify_jwt = false
+
+[functions.gmail-context-lookup]
+verify_jwt = false

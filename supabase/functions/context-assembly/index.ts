@@ -1,19 +1,32 @@
 /**
- * context-assembly Edge Function v1.5.0
+ * context-assembly Edge Function v1.8.0
  * Assembles LLM-ready context_package from span_id (SPAN-FIRST)
  *
- * @version 1.5.0
- * @date 2026-02-09
+ * @version 1.8.0
+ * @date 2026-02-13
  * @purpose Provide rich context for AI Router project attribution
  * @port 6-source candidate collection from process-call v3.9.6
  *
  * CORE PRINCIPLE: span_id is the unit of truth. Calls are containers only.
+ *
+ * v1.8.0 Changes (Journal Context Poisoning Fix):
+ * - NEW: journal claims/loops are contact-scoped (same contact_id OR same phone)
+ * - NEW: null-contact calls skip journal context entirely to avoid unanchored leakage
  *
  * v1.5.0 Changes (Contact Fanout Integration — DATA-9 D4 spec):
  * - REPLACED: contacts.floats_between_projects boolean → contact_fanout table lookup
  * - NEW: context_package.contact.fanout_class (anchored|semi_anchored|drifter|floater|unknown)
  * - NEW: context_package.contact.effective_fanout (integer project count)
  * - PRESERVED: floater_flag for backwards compat (derived from fanout_class)
+ *
+ * v1.7.0 Changes (Continuity Bundle):
+ * - NEW: continuity_links array linking back-to-back calls within 48h
+ * - Tiered evidence (project mention, callback phrase, recency) with floater rule
+ *
+ * v1.6.0 Changes (Gmail Context Lookup):
+ * - NEW: calls gmail-context-lookup edge function (bounded, fail-open)
+ * - NEW: context_package.email_context (bounded metadata, no free-text snippets)
+ * - NEW: context_package.email_lookup_meta (receipt-friendly lookup metadata)
  *
  * v1.4.0 Changes (Journal/World Model integration):
  * - NEW: journal-derived project state injected into context package
@@ -36,7 +49,8 @@
  *   - interaction_id + span_index: (debug convenience) - resolves to span_id first
  *
  * Output:
- *   - context_package JSON with meta, span, contact, candidates, place_mentions, project_journal
+ *   - context_package JSON with meta, span, contact, candidates, place_mentions, project_journal,
+ *     email_context, email_lookup_meta
  *
  * AUTH:
  * - Accepts service role JWT (verify_jwt=false in config)
@@ -45,15 +59,31 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const ASSEMBLY_VERSION = "v1.5.0"; // v1.5.0: contact_fanout integration (replaces floats_between_projects boolean)
+const ASSEMBLY_VERSION = "v1.8.0"; // v1.8.0: journal contact-scoping + null-contact guard
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_TRANSCRIPT_CHARS = 8000;
 const MAX_ALIAS_TERMS_PER_PROJECT = 25;
+const GMAIL_LOOKUP_DEFAULT_LOOKBACK_DAYS = 30;
+const GMAIL_LOOKUP_DEFAULT_MAX_RESULTS = 5;
+const GMAIL_LOOKUP_TIMEOUT_MS = 8000;
 
 // Geo candidate constants
 const GEO_MAX_DISTANCE_KM = 50; // Only consider projects within 50km
 const GEO_MAX_CANDIDATES = 5; // Cap geo candidates to prevent flooding
+
+// Continuity bundle constants
+const CONTINUITY_LOOKBACK_HOURS = 48;
+const CONTINUITY_MAX_PRIOR_CALLS = 5;
+const CONTINUITY_FLOATER_GAP_HOURS = 4;
+const CALLBACK_PHRASES = [
+  "calling you back",
+  "returning your call",
+  "missed your call",
+  "following up",
+  "as we discussed",
+  "like we talked about",
+];
 
 // PR-11: Project status filter - only include active client projects
 const VALID_PROJECT_STATUSES = ["active", "warranty", "estimating"];
@@ -175,6 +205,36 @@ interface ProjectJournalState {
   last_journal_activity: string | null; // Timestamp of most recent claim
 }
 
+interface EmailContextItem {
+  message_id: string;
+  thread_id: string | null;
+  date: string | null;
+  from: string | null;
+  to: string | null;
+  subject: string | null;
+  subject_keywords: string[];
+  project_mentions: string[];
+  mentioned_project_ids: string[];
+  amounts_mentioned: string[];
+  evidence_locator: string;
+}
+
+interface EmailLookupMeta {
+  step: string;
+  source: string | null;
+  contact_id: string | null;
+  query: string | null;
+  date_range: string | null;
+  results_count: number;
+  returned_count: number;
+  cached: boolean;
+  lookup_ms: number | null;
+  gmail_api_calls: number;
+  auth_mode: string | null;
+  warnings: string[];
+  truncation: string[];
+}
+
 interface ContextPackage {
   meta: {
     assembly_version: string;
@@ -204,6 +264,23 @@ interface ContextPackage {
   candidates: Candidate[];
   place_mentions: PlaceMention[];
   project_journal: ProjectJournalState[]; // v1.4.0: journal-derived state per candidate project
+  email_context: EmailContextItem[];
+  email_lookup_meta: EmailLookupMeta | null;
+  continuity_links: ContinuityLink[];
+}
+
+interface ContinuityLink {
+  prior_interaction_id: string;
+  prior_project_id: string | null;
+  prior_project_name: string | null;
+  prior_event_at_utc: string | null;
+  gap_minutes: number;
+  tier: "TIER_1" | "TIER_2" | "TIER_3";
+  evidence: {
+    reason: string;
+    spans: string[];
+    callback_phrase_hits: string[];
+  };
 }
 
 // ============================================================
@@ -288,6 +365,29 @@ function snippetAround(text: string, idx: number, termLen: number, radius = 40):
   return snippet.slice(0, 100);
 }
 
+function normalizePhone(phone: string | null | undefined): string | null {
+  const digits = (phone || "").replace(/\D/g, "");
+  if (!digits) return null;
+  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
+  if (digits.length > 10) return digits.slice(-10);
+  return digits;
+}
+
+function matchesJournalSourceContact(
+  currentContactId: string | null,
+  currentPhone: string | null,
+  sourceContactId: string | null | undefined,
+  sourcePhone: string | null | undefined,
+): boolean {
+  if (currentContactId && sourceContactId && currentContactId === sourceContactId) {
+    return true;
+  }
+  const cur = normalizePhone(currentPhone);
+  const src = normalizePhone(sourcePhone);
+  if (!cur || !src) return false;
+  return cur === src || cur.slice(-4) === src.slice(-4);
+}
+
 /** Smart truncation: window around evidence to preserve anchors */
 function smartTruncate(
   transcript: string,
@@ -334,6 +434,24 @@ function haversineDistanceKm(
 
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
+}
+
+/** Find callback phrases and return snippets (<=80 chars) around them */
+function findCallbackPhraseSpans(
+  transcript: string,
+  transcriptLower: string,
+): string[] {
+  const spans: string[] = [];
+  for (const phrase of CALLBACK_PHRASES) {
+    const phraseLower = phrase.toLowerCase();
+    const idx = transcriptLower.indexOf(phraseLower);
+    if (idx >= 0) {
+      const snippet = snippetAround(transcript, idx, phrase.length, 60).slice(0, 80);
+      spans.push(snippet);
+      if (spans.length >= 5) break;
+    }
+  }
+  return spans;
 }
 
 /**
@@ -575,13 +693,14 @@ Deno.serve(async (req: Request) => {
     let contact_id: string | null = null;
     let contact_name: string | null = null;
     let contact_phone: string | null = null;
+    let event_at_utc: string | null = null;
     let fanout_class = "unknown";
     let effective_fanout = 0;
     let floater_flag = false; // Backwards compat: derived from fanout_class
 
     const { data: interaction } = await db
       .from("interactions")
-      .select("contact_id, contact_name, contact_phone")
+      .select("contact_id, contact_name, contact_phone, event_at_utc, project_id")
       .eq("interaction_id", interaction_id)
       .single();
 
@@ -589,6 +708,7 @@ Deno.serve(async (req: Request) => {
       contact_id = interaction.contact_id;
       contact_name = interaction.contact_name;
       contact_phone = interaction.contact_phone;
+      event_at_utc = interaction.event_at_utc;
     }
 
     // v1.5.0: Fetch fanout data from contact_fanout table (DATA-9 D4 spec)
@@ -652,9 +772,88 @@ Deno.serve(async (req: Request) => {
     }
 
     const phone_e164_last4 = contact_phone ? contact_phone.slice(-4) : null;
+    let email_context: EmailContextItem[] = [];
+    let email_lookup_meta: EmailLookupMeta | null = null;
+    let continuity_links: ContinuityLink[] = [];
+
+    // ========================================
+    // SOURCE 8: Gmail context lookup (fail-open)
+    // - Runs only when a contact is known.
+    // - Returns bounded metadata (<=5 messages, no free-text snippets).
+    // ========================================
+    if (contact_id) {
+      const supabaseUrl = Deno.env.get("SUPABASE_URL");
+      const gmailLookupUrl = Deno.env.get("GMAIL_CONTEXT_LOOKUP_URL") ||
+        (supabaseUrl ? `${supabaseUrl}/functions/v1/gmail-context-lookup` : null);
+
+      if (gmailLookupUrl) {
+        const lookupHeaders: Record<string, string> = {
+          "Content-Type": "application/json",
+        };
+
+        if (expectedSecret) {
+          lookupHeaders["X-Edge-Secret"] = expectedSecret;
+        } else if (authHeader?.startsWith("Bearer ")) {
+          lookupHeaders["Authorization"] = authHeader;
+        }
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), GMAIL_LOOKUP_TIMEOUT_MS);
+        try {
+          const gmailResp = await fetch(gmailLookupUrl, {
+            method: "POST",
+            headers: lookupHeaders,
+            body: JSON.stringify({
+              contact_id,
+              interaction_id,
+              span_id,
+              lookback_days: GMAIL_LOOKUP_DEFAULT_LOOKBACK_DAYS,
+              max_results: GMAIL_LOOKUP_DEFAULT_MAX_RESULTS,
+              source: "context-assembly",
+            }),
+            signal: controller.signal,
+          });
+
+          if (!gmailResp.ok) {
+            warnings.push(`gmail_lookup_http_${gmailResp.status}`);
+          } else {
+            const gmailPayload = await gmailResp.json().catch(() => null);
+            if (gmailPayload?.ok) {
+              email_context = Array.isArray(gmailPayload.email_context)
+                ? gmailPayload.email_context as EmailContextItem[]
+                : [];
+              email_lookup_meta = gmailPayload.email_lookup_meta &&
+                  typeof gmailPayload.email_lookup_meta === "object"
+                ? gmailPayload.email_lookup_meta as EmailLookupMeta
+                : null;
+              sources_used.push("gmail_context_lookup");
+              if (email_lookup_meta?.warnings?.length) {
+                warnings.push(...email_lookup_meta.warnings.map((w) => `gmail:${w}`));
+              }
+              if (email_lookup_meta?.truncation?.length) {
+                truncations.push(...email_lookup_meta.truncation.map((t) => `gmail:${t}`));
+              }
+            } else {
+              warnings.push("gmail_lookup_invalid_payload");
+            }
+          }
+        } catch (error: any) {
+          if (error?.name === "AbortError") {
+            warnings.push("gmail_lookup_timeout");
+          } else {
+            warnings.push(`gmail_lookup_exception:${String(error?.message || error).slice(0, 100)}`);
+          }
+        } finally {
+          clearTimeout(timeoutId);
+        }
+      } else {
+        warnings.push("gmail_lookup_url_missing");
+      }
+    }
 
     // ========================================
     // 7-SOURCE CANDIDATE COLLECTION
+    // (plus Source 8 Gmail context lookup above)
     // ========================================
     const candidatesById = new Map<string, {
       project_id: string;
@@ -742,12 +941,15 @@ Deno.serve(async (req: Request) => {
     }
 
     const matchPositions: number[] = [];
+    let callbackSpans: string[] = [];
+    const projectMentionSpans: string[] = [];
     const place_mentions: PlaceMention[] = [];
 
     // SOURCE 4-7: Transcript-based sources
     if (transcript_text) {
       const transcriptClean = stripSpeakerLabels(transcript_text);
       const transcriptLower = transcriptClean.toLowerCase();
+      callbackSpans = findCallbackPhraseSpans(transcriptClean, transcriptLower);
 
       // Fetch all projects + aliases for matching
       const { data: projects } = await db.from("projects").select("id, name, aliases, city, address");
@@ -796,7 +998,13 @@ Deno.serve(async (req: Request) => {
                 ? "alias"
                 : (p.name.toLowerCase() === termLower ? "exact_project_name" : "city_or_location");
 
-              const cur = candidatesById.get(p.id) || {
+              const cur: {
+                project_id: string;
+                assigned: boolean;
+                affinity_weight: number;
+                sources: string[];
+                alias_matches: AliasMatch[];
+              } = candidatesById.get(p.id) || {
                 project_id: p.id,
                 assigned: false,
                 affinity_weight: 0,
@@ -804,10 +1012,14 @@ Deno.serve(async (req: Request) => {
                 alias_matches: [],
               };
               if (!cur.sources.includes("transcript_scan")) cur.sources.push("transcript_scan");
+              const snippet = snippetAround(transcriptClean, idx, term.length);
+              if (projectMentionSpans.length < 5) {
+                projectMentionSpans.push(snippet.slice(0, 80));
+              }
               cur.alias_matches.push({
                 term,
                 match_type: matchType,
-                snippet: snippetAround(transcriptClean, idx, term.length),
+                snippet,
               });
               candidatesById.set(p.id, cur);
             }
@@ -1016,6 +1228,101 @@ Deno.serve(async (req: Request) => {
     }
 
     // ========================================
+    // CONTINUITY BUNDLE (Back-to-back calls within 48h)
+    // Tiered linking: TIER_1 project mention, TIER_2 callback phrase, TIER_3 recency
+    // Floater rule: if floater or gap > 4h, require TIER_1
+    // ========================================
+    if (contact_id && event_at_utc && transcript_text) {
+      try {
+        const eventMs = Date.parse(event_at_utc);
+        if (!Number.isNaN(eventMs)) {
+          const sinceIso = new Date(eventMs - CONTINUITY_LOOKBACK_HOURS * 60 * 60 * 1000).toISOString();
+          const { data: priorRows } = await db
+            .from("interactions")
+            .select("interaction_id, project_id, event_at_utc")
+            .eq("contact_id", contact_id)
+            .lt("event_at_utc", event_at_utc)
+            .gte("event_at_utc", sinceIso)
+            .order("event_at_utc", { ascending: false })
+            .limit(CONTINUITY_MAX_PRIOR_CALLS * 2);
+
+          const projectIds = Array.from(
+            new Set((priorRows || []).map((r) => r.project_id).filter(Boolean) as string[]),
+          );
+          const priorProjectNames = new Map<string, string>();
+          if (projectIds.length) {
+            const { data: pnameRows } = await db.from("projects").select("id, name").in("id", projectIds);
+            for (const r of (pnameRows || [])) {
+              if (r.id) priorProjectNames.set(r.id, r.name || r.id);
+            }
+          }
+
+          const tierRank: Record<string, number> = { TIER_1: 0, TIER_2: 1, TIER_3: 2 };
+          for (const row of (priorRows || [])) {
+            if (!row.interaction_id || !row.event_at_utc) continue;
+            const priorMs = Date.parse(row.event_at_utc);
+            if (Number.isNaN(priorMs)) continue;
+            const gapMinutes = Math.max(0, Math.round((eventMs - priorMs) / 60000));
+            if (gapMinutes > CONTINUITY_LOOKBACK_HOURS * 60) continue;
+
+            const isFloaterSensitive = floater_flag || gapMinutes > CONTINUITY_FLOATER_GAP_HOURS * 60;
+            const hasProjectMention = projectMentionSpans.length > 0;
+            const hasCallback = callbackSpans.length > 0;
+
+            let tier: "TIER_1" | "TIER_2" | "TIER_3" = "TIER_3";
+            let reason = "recency_only";
+            if (hasCallback) {
+              tier = "TIER_2";
+              reason = "callback_phrase";
+            }
+            if (hasProjectMention) {
+              tier = "TIER_1";
+              reason = "project_mention";
+            }
+
+            // Floater rule: require Tier1
+            if (isFloaterSensitive && tier !== "TIER_1") continue;
+
+            const spans: string[] = [];
+            if (tier === "TIER_1") spans.push(...projectMentionSpans.slice(0, 5));
+            if (tier === "TIER_1" || tier === "TIER_2") spans.push(...callbackSpans.slice(0, 5));
+            const trimmedSpans = spans.slice(0, 5).map((s) => s.slice(0, 80));
+
+            continuity_links.push({
+              prior_interaction_id: row.interaction_id,
+              prior_project_id: row.project_id || null,
+              prior_project_name: row.project_id ? priorProjectNames.get(row.project_id) || row.project_id : null,
+              prior_event_at_utc: row.event_at_utc || null,
+              gap_minutes: gapMinutes,
+              tier,
+              evidence: {
+                reason,
+                spans: trimmedSpans,
+                callback_phrase_hits: callbackSpans,
+              },
+            });
+          }
+
+          continuity_links = continuity_links
+            .sort((a, b) => {
+              const tierDiff = tierRank[a.tier] - tierRank[b.tier];
+              if (tierDiff !== 0) return tierDiff;
+              return a.gap_minutes - b.gap_minutes;
+            })
+            .slice(0, CONTINUITY_MAX_PRIOR_CALLS);
+
+          if (continuity_links.length > 0) {
+            sources_used.push("continuity_bundle");
+          }
+        } else {
+          warnings.push("continuity_no_event_time");
+        }
+      } catch (_contErr) {
+        warnings.push("continuity_bundle_failed");
+      }
+    }
+
+    // ========================================
     // ENRICH CANDIDATES WITH PROJECT DETAILS
     // ========================================
     const candidateIds = Array.from(candidatesById.keys());
@@ -1163,73 +1470,117 @@ Deno.serve(async (req: Request) => {
 
     if (candidateProjectIds.length > 0) {
       try {
-        // Fetch recent active claims for candidate projects (max 5 per project)
-        const { data: claimsData, error: claimsErr } = await db
-          .from("journal_claims")
-          .select("project_id, claim_type, claim_text, epistemic_status, created_at")
-          .in("project_id", candidateProjectIds)
-          .eq("active", true)
-          .order("created_at", { ascending: false })
-          .limit(candidateProjectIds.length * 5); // Rough limit, we'll group below
+        // Null-contact calls are unanchored; skip journal context to prevent cross-contact leakage.
+        if (!contact_id) {
+          warnings.push("journal_source_unanchored_skipped");
+        } else {
+          // Pull a larger pool, then apply contact scoping before per-project caps.
+          const { data: claimsData, error: claimsErr } = await db
+            .from("journal_claims")
+            .select("project_id, call_id, claim_type, claim_text, epistemic_status, created_at")
+            .in("project_id", candidateProjectIds)
+            .eq("active", true)
+            .order("created_at", { ascending: false })
+            .limit(candidateProjectIds.length * 25);
 
-        // Fetch open loops for candidate projects
-        const { data: loopsData, error: loopsErr } = await db
-          .from("journal_open_loops")
-          .select("project_id, loop_type, description, status")
-          .in("project_id", candidateProjectIds)
-          .eq("status", "open")
-          .limit(candidateProjectIds.length * 3);
+          const { data: loopsData, error: loopsErr } = await db
+            .from("journal_open_loops")
+            .select("project_id, call_id, loop_type, description, status, created_at")
+            .in("project_id", candidateProjectIds)
+            .eq("status", "open")
+            .order("created_at", { ascending: false })
+            .limit(candidateProjectIds.length * 12);
 
-        if (!claimsErr && !loopsErr) {
-          // Group claims by project
-          const claimsByProject = new Map<string, JournalClaim[]>();
-          for (const c of (claimsData || [])) {
-            if (!c.project_id) continue;
-            if (!claimsByProject.has(c.project_id)) claimsByProject.set(c.project_id, []);
-            const arr = claimsByProject.get(c.project_id)!;
-            if (arr.length < 5) { // Cap at 5 per project
-              arr.push({
-                claim_type: c.claim_type,
-                claim_text: (c.claim_text || "").slice(0, 200),
-                epistemic_status: c.epistemic_status,
-                created_at: c.created_at,
-              });
-            }
-          }
+          if (!claimsErr && !loopsErr) {
+            const callIds = Array.from(new Set([
+              ...(claimsData || []).map((c) => c.call_id).filter(Boolean),
+              ...(loopsData || []).map((l) => l.call_id).filter(Boolean),
+            ] as string[]));
 
-          // Group open loops by project
-          const loopsByProject = new Map<string, JournalOpenLoop[]>();
-          for (const l of (loopsData || [])) {
-            if (!l.project_id) continue;
-            if (!loopsByProject.has(l.project_id)) loopsByProject.set(l.project_id, []);
-            const arr = loopsByProject.get(l.project_id)!;
-            if (arr.length < 3) { // Cap at 3 per project
-              arr.push({
-                loop_type: l.loop_type,
-                description: (l.description || "").slice(0, 200),
-                status: l.status,
-              });
-            }
-          }
+            const sourceCalls = new Map<string, { contact_id: string | null; contact_phone: string | null }>();
+            if (callIds.length > 0) {
+              const { data: sourceCallRows } = await db
+                .from("interactions")
+                .select("interaction_id, contact_id, contact_phone")
+                .in("interaction_id", callIds);
 
-          // Build per-project state
-          let journalSourceAdded = false;
-          for (const pid of candidateProjectIds) {
-            const claims = claimsByProject.get(pid) || [];
-            const loops = loopsByProject.get(pid) || [];
-
-            if (claims.length > 0 || loops.length > 0) {
-              project_journal.push({
-                project_id: pid,
-                active_claims_count: claims.length, // Note: this is capped at 5, actual count may be higher
-                recent_claims: claims,
-                open_loops: loops,
-                last_journal_activity: claims.length > 0 ? claims[0].created_at : null,
-              });
-              if (!journalSourceAdded) {
-                sources_used.push("journal_claims");
-                journalSourceAdded = true;
+              for (const row of (sourceCallRows || [])) {
+                sourceCalls.set(row.interaction_id, {
+                  contact_id: row.contact_id,
+                  contact_phone: row.contact_phone,
+                });
               }
+            }
+
+            let scopedClaimsAdded = 0;
+            let scopedLoopsAdded = 0;
+
+            // Group claims by project
+            const claimsByProject = new Map<string, JournalClaim[]>();
+            for (const c of (claimsData || [])) {
+              if (!c.project_id) continue;
+              const source = c.call_id ? sourceCalls.get(c.call_id) : undefined;
+              if (!source) continue;
+              if (!matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone)) {
+                continue;
+              }
+              if (!claimsByProject.has(c.project_id)) claimsByProject.set(c.project_id, []);
+              const arr = claimsByProject.get(c.project_id)!;
+              if (arr.length < 5) { // Cap at 5 per project
+                arr.push({
+                  claim_type: c.claim_type,
+                  claim_text: (c.claim_text || "").slice(0, 200),
+                  epistemic_status: c.epistemic_status,
+                  created_at: c.created_at,
+                });
+                scopedClaimsAdded += 1;
+              }
+            }
+
+            // Group open loops by project
+            const loopsByProject = new Map<string, JournalOpenLoop[]>();
+            for (const l of (loopsData || [])) {
+              if (!l.project_id) continue;
+              const source = l.call_id ? sourceCalls.get(l.call_id) : undefined;
+              if (!source) continue;
+              if (!matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone)) {
+                continue;
+              }
+              if (!loopsByProject.has(l.project_id)) loopsByProject.set(l.project_id, []);
+              const arr = loopsByProject.get(l.project_id)!;
+              if (arr.length < 3) { // Cap at 3 per project
+                arr.push({
+                  loop_type: l.loop_type,
+                  description: (l.description || "").slice(0, 200),
+                  status: l.status,
+                });
+                scopedLoopsAdded += 1;
+              }
+            }
+
+            // Build per-project state
+            let journalSourceAdded = false;
+            for (const pid of candidateProjectIds) {
+              const claims = claimsByProject.get(pid) || [];
+              const loops = loopsByProject.get(pid) || [];
+
+              if (claims.length > 0 || loops.length > 0) {
+                project_journal.push({
+                  project_id: pid,
+                  active_claims_count: claims.length, // Note: this is capped at 5, actual count may be higher
+                  recent_claims: claims,
+                  open_loops: loops,
+                  last_journal_activity: claims.length > 0 ? claims[0].created_at : null,
+                });
+                if (!journalSourceAdded) {
+                  sources_used.push("journal_claims");
+                  journalSourceAdded = true;
+                }
+              }
+            }
+
+            if (scopedClaimsAdded === 0 && scopedLoopsAdded === 0) {
+              warnings.push("journal_contact_scope_no_matches");
             }
           }
         }
@@ -1271,6 +1622,9 @@ Deno.serve(async (req: Request) => {
       candidates: finalCandidates,
       place_mentions,
       project_journal,
+      email_context,
+      email_lookup_meta,
+      continuity_links,
     };
 
     return new Response(
