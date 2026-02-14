@@ -157,13 +157,10 @@ Deno.serve(async (req: Request) => {
 
   const edgeSecret = req.headers.get("X-Edge-Secret") || req.headers.get("x-edge-secret");
   const expectedSecret = Deno.env.get("EDGE_SHARED_SECRET");
-  const authHeader = req.headers.get("Authorization");
-  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
   const secretOk = expectedSecret && edgeSecret === expectedSecret;
-  const bearerOk = serviceRoleKey && authHeader === `Bearer ${serviceRoleKey}`;
 
-  if (!secretOk && !bearerOk) {
+  if (!secretOk) {
     return new Response(
       JSON.stringify({ error: "unauthorized" }),
       { status: 401, headers: { "Content-Type": "application/json" } },
