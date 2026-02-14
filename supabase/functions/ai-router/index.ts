@@ -1,23 +1,31 @@
 /**
- * ai-router Edge Function v1.8.0
+ * ai-router Edge Function v1.8.1
  * LLM-based project attribution for conversation spans
  *
- * @version 1.8.0
- * @date 2026-02-10
+ * @version 1.8.1
+ * @date 2026-02-14
  * @purpose Use Claude Haiku to attribute spans to projects with anchored evidence
  *
  * CORE PRINCIPLE: span_attributions is the single source of truth.
  * NO writes to interactions.project_id from this path.
+ *
+ * v1.8.1 Changes (Pipeline chain wiring):
+ * - Added fire-and-forget chain call to journal-extract after span_attributions write
+ *   (belt-and-suspenders with segment-call hook — ensures journal extraction runs
+ *   even when ai-router is called outside the segment-call chain, e.g. backfill/replay)
+ * - journal-extract fires for ALL decisions (assign/review/none) since it reads
+ *   applied_project_id from span_attributions and handles null-project gracefully
+ * - Response includes journal_extract_fired flag + function_version field
+ *
+ * v1.8.0 Changes (Gmail weak corroboration):
+ * - Prompt includes bounded email_context summaries when present
+ * - Explicitly treats email context as weak corroboration only
  *
  * v1.7.0 Changes (P1: Contact Fanout + Journal References):
  * - Prompt includes fanout_class + effective_fanout per contact (DATA-9 D4 spec)
  * - Prompt explains fanout signal strength (anchored=strong, floater=anti-signal)
  * - Output includes journal_references: which journal claims influenced the decision
  * - Replaces boolean floater_flag with richer fanout context
- *
- * v1.8.0 Changes (Gmail weak corroboration):
- * - Prompt includes bounded email_context summaries when present
- * - Explicitly treats email context as weak corroboration only
  *
  * Input:
  *   - context_package: ContextPackage (from context-assembly)
@@ -30,7 +38,8 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 
-const PROMPT_VERSION = "v1.8.0"; // v1.8.0: adds bounded gmail weak corroboration
+const PROMPT_VERSION = "v1.8.0"; // Prompt unchanged from v1.8.0
+const FUNCTION_VERSION = "v1.8.1";
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
 
@@ -55,12 +64,11 @@ interface SuggestedAlias {
   rationale: string;
 }
 
-// v1.7.0: Journal references — which journal claims influenced the decision
 interface JournalReference {
   project_id: string;
   claim_type: string;
   claim_text: string;
-  relevance: string; // How the claim relates to the transcript
+  relevance: string;
 }
 
 interface AttributionResult {
@@ -71,10 +79,9 @@ interface AttributionResult {
   reasoning: string;
   anchors: Anchor[];
   suggested_aliases?: SuggestedAlias[];
-  journal_references?: JournalReference[]; // v1.7.0: which journal claims influenced decision
+  journal_references?: JournalReference[];
 }
 
-// v1.6.0: Journal-derived project state (from context-assembly v1.4.0)
 interface JournalClaim {
   claim_type: string;
   claim_text: string;
@@ -130,9 +137,9 @@ interface ContextPackage {
   contact: {
     contact_id: string | null;
     contact_name: string | null;
-    floater_flag: boolean; // Backwards compat
-    fanout_class?: string; // v1.7.0: anchored|semi_anchored|drifter|floater|unknown
-    effective_fanout?: number; // v1.7.0: project count
+    floater_flag: boolean;
+    fanout_class?: string;
+    effective_fanout?: number;
     recent_projects: Array<{ project_id: string; project_name: string }>;
   };
   candidates: Array<{
@@ -150,7 +157,7 @@ interface ContextPackage {
       alias_matches: Array<{ term: string; match_type: string; snippet?: string }>;
     };
   }>;
-  project_journal?: ProjectJournalState[]; // v1.6.0: journal-derived state per candidate
+  project_journal?: ProjectJournalState[];
   email_context?: EmailContextItem[];
   email_lookup_meta?: EmailLookupMeta | null;
 }
@@ -159,39 +166,27 @@ interface ContextPackage {
 // GUARDRAIL HELPERS
 // ============================================================
 
-// HCB staff names - these are NOT project evidence
-// Used for programmatic filtering of invalid anchors
 const HCB_STAFF_PATTERNS = [
   "zack sittler",
   "zachary sittler",
   "zach sittler",
   "chad barlow",
-  "sittler:", // Speaker label pattern
+  "sittler:",
 ];
 
-/**
- * Check if an anchor quote contains HCB staff names (invalid evidence)
- */
 function anchorContainsStaffName(quote: string): boolean {
   const quoteLower = (quote || "").toLowerCase();
-  // Check if quote is primarily about a staff name
   for (const pattern of HCB_STAFF_PATTERNS) {
     if (quoteLower.includes(pattern)) {
       return true;
     }
   }
-  // Also check if quote is just "Sittler" alone (not part of a project name like "Sittler Residence")
   if (/\bsittler\b/i.test(quote) && !/residence|project|house/i.test(quote)) {
     return true;
   }
   return false;
 }
 
-/**
- * Validates that at least one anchor quote actually appears in the transcript.
- * Also filters out anchors that use HCB staff names as evidence.
- * Normalizes both strings (lowercase, collapse whitespace) for fuzzy matching.
- */
 function validateAnchorQuotes(
   anchors: Anchor[],
   transcript: string,
@@ -200,7 +195,6 @@ function validateAnchorQuotes(
     return { valid: false, validatedAnchors: [], rejectedStaffAnchors: 0 };
   }
 
-  // Normalize: lowercase, collapse whitespace, trim
   const normalizeText = (s: string) => (s || "").toLowerCase().replace(/\s+/g, " ").trim();
   const transcriptNorm = normalizeText(transcript);
 
@@ -211,23 +205,19 @@ function validateAnchorQuotes(
     if (!anchor.quote || anchor.quote.length === 0) continue;
 
     const quoteNorm = normalizeText(anchor.quote);
-    if (quoteNorm.length < 3) continue; // Too short to be meaningful
+    if (quoteNorm.length < 3) continue;
 
-    // HARD FILTER: Reject anchors that use staff names as evidence
     if (anchorContainsStaffName(anchor.quote) || anchorContainsStaffName(anchor.text || "")) {
       rejectedStaffAnchors++;
       console.log(`[ai-router] Rejected staff-name anchor: "${anchor.quote}"`);
       continue;
     }
 
-    // Check if quote appears in transcript
     if (!transcriptNorm.includes(quoteNorm)) {
       console.log(`[ai-router] Rejected anchor: quote not in transcript: "${anchor.quote}"`);
       continue;
     }
 
-    // COHERENCE CHECK: anchor.text must appear in anchor.quote
-    // Prevents model from claiming text="Athens" with quote="i'm in bostwick"
     const textNorm = normalizeText(anchor.text || "");
     if (textNorm.length >= 3 && !quoteNorm.includes(textNorm)) {
       console.log(`[ai-router] Rejected anchor: text "${anchor.text}" not found in quote "${anchor.quote}"`);
@@ -244,8 +234,6 @@ function validateAnchorQuotes(
   };
 }
 
-// Anchor strength classification
-// STRONG anchors can support auto-assign; WEAK anchors force REVIEW
 const STRONG_ANCHOR_TYPES = [
   "exact_project_name",
   "alias",
@@ -262,26 +250,14 @@ const _WEAK_ANCHOR_TYPES = [
   "other",
 ];
 
-/**
- * Check if anchors contain at least one STRONG anchor type.
- * City/zip/county alone is insufficient for auto-assign.
- */
 function hasStrongAnchor(anchors: Anchor[]): boolean {
   return anchors.some((a) => STRONG_ANCHOR_TYPES.includes(a.match_type));
 }
 
-/**
- * Lock ordering: human > ai > null
- * Returns true if newLock can overwrite currentLock
- */
 function canOverwriteLock(currentLock: string | null, newLock: string | null): boolean {
   const lockOrder: Record<string, number> = { "human": 3, "ai": 2 };
   const currentLevel = lockOrder[currentLock || ""] || 0;
   const newLevel = lockOrder[newLock || ""] || 0;
-
-  // Can only overwrite if new level >= current level
-  // This means: ai can overwrite ai or null, but not human
-  // null cannot overwrite ai or human
   return newLevel >= currentLevel;
 }
 
@@ -289,10 +265,6 @@ function canOverwriteLock(currentLock: string | null, newLock: string | null): b
 // REVIEW QUEUE HELPERS (PR-4)
 // ============================================================
 
-/**
- * Build reason_codes array for review_queue
- * Combines model reasons + system-detected conditions
- */
 function buildReasonCodes(opts: {
   modelReasons?: string[] | null;
   quoteVerified: boolean;
@@ -310,15 +282,9 @@ function buildReasonCodes(opts: {
   if (opts.geoOnly) reasons.push("geo_only");
   if (opts.modelError) reasons.push("model_error");
 
-  // Dedupe
   return Array.from(new Set(reasons.filter(Boolean)));
 }
 
-/**
- * Upsert a review item keyed by span_id
- * Uses existing review_queue schema (reasons, pending/resolved/dismissed)
- * Writes BOTH reason_codes AND reasons for back-compat (reconciled PR-4)
- */
 async function upsertReviewQueue(
   db: ReturnType<typeof createClient>,
   payload: {
@@ -335,8 +301,8 @@ async function upsertReviewQueue(
         span_id: payload.span_id,
         interaction_id: payload.interaction_id,
         status: "pending",
-        reason_codes: payload.reasons, // New column (preferred)
-        reasons: payload.reasons, // Legacy column (back-compat)
+        reason_codes: payload.reasons,
+        reasons: payload.reasons,
         context_payload: payload.context_payload,
       },
       { onConflict: "span_id" },
@@ -347,9 +313,6 @@ async function upsertReviewQueue(
   }
 }
 
-/**
- * Resolve any open review item for a span (when auto-assign succeeds)
- */
 async function resolveReviewQueue(
   db: ReturnType<typeof createClient>,
   spanId: string,
@@ -474,7 +437,6 @@ OUTPUT FORMAT (JSON only, no markdown):
 IMPORTANT: The "quote" field in anchors must contain text that ACTUALLY APPEARS in the transcript segment provided.`;
 
 function buildUserPrompt(ctx: ContextPackage): string {
-  // Build journal state index for quick lookup
   const journalByProject = new Map<string, ProjectJournalState>();
   if (ctx.project_journal && Array.isArray(ctx.project_journal)) {
     for (const pj of ctx.project_journal) {
@@ -487,7 +449,6 @@ function buildUserPrompt(ctx: ContextPackage): string {
       ? `Matches in transcript: ${c.evidence.alias_matches.map((m) => `"${m.term}" (${m.match_type})`).join(", ")}`
       : "No direct transcript matches";
 
-    // v1.6.0: Include journal state per candidate if available
     const journalState = journalByProject.get(c.project_id);
     let journalSummary = "   - Journal: No prior context";
     if (journalState && (journalState.recent_claims.length > 0 || journalState.open_loops.length > 0)) {
@@ -508,9 +469,7 @@ function buildUserPrompt(ctx: ContextPackage): string {
    - Client: ${c.client_name || "N/A"}
    - Aliases: ${c.aliases.length > 0 ? c.aliases.slice(0, 5).join(", ") : "None"}
    - Status: ${c.status || "N/A"}, Phase: ${c.phase || "N/A"}
-   - Evidence: assigned=${c.evidence.assigned}, affinity=${c.evidence.affinity_weight.toFixed(2)}, sources=[${
-      c.evidence.sources.join(",")
-    }]
+   - Evidence: assigned=${c.evidence.assigned}, affinity=${c.evidence.affinity_weight.toFixed(2)}, sources=[${c.evidence.sources.join(",")}]
    - ${aliasMatchSummary}
 ${journalSummary}`;
   }).join("\n\n");
@@ -519,7 +478,6 @@ ${journalSummary}`;
     ? ctx.contact.recent_projects.map((p) => p.project_name).join(", ")
     : "None";
 
-  // v1.7.0: Fanout context for caller
   const fanoutClass = ctx.contact.fanout_class || (ctx.contact.floater_flag ? "floater" : "unknown");
   const effectiveFanout = ctx.contact.effective_fanout ?? (ctx.contact.floater_flag ? 5 : 0);
   const fanoutSignal = fanoutClass === "anchored"
@@ -535,9 +493,7 @@ ${journalSummary}`;
   const emailItems = Array.isArray(ctx.email_context) ? ctx.email_context.slice(0, 5) : [];
   const emailLookupMeta = ctx.email_lookup_meta || null;
   const emailLookupSummary = emailLookupMeta
-    ? `returned=${Number(emailLookupMeta.returned_count || emailItems.length)}, cached=${
-      emailLookupMeta.cached === true ? "yes" : "no"
-    }, range=${emailLookupMeta.date_range || "unknown"}`
+    ? `returned=${Number(emailLookupMeta.returned_count || emailItems.length)}, cached=${emailLookupMeta.cached === true ? "yes" : "no"}, range=${emailLookupMeta.date_range || "unknown"}`
     : "not_run";
   const emailWarnings = emailLookupMeta?.warnings?.length ? emailLookupMeta.warnings.slice(0, 4).join(", ") : "none";
   const emailContextSummary = emailItems.length > 0
@@ -547,9 +503,7 @@ ${journalSummary}`;
       const keywords = item.subject_keywords?.length ? item.subject_keywords.slice(0, 5).join(", ") : "none";
       const subject = (item.subject || "no subject").replace(/\s+/g, " ").slice(0, 120);
       const when = item.date || "unknown_date";
-      return `${
-        idx + 1
-      }. ${when} | subject="${subject}" | mentions=[${mentions}] | amounts=[${amounts}] | keywords=[${keywords}]`;
+      return `${idx + 1}. ${when} | subject="${subject}" | mentions=[${mentions}] | amounts=[${amounts}] | keywords=[${keywords}]`;
     }).join("\n")
     : "No recent vendor email context";
 
@@ -594,6 +548,15 @@ Deno.serve(async (req: Request) => {
     });
   }
 
+  const edgeSecretHeader = req.headers.get("X-Edge-Secret");
+  const expectedSecret = Deno.env.get("EDGE_SHARED_SECRET");
+  if (!expectedSecret || edgeSecretHeader !== expectedSecret) {
+    return new Response(JSON.stringify({ error: "unauthorized" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
   let body: any;
   try {
     body = await req.json();
@@ -634,9 +597,6 @@ Deno.serve(async (req: Request) => {
   let model_error = false;
 
   try {
-    // ========================================
-    // CALL CLAUDE HAIKU
-    // ========================================
     const anthropic = new Anthropic({
       apiKey: Deno.env.get("ANTHROPIC_API_KEY")!,
     });
@@ -656,11 +616,9 @@ Deno.serve(async (req: Request) => {
     tokens_used = (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0);
     raw_response = response;
 
-    // Parse response
     const textBlock = response.content.find((b: any) => b.type === "text");
     const responseText = textBlock?.type === "text" ? textBlock.text : "";
 
-    // Extract JSON from response (handle potential markdown wrapping)
     let jsonStr = responseText;
     const jsonMatch = responseText.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
@@ -669,19 +627,14 @@ Deno.serve(async (req: Request) => {
 
     const parsed = JSON.parse(jsonStr);
 
-    // Validate and build result
     const project_id = parsed.project_id || null;
     const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
     const anchors: Anchor[] = Array.isArray(parsed.anchors) ? parsed.anchors : [];
     const suggested_aliases: SuggestedAlias[] = Array.isArray(parsed.suggested_aliases) ? parsed.suggested_aliases : [];
-    // v1.7.0: Extract journal references from model response
     const journal_references: JournalReference[] = Array.isArray(parsed.journal_references)
       ? parsed.journal_references
       : [];
 
-    // HARD GUARDRAIL: decision="assign" requires transcript-grounded anchor
-    // Quote must ACTUALLY APPEAR in the transcript (substring match)
-    // Staff-name anchors are filtered out programmatically
     let decision = parsed.decision as "assign" | "review" | "none";
     const spanTranscript = context_package.span?.transcript_text || "";
     const { valid: hasValidAnchor, validatedAnchors, rejectedStaffAnchors } = validateAnchorQuotes(
@@ -689,7 +642,6 @@ Deno.serve(async (req: Request) => {
       spanTranscript,
     );
 
-    // Log if staff anchors were rejected
     if (rejectedStaffAnchors > 0) {
       console.log(
         `[ai-router] Rejected ${rejectedStaffAnchors} staff-name anchors, ${validatedAnchors.length} valid anchors remain`,
@@ -697,15 +649,12 @@ Deno.serve(async (req: Request) => {
     }
 
     if (decision === "assign" && !hasValidAnchor) {
-      // Downgrade to review if no valid anchor remains after filtering
       decision = "review";
       console.log(
         `[ai-router] Downgraded to review: no valid anchors after filtering (staff anchors rejected: ${rejectedStaffAnchors})`,
       );
     }
 
-    // POLICY: Weak anchors (city/zip/county) alone cannot support auto-assign
-    // Requires at least one STRONG anchor type (project name, address, client name)
     if (decision === "assign" && !hasStrongAnchor(validatedAnchors)) {
       decision = "review";
       console.log(
@@ -713,7 +662,6 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // Apply confidence thresholds
     if (decision === "assign" && confidence < THRESHOLD_AUTO_ASSIGN) {
       decision = "review";
     }
@@ -721,14 +669,13 @@ Deno.serve(async (req: Request) => {
       decision = "none";
     }
 
-    // USE VALIDATED ANCHORS (staff names filtered out)
     result = {
       span_id,
       project_id,
       confidence,
       decision,
       reasoning: parsed.reasoning || "No reasoning provided",
-      anchors: validatedAnchors, // Use filtered anchors, not original
+      anchors: validatedAnchors,
       suggested_aliases: suggested_aliases.length > 0 ? suggested_aliases : undefined,
       journal_references: journal_references.length > 0 ? journal_references : undefined,
     };
@@ -736,7 +683,6 @@ Deno.serve(async (req: Request) => {
     console.error("AI Router inference error:", e.message);
     model_error = true;
 
-    // On model failure, still produce a result (decision=review)
     result = {
       span_id,
       project_id: null,
@@ -753,9 +699,9 @@ Deno.serve(async (req: Request) => {
   let applied = false;
   let applied_project_id: string | null = null;
   let gatekeeper_reason: string | null = null;
+  let journal_extract_fired = false;
 
   if (!dry_run) {
-    // Check existing span lock (handle "no row" case with maybeSingle)
     const { data: existingAttribution } = await db
       .from("span_attributions")
       .select("attribution_lock")
@@ -764,19 +710,15 @@ Deno.serve(async (req: Request) => {
 
     const currentLock = existingAttribution?.attribution_lock ?? null;
 
-    // Determine what lock we would write
     const wouldApply = result.decision === "assign" && result.confidence >= THRESHOLD_AUTO_ASSIGN;
     const newLock = wouldApply ? "ai" : null;
 
-    // LOCK MONOTONICITY: human > ai > null
-    // AI cannot overwrite human lock, and null cannot overwrite ai lock
     if (!canOverwriteLock(currentLock, newLock)) {
       gatekeeper_reason = currentLock === "human" ? "human_lock_present" : "ai_lock_preserved";
       applied = false;
       applied_project_id = null;
       console.log(`[ai-router] Lock preserved: current=${currentLock}, attempted=${newLock}`);
     } else {
-      // Validate anchor quotes actually appear in transcript
       const spanTranscript = context_package.span?.transcript_text || "";
       const { valid: hasValidAnchor } = validateAnchorQuotes(result.anchors, spanTranscript);
 
@@ -801,13 +743,12 @@ Deno.serve(async (req: Request) => {
     // ========================================
     // WRITE TO SPAN_ATTRIBUTIONS (ALWAYS)
     // ========================================
-    // Upsert on idempotency key: span_id + model_id + prompt_version
     const attribution_lock = applied ? "ai" : null;
     const needs_review = result.decision === "review" || result.decision === "none";
 
     const { error: upsertErr } = await db.from("span_attributions").upsert({
       span_id,
-      project_id: result.project_id, // Model's predicted project
+      project_id: result.project_id,
       confidence: result.confidence,
       decision: result.decision,
       reasoning: result.reasoning,
@@ -823,7 +764,7 @@ Deno.serve(async (req: Request) => {
       applied_project_id,
       applied_at_utc: applied ? new Date().toISOString() : null,
       needs_review,
-      attributed_by: `ai-router-${PROMPT_VERSION}`,
+      attributed_by: `ai-router-${FUNCTION_VERSION}`,
       attributed_at: new Date().toISOString(),
     }, {
       onConflict: "span_id,model_id,prompt_version",
@@ -832,7 +773,6 @@ Deno.serve(async (req: Request) => {
 
     if (upsertErr) {
       console.error("[ai-router] span_attributions upsert failed:", upsertErr.message, upsertErr.details);
-      // Continue - we still return the result but log the error
     }
 
     // ========================================
@@ -849,9 +789,8 @@ Deno.serve(async (req: Request) => {
       model_error;
 
     if (needsReviewQueue) {
-      // Create/update review item for human triage
       const reason_codes = buildReasonCodes({
-        modelReasons: null, // Model doesn't return these yet
+        modelReasons: null,
         quoteVerified,
         strongAnchor: strongAnchorPresent,
         modelError: model_error,
@@ -877,15 +816,54 @@ Deno.serve(async (req: Request) => {
 
       await upsertReviewQueue(db, {
         span_id,
-        interaction_id: interaction_id || span_id, // Fallback to span_id if no interaction_id
+        interaction_id: interaction_id || span_id,
         reasons: reason_codes,
         context_payload,
       });
       console.log(`[ai-router] Created review_queue item for span ${span_id}, reasons: ${reason_codes.join(",")}`);
     } else {
-      // Auto-assigned: close any stale open review item for this span
       await resolveReviewQueue(db, span_id, "auto-applied by ai-router");
       console.log(`[ai-router] Resolved review_queue item for span ${span_id} (auto-assigned)`);
+    }
+
+    // ========================================
+    // v1.8.1: CHAIN TO JOURNAL-EXTRACT (fire-and-forget)
+    // Fires after attribution lands so journal-extract can read
+    // applied_project_id from span_attributions.
+    // Belt-and-suspenders with segment-call hook — ensures journal
+    // extraction runs even for backfill/replay/manual invocations.
+    // journal-extract has its own idempotency guard (skips if claims
+    // already exist for this span_id) and handles null project_id
+    // gracefully (skips DB insert, returns reason).
+    // ========================================
+    if (!model_error && span_id) {
+      const edgeSecretVal = Deno.env.get("EDGE_SHARED_SECRET");
+      const journalExtractUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/journal-extract`;
+      if (edgeSecretVal) {
+        try {
+          const jeResp = await fetch(journalExtractUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Edge-Secret": edgeSecretVal,
+            },
+            body: JSON.stringify({
+              span_id,
+              interaction_id: context_package.meta?.interaction_id,
+            }),
+          });
+          journal_extract_fired = true;
+          if (!jeResp.ok) {
+            const errBody = await jeResp.text().catch(() => "unknown");
+            console.warn(`[ai-router] journal-extract chain ${jeResp.status}: ${errBody.slice(0, 200)}`);
+          } else {
+            const jeData = await jeResp.json().catch(() => null);
+            console.log(`[ai-router] journal-extract chain OK: claims_extracted=${jeData?.claims_extracted ?? '?'}, claims_written=${jeData?.claims_written ?? '?'}`);
+          }
+        } catch (e: any) {
+          console.warn(`[ai-router] journal-extract chain error: ${e.message}`);
+        }
+      }
     }
   }
 
@@ -908,10 +886,14 @@ Deno.serve(async (req: Request) => {
         applied_project_id,
         reason: gatekeeper_reason,
       },
+      post_hooks: {
+        journal_extract_fired,
+      },
       model_error,
       dry_run,
       model_id: MODEL_ID,
       prompt_version: PROMPT_VERSION,
+      function_version: FUNCTION_VERSION,
       tokens_used,
       inference_ms,
       ms: Date.now() - t0,
