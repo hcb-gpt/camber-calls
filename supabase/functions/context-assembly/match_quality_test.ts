@@ -22,8 +22,12 @@ function classifyMatchStrength(
   const nameLower = projectName.toLowerCase();
 
   if (termLower === nameLower || matchType === "exact_project_name" || matchType === "name_match") return "strong";
+  const isExplicitAddress = /\d/.test(termLower) || /\b(?:st|street|ave|avenue|blvd|boulevard|rd|road|dr|drive|ln|lane|ct|court|cir|circle|pl|place|pkwy|parkway|way)\b/.test(termLower);
+  if (matchType === "city_or_location" || matchType === "location_match") {
+    if (isExplicitAddress) return "strong";
+    return "weak";
+  }
   if (term.trim().includes(" ")) return "strong";
-  if (matchType === "city_or_location" || matchType === "location_match") return "strong";
 
   const nameParts = nameLower.split(/\s+/);
   if (nameParts.length >= 2) {
@@ -82,9 +86,14 @@ Deno.test("classifyMatchStrength: multi-word alias = strong", () => {
   assertEquals(classifyMatchStrength("Well Road", "alias", "Well Road Renovation"), "strong");
 });
 
-Deno.test("classifyMatchStrength: location match = strong", () => {
-  assertEquals(classifyMatchStrength("Riverside", "city_or_location", "Riverside Project"), "strong");
-  assertEquals(classifyMatchStrength("Denver", "location_match", "Denver Office Build"), "strong");
+Deno.test("classifyMatchStrength: city-only location match = weak", () => {
+  assertEquals(classifyMatchStrength("Riverside", "city_or_location", "Riverside Project"), "weak");
+  assertEquals(classifyMatchStrength("Denver", "location_match", "Denver Office Build"), "weak");
+});
+
+Deno.test("classifyMatchStrength: explicit address-like location match = strong", () => {
+  assertEquals(classifyMatchStrength("123 Main Street", "city_or_location", "Riverside Project"), "strong");
+  assertEquals(classifyMatchStrength("Broadway Ave", "location_match", "Denver Office Build"), "strong");
 });
 
 Deno.test("classifyMatchStrength: last-name component = strong", () => {
