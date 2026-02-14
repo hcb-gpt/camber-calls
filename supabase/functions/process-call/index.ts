@@ -114,7 +114,7 @@ function normalizeAliasTerms(terms: string[]): string[] {
 // PHONETIC-ADJACENT-ONLY: Match quality classification
 // ============================================================
 /** Classify whether an alias match is strong or weak.
- *  - "strong": exact project name, multi-word alias, last-name match, or location
+ *  - "strong": exact project name, explicit address fragment, multi-word alias, last-name match
  *  - "weak": single short first-name-only token (< 6 chars) with no corroboration
  *  Rule: first-name-only phonetic = "possible" only, never auto-merge */
 function classifyMatchStrength(
@@ -128,11 +128,16 @@ function classifyMatchStrength(
   // Exact project name match is always strong
   if (termLower === nameLower || matchType === "name_match") return "strong";
 
-  // Multi-word terms are strong (full name, address, etc.)
-  if (term.trim().includes(" ")) return "strong";
+  const isExplicitAddress = /\d/.test(termLower) || /\b(?:st|street|ave|avenue|blvd|boulevard|rd|road|dr|drive|ln|lane|ct|court|cir|circle|pl|place|pkwy|parkway|way)\b/.test(termLower);
 
-  // Location matches are strong
-  if (matchType === "location_match" || matchType === "city_or_location") return "strong";
+  // Location matches are weak (city-only corroboration) unless explicitly address-like
+  if (matchType === "location_match" || matchType === "city_or_location") {
+    if (isExplicitAddress) return "strong";
+    return "weak";
+  }
+
+  // Multi-word terms are strong (full name, addresses, etc.)
+  if (term.trim().includes(" ")) return "strong";
 
   // Check if this is a last-name component match (strong)
   const nameParts = nameLower.split(/\s+/);
