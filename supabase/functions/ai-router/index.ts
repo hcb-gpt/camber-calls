@@ -58,6 +58,26 @@ interface Anchor {
   quote: string;
 }
 
+type PlaceRole = "proximity" | "origin" | "destination";
+
+interface GeoSignal {
+  score: number;
+  dominant_role: PlaceRole;
+  role_counts: Record<PlaceRole, number>;
+  place_count: number;
+}
+
+interface PlaceMention {
+  place_name: string;
+  geo_place_id: string | null;
+  lat: number | null;
+  lon: number | null;
+  role: PlaceRole;
+  trigger_verb: string | null;
+  char_offset: number;
+  snippet: string;
+}
+
 interface SuggestedAlias {
   project_id: string;
   alias_term: string;
@@ -155,8 +175,11 @@ interface ContextPackage {
       affinity_weight: number;
       assigned: boolean;
       alias_matches: Array<{ term: string; match_type: string; snippet?: string }>;
+      geo_distance_km?: number;
+      geo_signal?: GeoSignal;
     };
   }>;
+  place_mentions?: PlaceMention[];
   project_journal?: ProjectJournalState[];
   email_context?: EmailContextItem[];
   email_lookup_meta?: EmailLookupMeta | null;
@@ -286,7 +309,7 @@ function buildReasonCodes(opts: {
 }
 
 async function upsertReviewQueue(
-  db: ReturnType<typeof createClient>,
+  db: any,
   payload: {
     span_id: string;
     interaction_id: string;
@@ -314,7 +337,7 @@ async function upsertReviewQueue(
 }
 
 async function resolveReviewQueue(
-  db: ReturnType<typeof createClient>,
+  db: any,
   spanId: string,
   notes: string,
 ) {
@@ -386,6 +409,12 @@ EMAIL CONTEXT (when available):
 - Use email context to break ties only when transcript-grounded anchors already exist.
 - If email context conflicts with transcript anchors, trust the transcript.
 
+GEO CONTEXT (when available):
+- Geo signals are WEAK corroboration only (distance + role + place mentions).
+- Never auto-assign based only on geo/proximity evidence.
+- Destination/origin roles can increase confidence inside review band when transcript anchors already exist.
+- If geo conflicts with strong transcript anchors, trust transcript anchors.
+
 CONFIDENCE THRESHOLDS:
 - 0.75-1.00: Strong transcript-grounded evidence, safe to auto-assign
 - 0.50-0.74: Moderate evidence, needs human review
@@ -449,6 +478,14 @@ function buildUserPrompt(ctx: ContextPackage): string {
       ? `Matches in transcript: ${c.evidence.alias_matches.map((m) => `"${m.term}" (${m.match_type})`).join(", ")}`
       : "No direct transcript matches";
 
+    const geoSummary = c.evidence.geo_signal
+      ? `Geo: distance=${
+        typeof c.evidence.geo_distance_km === "number" ? `${c.evidence.geo_distance_km.toFixed(1)}km` : "n/a"
+      }, score=${
+        c.evidence.geo_signal.score.toFixed(2)
+      }, role=${c.evidence.geo_signal.dominant_role}, places=${c.evidence.geo_signal.place_count}`
+      : "Geo: none";
+
     const journalState = journalByProject.get(c.project_id);
     let journalSummary = "   - Journal: No prior context";
     if (journalState && (journalState.recent_claims.length > 0 || journalState.open_loops.length > 0)) {
@@ -469,7 +506,10 @@ function buildUserPrompt(ctx: ContextPackage): string {
    - Client: ${c.client_name || "N/A"}
    - Aliases: ${c.aliases.length > 0 ? c.aliases.slice(0, 5).join(", ") : "None"}
    - Status: ${c.status || "N/A"}, Phase: ${c.phase || "N/A"}
-   - Evidence: assigned=${c.evidence.assigned}, affinity=${c.evidence.affinity_weight.toFixed(2)}, sources=[${c.evidence.sources.join(",")}]
+   - Evidence: assigned=${c.evidence.assigned}, affinity=${c.evidence.affinity_weight.toFixed(2)}, sources=[${
+      c.evidence.sources.join(",")
+    }]
+   - ${geoSummary}
    - ${aliasMatchSummary}
 ${journalSummary}`;
   }).join("\n\n");
@@ -493,7 +533,9 @@ ${journalSummary}`;
   const emailItems = Array.isArray(ctx.email_context) ? ctx.email_context.slice(0, 5) : [];
   const emailLookupMeta = ctx.email_lookup_meta || null;
   const emailLookupSummary = emailLookupMeta
-    ? `returned=${Number(emailLookupMeta.returned_count || emailItems.length)}, cached=${emailLookupMeta.cached === true ? "yes" : "no"}, range=${emailLookupMeta.date_range || "unknown"}`
+    ? `returned=${Number(emailLookupMeta.returned_count || emailItems.length)}, cached=${
+      emailLookupMeta.cached === true ? "yes" : "no"
+    }, range=${emailLookupMeta.date_range || "unknown"}`
     : "not_run";
   const emailWarnings = emailLookupMeta?.warnings?.length ? emailLookupMeta.warnings.slice(0, 4).join(", ") : "none";
   const emailContextSummary = emailItems.length > 0
@@ -503,9 +545,20 @@ ${journalSummary}`;
       const keywords = item.subject_keywords?.length ? item.subject_keywords.slice(0, 5).join(", ") : "none";
       const subject = (item.subject || "no subject").replace(/\s+/g, " ").slice(0, 120);
       const when = item.date || "unknown_date";
-      return `${idx + 1}. ${when} | subject="${subject}" | mentions=[${mentions}] | amounts=[${amounts}] | keywords=[${keywords}]`;
+      return `${
+        idx + 1
+      }. ${when} | subject="${subject}" | mentions=[${mentions}] | amounts=[${amounts}] | keywords=[${keywords}]`;
     }).join("\n")
     : "No recent vendor email context";
+
+  const placeMentions = Array.isArray(ctx.place_mentions) ? ctx.place_mentions.slice(0, 8) : [];
+  const placeMentionSummary = placeMentions.length > 0
+    ? placeMentions.map((p, idx) => {
+      const roleTag = p.trigger_verb ? `${p.role} via "${p.trigger_verb}"` : `${p.role}`;
+      const loc = (p.lat != null && p.lon != null) ? `${p.lat.toFixed(4)},${p.lon.toFixed(4)}` : "n/a";
+      return `${idx + 1}. ${p.place_name} | role=${roleTag} | loc=${loc} | quote="${(p.snippet || "").slice(0, 90)}"`;
+    }).join("\n")
+    : "No explicit place mentions detected";
 
   return `TRANSCRIPT SEGMENT:
 """
@@ -523,6 +576,9 @@ EMAIL CONTEXT (WEAK CORROBORATION):
 - Warnings: ${emailWarnings}
 ${emailContextSummary}
 
+GEO PLACE MENTIONS (WEAK CORROBORATION):
+${placeMentionSummary}
+
 CANDIDATE PROJECTS (${ctx.candidates.length} total):
 ${candidateList || "No candidates found"}
 
@@ -530,6 +586,7 @@ Analyze the transcript and determine which project (if any) this conversation is
 Consider the contact's fanout class — an anchored contact (fanout=1) on a single project is strong evidence; a floater (fanout>=5) provides no identity signal.
 Consider the journal context for each project — if the conversation topic matches known commitments, decisions, or open loops for a project, that strengthens the attribution.
 Treat email context as weak corroboration only; never use email context alone for decision="assign".
+Treat geo context as weak corroboration only; use it as a tie-breaker when transcript evidence is otherwise close.
 If journal claims influenced your decision, include them in journal_references.
 Remember: You MUST include an exact quote from the transcript to use decision="assign".`;
 }
@@ -858,7 +915,11 @@ Deno.serve(async (req: Request) => {
             console.warn(`[ai-router] journal-extract chain ${jeResp.status}: ${errBody.slice(0, 200)}`);
           } else {
             const jeData = await jeResp.json().catch(() => null);
-            console.log(`[ai-router] journal-extract chain OK: claims_extracted=${jeData?.claims_extracted ?? '?'}, claims_written=${jeData?.claims_written ?? '?'}`);
+            console.log(
+              `[ai-router] journal-extract chain OK: claims_extracted=${
+                jeData?.claims_extracted ?? "?"
+              }, claims_written=${jeData?.claims_written ?? "?"}`,
+            );
           }
         } catch (e: any) {
           console.warn(`[ai-router] journal-extract chain error: ${e.message}`);

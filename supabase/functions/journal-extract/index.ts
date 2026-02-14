@@ -1,10 +1,41 @@
 /**
- * journal-extract Edge Function v1.1.2
+ * journal-extract Edge Function v1.2.1
  * Extracts structured epistemic claims from attributed conversation spans
  *
- * @version 1.1.2
- * @date 2026-02-10
+ * @version 1.2.1
+ * @date 2026-02-14
  * @purpose D1 deliverable - journal claim extraction from spans
+ *
+ * v1.2.1 changes (DEV-2):
+ *   - INCIDENT MITIGATION: Add transcript truncation (max 8000 chars) to prevent
+ *     Haiku inference timeouts on long spans (38K+ chars → auto-timeout cascade).
+ *     Aligns with striking-detect pattern (6000 char cap).
+ *   - Skip LLM retry when first attempt times out (retry would also timeout,
+ *     doubling the wall-clock time for no benefit).
+ *   - Add transcript_chars and truncated flags to response for observability.
+ *
+ * v1.2.0 changes (DEV-1):
+ *   - HOTFIX: Fix status enum mismatch — 'completed' → 'success' in journal_runs writes.
+ *     CHECK constraint only allows 'running'|'success'|'failed'. Writing 'completed' caused
+ *     silent update failures → rows stuck in 'running' → cron auto-timeout cascade (238+ false failures).
+ *   - Add error checking on all journal_runs .update() calls.
+ *   - Fix catch-path failure update: use run_id instead of call_id (was matching wrong rows).
+ *   - Add AbortController to Anthropic fetch so timeout actually cancels the HTTP request.
+ *
+ * v1.1.5 changes (DEV-2):
+ *   - Upgrade epistemic_status extraction vocabulary to:
+ *     observed, reported, inferred, promised, decided, disputed, superseded.
+ *   - Prompt guidance now maps commitments/decisions/facts/testimony to the
+ *     upgraded vocabulary.
+ *
+ * v1.1.4 changes (DEV-1):
+ *   - Restore pointer field propagation into dedup RPC payload
+ *     (char_start/char_end/span_text/span_hash/pointer_type + claim_project_id/confidence).
+ *   - Ensures pointer trigger path can run again and recover transcript span pointers.
+ *
+ * v1.1.3 changes (DEV-2):
+ *   - Deployment config aligned to internal auth pattern (`verify_jwt=false`)
+ *     so segment-call X-Edge-Secret invocations are accepted at gateway.
  *
  * v1.1.2 changes (DEV-10):
  *   - Use insert_journal_claims_dedup RPC for ON CONFLICT DO NOTHING dedup
@@ -27,14 +58,37 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const FUNCTION_VERSION = "v1.1.2";
-const PROMPT_VERSION = "journal-extract-v1";
+const FUNCTION_VERSION = "v1.2.1";
+const PROMPT_VERSION = "journal-extract-v2";
 const MAX_TOKENS = 4096;
 const DEFAULT_MODEL = "claude-3-haiku-20240307";
 const DEFAULT_TIMEOUT_MS = 30000;
+const MAX_TRANSCRIPT_CHARS = 8000; // Cap transcript to prevent inference timeouts
 
-const VALID_CLAIM_TYPES = ["commitment", "deadline", "decision", "blocker", "requirement", "preference", "concern", "fact", "question", "update"] as const;
-const VALID_EPISTEMIC_STATUSES = ["stated", "inferred", "uncertain"] as const;
+const VALID_CLAIM_TYPES = [
+  "commitment",
+  "deadline",
+  "decision",
+  "blocker",
+  "requirement",
+  "preference",
+  "concern",
+  "fact",
+  "question",
+  "update",
+] as const;
+const VALID_EPISTEMIC_STATUSES = [
+  "observed",
+  "reported",
+  "inferred",
+  "promised",
+  "decided",
+  "disputed",
+  "superseded",
+  // Back-compat accepted during rollout
+  "stated",
+  "uncertain",
+] as const;
 const VALID_WARRANT_LEVELS = ["high", "medium", "low"] as const;
 const VALID_TESTIMONY_TYPES = ["direct", "reported", "inferred"] as const;
 
@@ -178,7 +232,7 @@ function validateExtraction(parsed: any): ExtractionResponse {
     claims.push({
       claim_type,
       claim_text: String(c.claim_text).slice(0, 2000),
-      epistemic_status: VALID_EPISTEMIC_STATUSES.includes(c.epistemic_status) ? c.epistemic_status : "inferred",
+      epistemic_status: VALID_EPISTEMIC_STATUSES.includes(c.epistemic_status) ? c.epistemic_status : "reported",
       warrant_level: VALID_WARRANT_LEVELS.includes(c.warrant_level) ? c.warrant_level : "medium",
       testimony_type: c.testimony_type && VALID_TESTIMONY_TYPES.includes(c.testimony_type) ? c.testimony_type : null,
       speaker_label: c.speaker_label || null,
@@ -192,20 +246,10 @@ function validateExtraction(parsed: any): ExtractionResponse {
   return { claims, summary: parsed.summary || "" };
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-  let timeoutHandle: number | undefined;
-  const timeoutPromise = new Promise<T>((_, reject) => {
-    timeoutHandle = setTimeout(() => reject(new Error(`${label}_timeout`)), timeoutMs);
-  });
-  try {
-    return await Promise.race([promise, timeoutPromise]);
-  } finally {
-    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
-  }
-}
-
 /**
- * Call Anthropic API for claim extraction.
+ * Call Anthropic API for claim extraction with AbortController-backed timeout.
+ * The AbortController ensures the HTTP request is actually cancelled on timeout,
+ * not just abandoned (which would leak connections).
  */
 async function callLlm(
   anthropicKey: string,
@@ -215,8 +259,11 @@ async function callLlm(
   timeoutMs: number,
 ): Promise<{ rawContent: string; tokens_used: number; inference_ms: number }> {
   const llmT0 = Date.now();
-  const resp = await withTimeout(
-    fetch("https://api.anthropic.com/v1/messages", {
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -230,23 +277,30 @@ async function callLlm(
         system: systemPrompt,
         messages: [{ role: "user", content: userPrompt }],
       }),
-    }),
-    timeoutMs,
-    "anthropic_extract",
-  );
-  const inference_ms = Date.now() - llmT0;
+      signal: controller.signal,
+    });
 
-  if (!resp.ok) {
-    const errText = await resp.text();
-    throw new Error(`anthropic_${resp.status}: ${errText.slice(0, 200)}`);
+    const inference_ms = Date.now() - llmT0;
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`anthropic_${resp.status}: ${errText.slice(0, 200)}`);
+    }
+
+    const payload = await resp.json();
+    const textBlock = (payload?.content || []).find((b: any) => b?.type === "text");
+    const rawContent = textBlock?.text || "";
+    const tokens_used = (payload?.usage?.input_tokens || 0) + (payload?.usage?.output_tokens || 0);
+
+    return { rawContent, tokens_used, inference_ms };
+  } catch (err: any) {
+    if (err.name === "AbortError" || controller.signal.aborted) {
+      throw new Error(`anthropic_extract_timeout: request aborted after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutHandle);
   }
-
-  const payload = await resp.json();
-  const textBlock = (payload?.content || []).find((b: any) => b?.type === "text");
-  const rawContent = textBlock?.text || "";
-  const tokens_used = (payload?.usage?.input_tokens || 0) + (payload?.usage?.output_tokens || 0);
-
-  return { rawContent, tokens_used, inference_ms };
 }
 
 const SYSTEM_PROMPT = `You are a construction project journal analyst for HCB (Heartwood Custom Builders).
@@ -267,9 +321,21 @@ CLAIM TYPES (pick exactly one per claim):
 - update: A status update on something ("Plumbing rough-in is done")
 
 EPISTEMIC STATUS:
-- stated: Speaker explicitly said this (direct quote or clear paraphrase)
-- inferred: Implied by context but not directly said
-- uncertain: Ambiguous - could be interpreted multiple ways
+- observed: Direct first-hand observation or directly witnessed state
+- reported: Relayed from someone else or generally asserted without direct observation
+- inferred: Derived from context, implication, or synthesis
+- promised: Forward-looking commitment language ("I'll", "we will", "going to")
+- decided: Explicit decision or choice made
+- disputed: Ambiguous, contested, or uncertain claim
+- superseded: Explicitly replaced/overridden by newer information
+
+MAPPING GUIDANCE:
+- commitments/deadlines -> usually promised
+- decisions -> decided
+- facts from direct observation -> observed
+- facts relayed by others -> reported
+- inferences/implications -> inferred
+- concerns/blockers with uncertainty -> disputed or inferred
 
 WARRANT LEVEL (how much evidence supports this claim):
 - high: Clear, unambiguous statement with context
@@ -303,7 +369,7 @@ OUTPUT FORMAT (JSON only, no markdown):
     {
       "claim_type": "commitment|deadline|decision|blocker|requirement|preference|concern|fact|question|update",
       "claim_text": "Clear, concise description of the claim",
-      "epistemic_status": "stated|inferred|uncertain",
+      "epistemic_status": "observed|reported|inferred|promised|decided|disputed|superseded",
       "warrant_level": "high|medium|low",
       "testimony_type": "direct|reported|inferred",
       "speaker_label": "SPEAKER_0",
@@ -327,7 +393,7 @@ OUTPUT FORMAT (strict JSON — nothing else):
     {
       "claim_type": "commitment|deadline|decision|blocker|requirement|preference|concern|fact|question|update",
       "claim_text": "Clear, concise description of the claim",
-      "epistemic_status": "stated|inferred|uncertain",
+      "epistemic_status": "observed|reported|inferred|promised|decided|disputed|superseded",
       "warrant_level": "high|medium|low",
       "testimony_type": "direct|reported|inferred",
       "speaker_label": "SPEAKER_0",
@@ -345,7 +411,8 @@ Deno.serve(async (req: Request) => {
 
   if (req.method !== "POST") {
     return new Response(JSON.stringify({ error: "POST only" }), {
-      status: 405, headers: { "Content-Type": "application/json" },
+      status: 405,
+      headers: { "Content-Type": "application/json" },
     });
   }
 
@@ -366,7 +433,8 @@ Deno.serve(async (req: Request) => {
     body = await req.json();
   } catch {
     return new Response(JSON.stringify({ error: "Invalid JSON" }), {
-      status: 400, headers: { "Content-Type": "application/json" },
+      status: 400,
+      headers: { "Content-Type": "application/json" },
     });
   }
 
@@ -386,6 +454,9 @@ Deno.serve(async (req: Request) => {
   const model = Deno.env.get("JOURNAL_EXTRACT_MODEL") || DEFAULT_MODEL;
   const timeoutMs = Number(Deno.env.get("JOURNAL_EXTRACT_TIMEOUT_MS")) || DEFAULT_TIMEOUT_MS;
   const dry_run = body.dry_run === true;
+
+  // Hoisted so catch block can reference it for failure recording
+  let run_id: string | null = null;
 
   try {
     let span_id: string | null = body.span_id || null;
@@ -476,7 +547,7 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    const run_id = crypto.randomUUID();
+    run_id = crypto.randomUUID();
 
     if (!dry_run) {
       const { error: runErr } = await db.from("journal_runs").insert({
@@ -489,7 +560,20 @@ Deno.serve(async (req: Request) => {
       if (runErr) console.error("[journal-extract] journal_runs insert failed:", runErr.message);
     }
 
-    const userPrompt = `TRANSCRIPT SEGMENT (span_id: ${span_id}, interaction: ${interaction_id}):\n"""\n${transcript}\n"""\n\nExtract all project-relevant claims from this transcript segment.`;
+    // ── TRANSCRIPT TRUNCATION ────────────────────────────────────
+    // Cap transcript to prevent Haiku inference timeouts on very long spans.
+    // Spans up to 38K chars were causing 30s+ inference → auto-timeout cascade.
+    const truncated = transcript.length > MAX_TRANSCRIPT_CHARS;
+    const promptTranscript = truncated
+      ? transcript.slice(0, MAX_TRANSCRIPT_CHARS) + "\n...[truncated]"
+      : transcript;
+
+    if (truncated) {
+      console.log(`[journal-extract] Truncated transcript from ${transcript.length} to ${MAX_TRANSCRIPT_CHARS} chars for span ${span_id}`);
+    }
+
+    const userPrompt =
+      `TRANSCRIPT SEGMENT (span_id: ${span_id}, interaction: ${interaction_id}):\n"""\n${promptTranscript}\n"""\n\nExtract all project-relevant claims from this transcript segment.`;
 
     let extraction: ExtractionResponse;
     let tokens_used = 0;
@@ -505,10 +589,17 @@ Deno.serve(async (req: Request) => {
       extraction = parseExtractionJson(result1.rawContent);
     } catch (parseErr: any) {
       // ── ATTEMPT 2: Retry with strict JSON-only prompt ─────────
+      // Skip retry if the first attempt itself timed out — retrying would
+      // also timeout and just double the wall-clock time.
+      if (parseErr.message?.includes("timeout")) {
+        throw parseErr; // propagate directly to catch block
+      }
+
       console.warn(`[journal-extract] Parse failed on attempt 1: ${parseErr.message}. Retrying with strict prompt.`);
       retried = true;
 
-      const retryPrompt = `TRANSCRIPT SEGMENT (span_id: ${span_id}, interaction: ${interaction_id}):\n"""\n${transcript}\n"""\n\nExtract all project-relevant claims. Output ONLY valid JSON — no markdown, no code fences, no comments.`;
+      const retryPrompt =
+        `TRANSCRIPT SEGMENT (span_id: ${span_id}, interaction: ${interaction_id}):\n"""\n${promptTranscript}\n"""\n\nExtract all project-relevant claims. Output ONLY valid JSON — no markdown, no code fences, no comments.`;
 
       const result2 = await callLlm(anthropicKey, model, RETRY_SYSTEM_PROMPT, retryPrompt, timeoutMs);
       tokens_used += result2.tokens_used;
@@ -521,7 +612,7 @@ Deno.serve(async (req: Request) => {
     const speakerContactMap = new Map<string, { contact_id: string; contact_name: string; is_internal: boolean }>();
 
     if (project_id) {
-      const uniqueSpeakers = [...new Set(extraction.claims.map(c => c.speaker_label).filter(Boolean))];
+      const uniqueSpeakers = [...new Set(extraction.claims.map((c) => c.speaker_label).filter(Boolean))];
       for (const label of uniqueSpeakers) {
         try {
           const { data: resolved } = await db.rpc("resolve_speaker_contact", {
@@ -552,16 +643,19 @@ Deno.serve(async (req: Request) => {
       // knows claims were found, and can re-trigger after attribution.
       if (!project_id) {
         skipped_no_project = true;
-        console.warn(`[journal-extract] Skipping claim insert: span ${span_id} has no project attribution (FK constraint).`);
+        console.warn(
+          `[journal-extract] Skipping claim insert: span ${span_id} has no project attribution (FK constraint).`,
+        );
 
-        await db.from("journal_runs").update({
-          status: "completed",
+        const { error: noProjectUpdateErr } = await db.from("journal_runs").update({
+          status: "success",
           completed_at: new Date().toISOString(),
           claims_extracted: 0,
           error_message: "no_project_attribution: claims extracted but not written (FK constraint)",
         }).eq("run_id", run_id);
+        if (noProjectUpdateErr) console.error("[journal-extract] journal_runs update (no project) failed:", noProjectUpdateErr.message);
       } else {
-        const claimRows = extraction.claims.map(c => {
+        const claimRows = extraction.claims.map((c) => {
           const speaker = c.speaker_label ? speakerContactMap.get(c.speaker_label) : null;
           const claim_id = crypto.randomUUID();
           claim_ids.push(claim_id);
@@ -571,6 +665,8 @@ Deno.serve(async (req: Request) => {
             run_id,
             call_id: interaction_id,
             project_id,
+            claim_project_id: project_id,
+            claim_project_confidence: attribution?.confidence ?? null,
             source_span_id: span_id,
             claim_type: c.claim_type,
             claim_text: c.claim_text,
@@ -582,6 +678,12 @@ Deno.serve(async (req: Request) => {
             speaker_is_internal: speaker?.is_internal || null,
             start_sec: c.start_sec,
             end_sec: c.end_sec,
+            char_start: null,
+            char_end: null,
+            // Seed span_text so trg_journal_claim_compute_pointer can compute locator/hash.
+            span_text: c.claim_text,
+            span_hash: null,
+            pointer_type: "transcript_span",
             relationship: "new",
             active: true,
             extraction_model_id: model,
@@ -598,16 +700,15 @@ Deno.serve(async (req: Request) => {
         if (claimErr) {
           console.error("[journal-extract] journal_claims insert failed:", claimErr.message);
         } else {
-          const insertedCount =
-            typeof insertedCountRaw === "number"
-              ? insertedCountRaw
-              : Number.parseInt(String(insertedCountRaw ?? "0"), 10);
+          const insertedCount = typeof insertedCountRaw === "number"
+            ? insertedCountRaw
+            : Number.parseInt(String(insertedCountRaw ?? "0"), 10);
           claims_written = Number.isFinite(insertedCount) ? insertedCount : 0;
         }
 
-        const openLoopClaims = extraction.claims.filter(c => c.is_open_loop);
+        const openLoopClaims = extraction.claims.filter((c) => c.is_open_loop);
         if (openLoopClaims.length > 0) {
-          const loopRows = openLoopClaims.map(c => ({
+          const loopRows = openLoopClaims.map((c) => ({
             run_id,
             call_id: interaction_id,
             project_id,
@@ -626,11 +727,12 @@ Deno.serve(async (req: Request) => {
           }
         }
 
-        await db.from("journal_runs").update({
-          status: "completed",
+        const { error: successUpdateErr } = await db.from("journal_runs").update({
+          status: "success",
           completed_at: new Date().toISOString(),
           claims_extracted: claims_written,
         }).eq("run_id", run_id);
+        if (successUpdateErr) console.error("[journal-extract] journal_runs update (success) failed:", successUpdateErr.message);
       }
     }
 
@@ -654,24 +756,28 @@ Deno.serve(async (req: Request) => {
         inference_ms,
         retried,
         dry_run,
+        transcript_chars: transcript.length,
+        truncated,
         prompt_version: PROMPT_VERSION,
         function_version: FUNCTION_VERSION,
         ms: Date.now() - t0,
       }),
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
-
   } catch (e: any) {
     console.error("[journal-extract] Error:", e.message);
 
-    if (!body.dry_run) {
+    if (!body.dry_run && run_id) {
       try {
-        await db.from("journal_runs").update({
+        // Use run_id (not call_id) to target the exact row this invocation created.
+        // Using call_id could match multiple runs for the same interaction.
+        const { error: failUpdateErr } = await db.from("journal_runs").update({
           status: "failed",
           completed_at: new Date().toISOString(),
           error_message: e.message?.slice(0, 500),
-        }).eq("call_id", body.interaction_id || "").eq("status", "running");
-      } catch { /* ignore */ }
+        }).eq("run_id", run_id).eq("status", "running");
+        if (failUpdateErr) console.error("[journal-extract] journal_runs update (failed) error:", failUpdateErr.message);
+      } catch { /* ignore — best-effort failure recording */ }
     }
 
     return new Response(
