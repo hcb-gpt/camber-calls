@@ -118,7 +118,8 @@ inserted_pointers AS (
     char_start,
     char_end,
     span_text,
-    span_hash
+    span_hash,
+    evidence_event_id
   )
   SELECT
     gen_random_uuid(),
@@ -131,10 +132,13 @@ inserted_pointers AS (
     c.char_start,
     c.char_end,
     c.span_text,
-    c.span_hash
+    c.span_hash,
+    ee.evidence_event_id
   FROM inserted_claims ic
   JOIN candidates c
     ON c.journal_claim_id = ic.journal_claim_id
+  LEFT JOIN public.evidence_events ee
+    ON ee.source_id = c.call_id
   RETURNING id
 )
 SELECT
