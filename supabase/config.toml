@@ -23,3 +23,18 @@ verify_jwt = false
 
 [functions.gmail-context-lookup]
 verify_jwt = false
+
+[functions.generate-summary]
+verify_jwt = false
+
+[functions.zapier-call-ingest]
+verify_jwt = false
+
+[functions.striking-detect]
+verify_jwt = false
+
+[functions.chain-detect]
+verify_jwt = false
+
+[functions.shadow-replay]
+verify_jwt = false

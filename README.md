@@ -49,6 +49,17 @@ supabase functions serve process-call --env-file .env.local
 supabase functions deploy process-call --no-verify-jwt
 ```
 
+## Read-Only SQL Access
+
+For DATA/DEV sessions, use:
+
+```bash
+cd /Users/chadbarlow/gh/hcb-gpt/camber-calls
+scripts/query.sh "select now();"
+```
+
+Details: `docs/data_sql_access.md`
+
 ## CI/CD
 
 Push to `main` triggers automatic deployment via GitHub Actions.
