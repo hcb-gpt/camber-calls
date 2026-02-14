@@ -9,7 +9,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-PIPEDREAM_URL="https://eopz0oyin0j45bv.m.pipedream.net"
+PD_SHADOW_URL="${PD_SHADOW_URL:-}"
 LOG_FILE="$REPO_DIR/shadow_results_$(date +%Y%m%d_%H%M%S).jsonl"
 
 # Load env if exists
@@ -22,6 +22,11 @@ fi
 # Check required vars
 if [[ -z "${SUPABASE_URL:-}" ]] || [[ -z "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
   echo "ERROR: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY required"
+  exit 1
+fi
+
+if [[ -z "$PD_SHADOW_URL" ]]; then
+  echo "ERROR: PD_SHADOW_URL required"
   exit 1
 fi
 
@@ -73,7 +78,7 @@ for IID in $IDS; do
     '. + {interaction_id: $sid, source: "shadow_batch"}')
 
   # Send to pipedream
-  RESULT=$(curl -s -X POST "$PIPEDREAM_URL" \
+  RESULT=$(curl -s -X POST "$PD_SHADOW_URL" \
     -H "Content-Type: application/json" \
     -d "$SHADOW_PAYLOAD")
 
