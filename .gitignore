@@ -22,5 +22,17 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Temp
+.temp/
+supabase/.temp/
+
+# Artifacts (backfill runs, spotcheck outputs)
+artifacts/
+
 # Claude Code local settings
 .claude/
