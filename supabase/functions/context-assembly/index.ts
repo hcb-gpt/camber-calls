@@ -1,13 +1,19 @@
 /**
- * context-assembly Edge Function v1.8.0
+ * context-assembly Edge Function v1.9.0
  * Assembles LLM-ready context_package from span_id (SPAN-FIRST)
  *
- * @version 1.8.0
+ * @version 1.9.0
  * @date 2026-02-13
  * @purpose Provide rich context for AI Router project attribution
  * @port 6-source candidate collection from process-call v3.9.6
  *
  * CORE PRINCIPLE: span_id is the unit of truth. Calls are containers only.
+ *
+ * v1.9.0 Changes (AI-ready Geo Signal Enrichment):
+ * - NEW: Candidate evidence now includes geo_signal summary:
+ *   { score, dominant_role, role_counts, place_count }
+ * - NEW: Geo scoring stays weak by design (never sufficient for auto-assign)
+ * - NEW: Role-aware geo aggregation (destination/origin/proximity) per project
  *
  * v1.8.0 Changes (Journal Context Poisoning Fix):
  * - NEW: journal claims/loops are contact-scoped (same contact_id OR same phone)
@@ -59,7 +65,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const ASSEMBLY_VERSION = "v1.8.0"; // v1.8.0: journal contact-scoping + null-contact guard
+const ASSEMBLY_VERSION = "v1.9.0"; // v1.9.0: AI-ready geo signal enrichment
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_TRANSCRIPT_CHARS = 8000;
@@ -146,12 +152,23 @@ interface AliasMatch {
   snippet?: string;
 }
 
+type PlaceRole = "proximity" | "origin" | "destination";
+
+interface GeoSignal {
+  // Weak signal score (0.05-0.55): useful for AI tie-breaking, never for solo auto-assign.
+  score: number;
+  dominant_role: PlaceRole;
+  role_counts: Record<PlaceRole, number>;
+  place_count: number;
+}
+
 interface CandidateEvidence {
   sources: string[];
   affinity_weight: number;
   assigned: boolean;
   alias_matches: AliasMatch[];
   geo_distance_km?: number;
+  geo_signal?: GeoSignal;
   weak_only?: boolean; // true if ALL alias evidence is weak (first-name-only, short token)
 }
 
@@ -177,7 +194,7 @@ interface PlaceMention {
   geo_place_id: string | null;
   lat: number | null;
   lon: number | null;
-  role: "proximity" | "origin" | "destination";
+  role: PlaceRole;
   trigger_verb: string | null;
   char_offset: number;
   snippet: string;
@@ -436,6 +453,42 @@ function haversineDistanceKm(
   return R * c;
 }
 
+function emptyRoleCounts(): Record<PlaceRole, number> {
+  return { proximity: 0, origin: 0, destination: 0 };
+}
+
+function dominantRoleFromCounts(counts: Record<PlaceRole, number>): PlaceRole {
+  const destination = counts.destination || 0;
+  const origin = counts.origin || 0;
+  const proximity = counts.proximity || 0;
+
+  // Tie-break policy prefers directional roles over proximity.
+  if (destination >= origin && destination >= proximity) return "destination";
+  if (origin >= destination && origin >= proximity) return "origin";
+  return "proximity";
+}
+
+function computeGeoWeakScore(
+  minDistanceKm: number,
+  roleCounts: Record<PlaceRole, number>,
+  placeCount: number,
+): number {
+  // Base distance signal: 0..0.35 across the 50km window.
+  const normalizedDistance = Math.max(0, Math.min(1, 1 - (minDistanceKm / GEO_MAX_DISTANCE_KM)));
+  const distanceScore = normalizedDistance * 0.35;
+
+  // Directional phrasing adds weak corroboration, never enough to stand alone.
+  const directionalHits = (roleCounts.destination || 0) + (roleCounts.origin || 0);
+  const roleBoost = directionalHits > 0 ? 0.12 : 0;
+
+  // Multiple distinct place mentions can reinforce confidence slightly.
+  const placeBoost = Math.min(0.08, Math.max(0, placeCount - 1) * 0.02);
+
+  // Always keep geo in weak band.
+  const raw = 0.05 + distanceScore + roleBoost + placeBoost;
+  return Math.max(0.05, Math.min(0.55, raw));
+}
+
 /** Find callback phrases and return snippets (<=80 chars) around them */
 function findCallbackPhraseSpans(
   transcript: string,
@@ -470,7 +523,7 @@ function detectPlaceRole(
   transcriptLower: string,
   placeIdx: number,
   placeName: string,
-): { role: "proximity" | "origin" | "destination"; trigger_verb: string | null } {
+): { role: PlaceRole; trigger_verb: string | null } {
   // Look in a window before the place mention for verb patterns
   const VERB_WINDOW = 60; // Characters before place to search for verbs
   const windowStart = Math.max(0, placeIdx - VERB_WINDOW);
@@ -862,9 +915,16 @@ Deno.serve(async (req: Request) => {
       sources: string[];
       alias_matches: AliasMatch[];
       geo_distance_km?: number;
+      geo_signal?: GeoSignal;
     }>();
 
-    const addCandidate = (pid: string, source: string, weight = 0, geo_distance_km?: number) => {
+    const addCandidate = (
+      pid: string,
+      source: string,
+      weight = 0,
+      geo_distance_km?: number,
+      geo_signal?: GeoSignal,
+    ) => {
       if (!pid) return;
       const cur = candidatesById.get(pid) || {
         project_id: pid,
@@ -879,6 +939,24 @@ Deno.serve(async (req: Request) => {
         cur.geo_distance_km = cur.geo_distance_km !== undefined
           ? Math.min(cur.geo_distance_km, geo_distance_km)
           : geo_distance_km;
+      }
+      if (geo_signal) {
+        if (!cur.geo_signal) {
+          cur.geo_signal = geo_signal;
+        } else {
+          const mergedCounts: Record<PlaceRole, number> = {
+            proximity: (cur.geo_signal.role_counts.proximity || 0) + (geo_signal.role_counts.proximity || 0),
+            origin: (cur.geo_signal.role_counts.origin || 0) + (geo_signal.role_counts.origin || 0),
+            destination: (cur.geo_signal.role_counts.destination || 0) +
+              (geo_signal.role_counts.destination || 0),
+          };
+          cur.geo_signal = {
+            score: Math.max(cur.geo_signal.score, geo_signal.score),
+            dominant_role: dominantRoleFromCounts(mergedCounts),
+            role_counts: mergedCounts,
+            place_count: Math.max(cur.geo_signal.place_count, geo_signal.place_count),
+          };
+        }
       }
       candidatesById.set(pid, cur);
     };
@@ -1096,7 +1174,7 @@ Deno.serve(async (req: Request) => {
             lat: number;
             lon: number;
             char_offset: number;
-            role: "proximity" | "origin" | "destination";
+            role: PlaceRole;
             trigger_verb: string | null;
             snippet: string;
           }> = [];
@@ -1186,7 +1264,14 @@ Deno.serve(async (req: Request) => {
               .eq("projects.project_kind", VALID_PROJECT_KIND);
 
             if (!geoErr && projectGeos?.length) {
-              const nearbyProjectsWithDistance = new Map<string, number>();
+              const nearbyProjects = new Map<
+                string,
+                {
+                  min_distance_km: number;
+                  role_counts: Record<PlaceRole, number>;
+                  place_names: Set<string>;
+                }
+              >();
 
               for (const place of mentionedPlaces) {
                 for (const pg of projectGeos) {
@@ -1200,24 +1285,47 @@ Deno.serve(async (req: Request) => {
                   );
 
                   if (distance <= GEO_MAX_DISTANCE_KM) {
-                    const existing = nearbyProjectsWithDistance.get(pg.project_id);
-                    if (existing === undefined || distance < existing) {
-                      nearbyProjectsWithDistance.set(pg.project_id, distance);
-                    }
+                    const existing = nearbyProjects.get(pg.project_id) || {
+                      min_distance_km: Number.POSITIVE_INFINITY,
+                      role_counts: emptyRoleCounts(),
+                      place_names: new Set<string>(),
+                    };
+                    existing.min_distance_km = Math.min(existing.min_distance_km, distance);
+                    existing.role_counts[place.role] = (existing.role_counts[place.role] || 0) + 1;
+                    existing.place_names.add(place.name);
+                    nearbyProjects.set(pg.project_id, existing);
                   }
                 }
               }
 
-              const sortedNearby = Array.from(nearbyProjectsWithDistance.entries())
-                .sort((a, b) => a[1] - b[1])
+              const sortedNearby = Array.from(nearbyProjects.entries())
+                .sort((a, b) => a[1].min_distance_km - b[1].min_distance_km)
                 .slice(0, GEO_MAX_CANDIDATES);
 
-              for (const [pid, distance] of sortedNearby) {
-                addCandidate(pid, "geo_proximity", 0, Math.round(distance * 10) / 10);
+              for (const [pid, signal] of sortedNearby) {
+                const placeCount = signal.place_names.size;
+                const weakGeoScore = computeGeoWeakScore(
+                  signal.min_distance_km,
+                  signal.role_counts,
+                  placeCount,
+                );
+                addCandidate(
+                  pid,
+                  "geo_proximity",
+                  0,
+                  Math.round(signal.min_distance_km * 10) / 10,
+                  {
+                    score: Math.round(weakGeoScore * 100) / 100,
+                    dominant_role: dominantRoleFromCounts(signal.role_counts),
+                    role_counts: signal.role_counts,
+                    place_count: placeCount,
+                  },
+                );
               }
 
               if (sortedNearby.length > 0) {
                 warnings.push(`geo_candidates_added:${sortedNearby.length}`);
+                warnings.push("geo_ai_signal_enriched");
               }
             }
           }
@@ -1412,6 +1520,7 @@ Deno.serve(async (req: Request) => {
           assigned: meta.assigned,
           alias_matches: meta.alias_matches,
           geo_distance_km: meta.geo_distance_km,
+          geo_signal: meta.geo_signal,
           weak_only: weakOnly || undefined,
         },
       });
@@ -1431,6 +1540,9 @@ Deno.serve(async (req: Request) => {
       if (b.evidence.affinity_weight !== a.evidence.affinity_weight) {
         return b.evidence.affinity_weight - a.evidence.affinity_weight;
       }
+      const aGeoScore = a.evidence.geo_signal?.score || 0;
+      const bGeoScore = b.evidence.geo_signal?.score || 0;
+      if (bGeoScore !== aGeoScore) return bGeoScore - aGeoScore;
       const aGeoOnly = a.evidence.sources.length === 1 && a.evidence.sources[0] === "geo_proximity";
       const bGeoOnly = b.evidence.sources.length === 1 && b.evidence.sources[0] === "geo_proximity";
       if (aGeoOnly !== bGeoOnly) return aGeoOnly ? 1 : -1;
@@ -1492,10 +1604,12 @@ Deno.serve(async (req: Request) => {
             .limit(candidateProjectIds.length * 12);
 
           if (!claimsErr && !loopsErr) {
-            const callIds = Array.from(new Set([
-              ...(claimsData || []).map((c) => c.call_id).filter(Boolean),
-              ...(loopsData || []).map((l) => l.call_id).filter(Boolean),
-            ] as string[]));
+            const callIds = Array.from(
+              new Set([
+                ...(claimsData || []).map((c) => c.call_id).filter(Boolean),
+                ...(loopsData || []).map((l) => l.call_id).filter(Boolean),
+              ] as string[]),
+            );
 
             const sourceCalls = new Map<string, { contact_id: string | null; contact_phone: string | null }>();
             if (callIds.length > 0) {

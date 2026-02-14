@@ -1,15 +1,15 @@
 /**
- * morning-digest Edge Function v1.0.0
+ * morning-digest Edge Function v1.2.0
  * Returns a structured daily digest for the Camber operator (Chad).
  *
- * @version 1.0.0
+ * @version 1.2.0
  * @date 2026-02-14
  * @purpose Dead-end consumer — surfaces actionable intelligence from pipeline data
  *
  * DESIGN:
  * - READ-ONLY: SELECT queries only, no writes
  * - Returns 5 sections: unresolved_signals, open_loops, review_pressure, recent_claims, pipeline_health
- * - AUTH: verify_jwt=true (operator-facing, not machine-to-machine)
+ * - AUTH: verify_jwt=false + X-Edge-Secret (Pattern A, pipeline internal)
  *
  * SECTIONS:
  * 1. Unresolved signals — top 5 from striking_signals by score DESC, grouped by project
@@ -21,7 +21,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const FUNCTION_VERSION = "v1.0.0";
+const FUNCTION_VERSION = "v1.2.0";
 const jsonHeaders = { "Content-Type": "application/json", "Connection": "keep-alive" };
 
 Deno.serve(async (req: Request) => {
@@ -32,6 +32,16 @@ Deno.serve(async (req: Request) => {
       status: 405,
       headers: jsonHeaders,
     });
+  }
+
+  // AUTH: X-Edge-Secret (Pattern A — pipeline internal)
+  const edgeSecret = req.headers.get("X-Edge-Secret") || req.headers.get("x-edge-secret");
+  const expectedSecret = Deno.env.get("EDGE_SHARED_SECRET");
+  if (!expectedSecret || edgeSecret !== expectedSecret) {
+    return new Response(
+      JSON.stringify({ error: "unauthorized", hint: "X-Edge-Secret required" }),
+      { status: 401, headers: jsonHeaders },
+    );
   }
 
   const db = createClient(

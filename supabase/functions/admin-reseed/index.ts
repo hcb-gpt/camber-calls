@@ -732,6 +732,8 @@ Deno.serve(async (req: Request) => {
     // Call context-assembly -> ai-router for each new span
     const contextAssemblyUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/context-assembly`;
     const aiRouterUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/ai-router`;
+    const strikingDetectUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/striking-detect`;
+    const journalExtractUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/journal-extract`;
     const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const edgeSecret = Deno.env.get("EDGE_SHARED_SECRET");
 
@@ -780,6 +782,46 @@ Deno.serve(async (req: Request) => {
         if (!routerResp.ok) {
           console.error(`[admin-reseed] ai-router failed for span ${spanId}: ${routerResp.status}`);
         } else {
+          let routerData: any = null;
+          try {
+            routerData = await routerResp.json();
+          } catch {
+            // Non-fatal: keep reseed success even if router response isn't parseable.
+          }
+
+          // Post-hook 1: striking-detect (always attempt, non-blocking).
+          fetch(strikingDetectUrl, {
+            method: "POST",
+            headers: internalHeaders,
+            body: JSON.stringify({
+              span_id: spanId,
+              interaction_id,
+              source: "admin-reseed",
+            }),
+          }).catch((e: unknown) => {
+            const msg = e instanceof Error ? e.message : "Unknown error";
+            console.error(`[admin-reseed] striking-detect post-hook failed for span ${spanId}: ${msg}`);
+          });
+
+          // Post-hook 2: journal-extract (only when router assigns a project; non-blocking).
+          const appliedProjectId = routerData?.gatekeeper?.applied_project_id;
+          const routerDecision = routerData?.decision;
+          if (routerDecision === "assign" && appliedProjectId) {
+            fetch(journalExtractUrl, {
+              method: "POST",
+              headers: internalHeaders,
+              body: JSON.stringify({
+                span_id: spanId,
+                interaction_id,
+                project_id: appliedProjectId,
+                source: "admin-reseed",
+              }),
+            }).catch((e: unknown) => {
+              const msg = e instanceof Error ? e.message : "Unknown error";
+              console.error(`[admin-reseed] journal-extract post-hook failed for span ${spanId}: ${msg}`);
+            });
+          }
+
           console.log(`[admin-reseed] Rerouted span ${spanId}`);
         }
       } catch (e: unknown) {

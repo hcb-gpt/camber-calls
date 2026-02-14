@@ -13,7 +13,7 @@
  * - Does NOT affect attribution — this is a separate perception channel
  * - High-striking spans (>= 0.7) get surfaced for attention
  *
- * AUTH: X-Edge-Secret + provenance allowlist (internal machine-to-machine)
+ * AUTH: X-Edge-Secret == EDGE_SHARED_SECRET (internal machine-to-machine)
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -23,12 +23,6 @@ const STRIKING_VERSION = "v1.0.0";
 const PROMPT_VERSION = "v1.0.0";
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
-
-const ALLOWED_PROVENANCE_SOURCES = [
-  "segment-call",
-  "admin-reseed",
-  "test",
-];
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
@@ -146,11 +140,8 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  const provenanceSource = body.source || "unknown";
-
   const hasValidEdgeSecret = expectedSecret &&
-    edgeSecretHeader === expectedSecret &&
-    ALLOWED_PROVENANCE_SOURCES.includes(provenanceSource);
+    edgeSecretHeader === expectedSecret;
 
   if (!hasValidEdgeSecret) {
     return new Response(
@@ -158,7 +149,7 @@ Deno.serve(async (req: Request) => {
         ok: false,
         error: "unauthorized",
         error_code: "auth_failed",
-        hint: "Requires X-Edge-Secret with allowlisted source",
+        hint: "Requires X-Edge-Secret matching EDGE_SHARED_SECRET",
         version: STRIKING_VERSION,
       }),
       { status: 401, headers: jsonHeaders },

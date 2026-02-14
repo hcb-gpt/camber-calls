@@ -6,7 +6,7 @@
  * @date 2026-01-31
  * @purpose Segment transcripts into N spans for multi-project attribution
  *
- * Auth: X-Edge-Secret + provenance allowlist (verify_jwt: false)
+ * Auth: X-Edge-Secret == EDGE_SHARED_SECRET (verify_jwt: false)
  * Called from: segment-call only
  *
  * STOPLINES (from CLAUDE.md):
@@ -49,11 +49,6 @@ function structuredLog(
     console.log(JSON.stringify(log));
   }
 }
-
-// ============================================================
-// AUTH CONFIGURATION
-// ============================================================
-const ALLOWED_PROVENANCE_SOURCES = ["segment-call", "admin-reseed", "edge", "test"];
 
 // ============================================================
 // GUARDRAIL DEFAULTS
@@ -131,7 +126,7 @@ Deno.serve(async (req: Request) => {
   }
 
   // ============================================================
-  // AUTH GATE: X-Edge-Secret + provenance allowlist
+  // AUTH GATE: X-Edge-Secret
   // ============================================================
   const edgeSecretHeader = req.headers.get("X-Edge-Secret");
   const expectedSecret = Deno.env.get("EDGE_SHARED_SECRET");
@@ -148,10 +143,9 @@ Deno.serve(async (req: Request) => {
 
   const provenanceSource = body.source || "unknown";
 
-  // Strict auth: X-Edge-Secret + valid provenance
+  // Strict auth: matching shared edge secret
   const hasValidAuth = expectedSecret &&
-    edgeSecretHeader === expectedSecret &&
-    ALLOWED_PROVENANCE_SOURCES.includes(provenanceSource);
+    edgeSecretHeader === expectedSecret;
 
   if (!hasValidAuth) {
     console.error(
@@ -162,7 +156,7 @@ Deno.serve(async (req: Request) => {
         ok: false,
         error: "unauthorized",
         error_code: "auth_failed",
-        hint: "Requires X-Edge-Secret with valid provenance source",
+        hint: "Requires X-Edge-Secret matching EDGE_SHARED_SECRET",
         version: SEGMENT_LLM_VERSION,
       }),
       { status: 401, headers: { "Content-Type": "application/json" } },

@@ -1,19 +1,30 @@
 /**
- * process-call Edge Function v4.3.0
+ * process-call Edge Function v4.3.3
  * Full v3.6 pipeline in Supabase - Ported from v4.0.22 context_assembly
  *
- * @version 4.3.0
- * @date 2026-02-09
+ * @version 4.3.3
+ * @date 2026-02-14
  * @port context_assembly v4.0.22 - 6-source ranking, word boundaries, speaker stripping
  *
  * PR-12 HARDENING:
- * - JWT + provenance gate (like context-assembly)
+ * - JWT + edge-secret gate
  * - project_kind='client' + status filters on all candidate sources
  * - No silent OK paths
  *
  * v4.2.0 CHANGES (attribution gap fix):
  * - Write candidate_projects to interactions
  * - Call auto_assign_project() after upsert to close PR-12 policy gap
+ *
+ * v4.3.2 CHANGES (lineage persistence):
+ * - Persist zapier_zap_id and zapier_run_id from _zapier_ingest_meta into calls_raw.
+ *
+ * v4.3.3 CHANGES (shadow replay support):
+ * - Persist `is_shadow` on calls_raw + interactions.
+ * - Normalize provenance source via ALLOWED_PROVENANCE_SOURCES (includes `shadow`).
+ *
+ * v4.3.1 CHANGES (auth hardening):
+ * - X-Edge-Secret path no longer gates on payload provenance source.
+ *   If EDGE_SHARED_SECRET matches, request is authenticated.
  *
  * v4.3.0 CHANGES (pipeline chain fix):
  * - Chain to segment-call after successful ingestion (fire-and-forget)
@@ -22,10 +33,26 @@
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { normalizePhoneForLookup } from "./phone_lookup.ts";
 
-const PROCESS_CALL_VERSION = "v4.3.0"; // pipeline chain fix: segment-call after ingestion
+const PROCESS_CALL_VERSION = "v4.3.3"; // shadow replay + auth hardening + lineage persistence + pipeline chain fix
 const GATE = { PASS: "PASS", SKIP: "SKIP", NEEDS_REVIEW: "NEEDS_REVIEW" };
 const ID_PATTERN = /^cll_[a-zA-Z0-9_]+$/;
+const ALLOWED_PROVENANCE_SOURCES = [
+  "openphone",
+  "zapier",
+  "admin-reseed",
+  "shadow",
+  "edge",
+  "process-call",
+  "segment-call",
+];
+
+function normalizeProvenanceSource(source: unknown): string {
+  const raw = String(source || "edge").trim().toLowerCase();
+  if (!raw) return "edge";
+  return ALLOWED_PROVENANCE_SOURCES.includes(raw) ? raw : "edge";
+}
 
 // ============================================================
 // PROJECT FILTERS (PR-11/PR-12: Only client projects with valid status)
@@ -40,17 +67,6 @@ const VALID_PROJECT_KIND = "client";
 const ADMIN_USER_IDS: string[] = [
   // Add Supabase auth.users.id values here
   // Example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-];
-
-// ============================================================
-// PROVENANCE GATE (PR-12)
-// Allowed sources that may call this endpoint
-// ============================================================
-const ALLOWED_PROVENANCE_SOURCES = [
-  "zapier",
-  "n8n",
-  "edge", // internal edge function calls
-  "test", // synthetic tests
 ];
 
 // ============================================================
@@ -196,13 +212,10 @@ Deno.serve(async (req: Request) => {
   // ============================================================
   const authHeader = req.headers.get("Authorization");
   const edgeSecret = req.headers.get("X-Edge-Secret");
-  const provenanceSource = (raw.source || "unknown").toLowerCase();
-
-  // Check edge secret first (for pipeline sources like Zapier/Pipedream/n8n)
+  // Check edge secret first (for pipeline machine-to-machine calls).
   const expectedSecret = Deno.env.get("EDGE_SHARED_SECRET");
   const hasValidEdgeSecret = expectedSecret &&
-    edgeSecret === expectedSecret &&
-    ALLOWED_PROVENANCE_SOURCES.includes(provenanceSource);
+    edgeSecret === expectedSecret;
 
   // If no valid edge secret, require JWT auth
   if (!hasValidEdgeSecret) {
@@ -267,8 +280,10 @@ Deno.serve(async (req: Request) => {
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
   );
+  const provenance_source = normalizeProvenanceSource(raw.source);
   const iid = raw.interaction_id || raw.call_id || `unknown_${run_id}`;
   const id_gen = !raw.interaction_id && !raw.call_id;
+  const is_shadow = raw.is_shadow === true || iid.startsWith("cll_SHADOW_") || provenance_source === "shadow";
 
   let audit_id: number | null = null, cr_uuid: string | null = null;
   let contact_id: string | null = null, contact_name: string | null = null;
@@ -292,6 +307,10 @@ Deno.serve(async (req: Request) => {
   }>();
   const sources_used: string[] = [];
   const warnings: string[] = [];
+  const raw_source = String(raw.source || "edge").trim().toLowerCase();
+  if (raw_source && raw_source !== provenance_source) {
+    warnings.push(`source_normalized:${raw_source}->${provenance_source}`);
+  }
 
   try {
     // IDEMPOTENCY
@@ -299,7 +318,7 @@ Deno.serve(async (req: Request) => {
       const { error } = await db.from("idempotency_keys").insert({
         key: iid,
         interaction_id: iid,
-        source: raw.source || "edge",
+        source: provenance_source,
         router_version: PROCESS_CALL_VERSION,
       });
       if (
@@ -347,13 +366,14 @@ Deno.serve(async (req: Request) => {
     // M1: Normalize input
     const n = m1(raw);
     const phone = n.to_phone || n.other_party_phone || n.contact_phone;
+    const lookupPhone = normalizePhoneForLookup(phone);
 
     // ========================================
     // CONTACT RESOLUTION
     // ========================================
-    if (phone) {
+    if (lookupPhone) {
       const { data } = await db.rpc("lookup_contact_by_phone", {
-        p_phone: phone,
+        p_phone: lookupPhone,
       });
       if (data?.[0]) {
         contact_id = data[0].contact_id;
@@ -520,7 +540,13 @@ Deno.serve(async (req: Request) => {
                 ? "alias_match"
                 : (p.name.toLowerCase() === termLower ? "name_match" : "location_match");
 
-              const cur = candidatesById.get(p.id) || {
+              const cur: {
+                project_id: string;
+                assigned: boolean;
+                affinity_weight: number;
+                sources: string[];
+                alias_matches: { term: string; match_type: string }[];
+              } = candidatesById.get(p.id) || {
                 project_id: p.id,
                 assigned: false,
                 affinity_weight: 0,
@@ -728,9 +754,14 @@ Deno.serve(async (req: Request) => {
       transcript: n.transcript || null,
       recording_url: n.recording_url || n.beside_note_url || null,
       pipeline_version: PROCESS_CALL_VERSION,
+      is_shadow,
+      zapier_zap_id: raw._zapier_ingest_meta?.zap_id || null,
+      zapier_run_id: raw._zapier_ingest_meta?.run_id || null,
       raw_snapshot_json: {
         run_id,
         v: PROCESS_CALL_VERSION,
+        source: provenance_source,
+        is_shadow,
         gate: g.decision,
         contact_id,
         // PR-12: Store candidate info but DO NOT assign to interactions.project_id
@@ -783,6 +814,7 @@ Deno.serve(async (req: Request) => {
         review_reasons: [...g.reasons, "ai_candidate_only"],
         project_attribution_confidence: project_confidence,
         transcript_chars: n.transcript?.length || 0,
+        is_shadow,
       }, { onConflict: "interaction_id" });
 
       // ========================================
