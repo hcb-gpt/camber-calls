@@ -48,7 +48,6 @@ const ADMIN_USER_IDS: string[] = [
 // ============================================================
 const ALLOWED_PROVENANCE_SOURCES = [
   "zapier",
-  "pipedream",
   "n8n",
   "edge", // internal edge function calls
   "test", // synthetic tests

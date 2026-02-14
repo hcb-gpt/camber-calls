@@ -63,7 +63,7 @@ list_changed_files() {
   esac
 }
 
-secret_pattern='(sk-[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|sbp_[A-Za-z0-9_-]{10,}|SUPABASE_SERVICE_ROLE(_KEY)?[[:space:]]*[:=][[:space:]]*["'"'"'"'"'"'"]?[A-Za-z0-9._-]{16,}|Authorization:[[:space:]]*Bearer[[:space:]]+[A-Za-z0-9._-]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,}|[A-Za-z0-9.-]+\.pipedream\.net)'
+secret_pattern='(sk-[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|sbp_[A-Za-z0-9_-]{10,}|SUPABASE_SERVICE_ROLE(_KEY)?[[:space:]]*[:=][[:space:]]*["'"'"'"'"'"'"]?[A-Za-z0-9._-]{16,}|Authorization:[[:space:]]*Bearer[[:space:]]+[A-Za-z0-9._-]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{10,}\.[A-Za-z0-9._-]{10,})'
 allowlist_pattern='(\[REDACTED\]|<REDACTED>|YOUR_[A-Z0-9_]+|REPLACE_WITH_[A-Z0-9_]+|EXAMPLE|example|placeholder|DUMMY|TEST_)'
 
 candidates="$(collect_candidates || true)"

@@ -197,7 +197,7 @@ while IFS= read -r interaction_id; do
   fi
 
   # 2) Call admin-reseed
-  IDEM_KEY="shadow-batch-${RUN_ID}-${interaction_id}"
+  IDEM_KEY="shadow_batch-${RUN_ID}-${interaction_id}"
   echo "${IDEM_KEY}" > "${OUT_DIR}/idempotency_key.txt"
 
   set +e

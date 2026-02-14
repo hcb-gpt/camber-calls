@@ -70,5 +70,6 @@ Edge function versions tracked in code comments and `router_version` field writt
 
 ## Related
 
-- **Pipedream Workflow:** Minimal relay at `https://eopz0oyin0j45bv.m.pipedream.net`
+- **Pipeline Entry Point:** `https://rjhdwidddtfetbwqolof.supabase.co/functions/v1/process-call`
 - **Supabase Project:** `rjhdwidddtfetbwqolof`
+- **Replay/Shadow:** TODO — define direct Edge-native replacement workflow

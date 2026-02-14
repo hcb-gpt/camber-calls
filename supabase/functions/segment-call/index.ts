@@ -20,7 +20,6 @@ const SEGMENT_CALL_VERSION = "v2.4.0";
 const ALLOWED_PROVENANCE_SOURCES = [
   "process-call",
   "zapier",
-  "pipedream",
   "n8n",
   "edge",
   "test",
