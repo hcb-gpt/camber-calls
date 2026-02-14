@@ -1,0 +1,3 @@
+# shadow-replay: deterministic shadow replay into process-call pipeline
+verify_jwt = false
+
