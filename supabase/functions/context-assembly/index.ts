@@ -124,7 +124,18 @@ const SOURCE_SCORE_CROSS_CONTACT_CLAIM_MATCH = 0.20; // Source 10: unscoped clai
 const SOURCE_SCORE_MATERIAL_BUDGET_TIER = 0.40; // Source 11: material→budget tier→project match
 const SOURCE_SCORE_STRUCTURAL_TYPE_SINGLE = 0.50; // Source 12: structural type match (unique match)
 const SOURCE_SCORE_STRUCTURAL_TYPE_MULTI = 0.30; // Source 12: structural type match (multiple matches)
+const SOURCE_SCORE_COMMON_WORD_ALIAS_DEMOTION = 0.45; // Common-word alias demotion (e.g., "mystery white")
 const FLOATER_AFFINITY_DISCOUNT = 0.5; // Floater modifier: halve affinity weights for sources 2-3
+const COMMON_WORD_ALIAS_TERMS = new Set(["white"]);
+const WEAK_ALIAS_ONLY_SOURCES = new Set([
+  "transcript_scan",
+  "claim_content_match",
+  "material_structural_mentions",
+  "material_budget_tier_match",
+  "floater_anti_signal",
+  "correspondent_project_affinity",
+  "geo_proximity",
+]);
 
 // Structural keywords → foundation_type mapping
 const STRUCTURAL_KEYWORD_MAP: Record<string, string> = {
@@ -233,6 +244,7 @@ interface CandidateEvidence {
   claim_crossref_topics?: string[];
   claim_crossref_snippets?: string[];
   weak_only?: boolean; // true if ALL alias evidence is weak (first-name-only, short token)
+  common_word_alias_demoted?: boolean;
 }
 
 interface Candidate {
@@ -1046,6 +1058,25 @@ Deno.serve(async (req: Request) => {
       geo_distance_km?: number;
       geo_signal?: GeoSignal;
     }>();
+    const mysteryWhiteMaterialMentioned = transcript_text
+      ? /\bmystery\s+white\b/i.test(stripSpeakerLabels(transcript_text))
+      : false;
+    const commonWordAliasWarnings = new Set<string>();
+
+    // Load blocklist once, then enforce globally after all candidate sources are aggregated.
+    const { data: blockedRows } = await db
+      .from("project_attribution_blocklist")
+      .select("project_id")
+      .eq("active", true)
+      .eq("block_mode", "hard_block");
+    const blockedProjectIds = new Set(
+      (blockedRows || [])
+        .map((r: { project_id: string | null }) => r.project_id)
+        .filter((v): v is string => !!v),
+    );
+    if (blockedProjectIds.size > 0) {
+      console.log(`[context-assembly] Blocklist active: ${blockedProjectIds.size} projects`);
+    }
 
     const addCandidate = (
       pid: string,
@@ -1213,21 +1244,10 @@ Deno.serve(async (req: Request) => {
       // Fetch all projects + aliases for matching
       const { data: allProjects } = await db.from("projects").select("id, name, aliases, city, address");
 
-      // ── BLOCKLIST ENFORCEMENT (P0: Sittler fix) ──────────────────────
-      // Fetch hard-blocked project IDs and remove them from candidate pool
-      const { data: blockedRows } = await db
-        .from("project_attribution_blocklist")
-        .select("project_id")
-        .eq("active", true)
-        .eq("block_mode", "hard_block");
-      const blockedProjectIds = new Set((blockedRows || []).map((r: { project_id: string }) => r.project_id));
+      // Pre-filter transcript-scan project corpus by blocklist; final global filter is applied later.
       const projects = (allProjects || []).filter(
         (p: { id: string }) => !blockedProjectIds.has(p.id),
       );
-      if (blockedProjectIds.size > 0) {
-        console.log(`[context-assembly] Blocklist active: ${blockedProjectIds.size} projects filtered from candidates`);
-      }
-      // ── END BLOCKLIST ENFORCEMENT ────────────────────────────────────
 
       let aliasRows: Array<{ project_id: string; alias: string }> | null = null;
       try {
@@ -1302,6 +1322,14 @@ Deno.serve(async (req: Request) => {
               const matchType = fromAliasTable.some((a) => a.toLowerCase() === termLower)
                 ? "alias"
                 : (p.name.toLowerCase() === termLower ? "exact_project_name" : "city_or_location");
+              const isCommonWordAlias = matchType === "alias" && COMMON_WORD_ALIAS_TERMS.has(termLower);
+              if (isCommonWordAlias && mysteryWhiteMaterialMentioned) {
+                if (!commonWordAliasWarnings.has(termLower)) {
+                  warnings.push(`common_word_alias_ignored:${termLower}`);
+                  commonWordAliasWarnings.add(termLower);
+                }
+                continue;
+              }
 
               const cur: {
                 project_id: string;
@@ -2050,6 +2078,21 @@ Deno.serve(async (req: Request) => {
     }
 
     // ========================================
+    // GLOBAL BLOCKLIST ENFORCEMENT
+    // Apply after all source aggregation, before ranking/truncation.
+    // ========================================
+    if (blockedProjectIds.size > 0 && candidatesById.size > 0) {
+      let removed = 0;
+      for (const pid of blockedProjectIds) {
+        if (candidatesById.delete(pid)) removed += 1;
+      }
+      if (removed > 0) {
+        warnings.push(`blocklist_filtered_global:${removed}`);
+        console.log(`[context-assembly] Blocklist removed ${removed} aggregated candidates pre-rank`);
+      }
+    }
+
+    // ========================================
     // ENRICH CANDIDATES WITH PROJECT DETAILS
     // ========================================
     const candidateIds = Array.from(candidatesById.keys());
@@ -2119,10 +2162,26 @@ Deno.serve(async (req: Request) => {
       const hasStrongMatch = meta.alias_matches.some(
         (m) => classifyMatchStrength(m.term, m.match_type, details.name) === "strong",
       );
-      const weakOnly = hasAliasEvidence && !hasStrongMatch && !meta.assigned;
+      const projectNameTokens = tokenizeTextForOverlap(details.name).map((t) => t.toLowerCase());
+      const hasCommonWordAliasInName = projectNameTokens.some((t) => COMMON_WORD_ALIAS_TERMS.has(t));
+      const hasOnlyWeakSources = meta.sources.every((src) => WEAK_ALIAS_ONLY_SOURCES.has(src));
+      const commonWordAliasDemoted = mysteryWhiteMaterialMentioned &&
+        hasCommonWordAliasInName &&
+        !meta.assigned &&
+        hasOnlyWeakSources;
+      const weakOnly = (hasAliasEvidence && !hasStrongMatch && !meta.assigned) || commonWordAliasDemoted;
 
       if (weakOnly) {
         warnings.push(`weak_alias_only:${details.name}`);
+      }
+      if (commonWordAliasDemoted) {
+        warnings.push(`common_word_alias_demoted:${details.name}`);
+      }
+      const sourceScores = { ...meta.source_scores };
+      let sourceStrength = meta.source_strength;
+      if (commonWordAliasDemoted) {
+        sourceScores.common_word_alias_demotion = -SOURCE_SCORE_COMMON_WORD_ALIAS_DEMOTION;
+        sourceStrength = Math.max(0, sourceStrength - SOURCE_SCORE_COMMON_WORD_ALIAS_DEMOTION);
       }
 
       candidates.push({
@@ -2138,11 +2197,12 @@ Deno.serve(async (req: Request) => {
           affinity_weight: meta.affinity_weight,
           assigned: meta.assigned,
           alias_matches: meta.alias_matches,
-          source_scores: meta.source_scores,
-          source_strength: meta.source_strength,
+          source_scores: sourceScores,
+          source_strength: sourceStrength,
           geo_distance_km: meta.geo_distance_km,
           geo_signal: meta.geo_signal,
           weak_only: weakOnly || undefined,
+          common_word_alias_demoted: commonWordAliasDemoted || undefined,
         },
       });
     }
@@ -2158,6 +2218,9 @@ Deno.serve(async (req: Request) => {
         const aWeak = a.evidence.weak_only === true;
         const bWeak = b.evidence.weak_only === true;
         if (aWeak !== bWeak) return aWeak ? 1 : -1;
+        const aDemoted = a.evidence.common_word_alias_demoted === true;
+        const bDemoted = b.evidence.common_word_alias_demoted === true;
+        if (aDemoted !== bDemoted) return aDemoted ? 1 : -1;
         if (b.evidence.alias_matches.length !== a.evidence.alias_matches.length) {
           return b.evidence.alias_matches.length - a.evidence.alias_matches.length;
         }
