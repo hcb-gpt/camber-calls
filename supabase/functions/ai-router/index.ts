@@ -71,6 +71,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 import { parseLlmJson } from "../_shared/llm_json.ts";
 import { applyCommonAliasCorroborationGuardrail, isCommonWordAlias } from "./alias_guardrails.ts";
+import { applyBethanyRoadWinshipGuardrail } from "./bethany_winship_guardrail.ts";
 import { applyBizDevCommitmentGate } from "./bizdev_guardrails.ts";
 import { homeownerOverrideActsAsStrongAnchor } from "./homeowner_override_gate.ts";
 
@@ -926,7 +927,7 @@ Deno.serve(async (req: Request) => {
     const parsed = inferenceResult.parsed;
 
     let project_id = parsed.project_id || null;
-    const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
+    let confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
     const anchors: Anchor[] = Array.isArray(parsed.anchors) ? parsed.anchors : [];
     const suggested_aliases: SuggestedAlias[] = Array.isArray(parsed.suggested_aliases) ? parsed.suggested_aliases : [];
     const journal_references: JournalReference[] = Array.isArray(parsed.journal_references)
@@ -978,6 +979,24 @@ Deno.serve(async (req: Request) => {
         `[ai-router] Downgraded to review: common-word alias lacked corroboration for project ${project_id} (aliases=${
           common_alias_terms.join(",") || "unknown"
         })`,
+      );
+    }
+
+    const bethanyGuardrail = applyBethanyRoadWinshipGuardrail({
+      decision,
+      project_id,
+      confidence,
+      reasoning,
+      anchors: validatedAnchors,
+      candidates: context_package.candidates,
+    });
+    decision = bethanyGuardrail.decision;
+    project_id = bethanyGuardrail.project_id;
+    confidence = bethanyGuardrail.confidence;
+    reasoning = bethanyGuardrail.reasoning;
+    if (bethanyGuardrail.applied) {
+      console.log(
+        `[ai-router] Bethany guardrail forced assignment to Winship candidate ${bethanyGuardrail.chosen_project_id}`,
       );
     }
 
