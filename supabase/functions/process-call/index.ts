@@ -339,6 +339,12 @@ Deno.serve(async (req: Request) => {
   if (raw_source && raw_source !== provenance_source) {
     warnings.push(`source_normalized:${raw_source}->${provenance_source}`);
   }
+  const normalizedPreview = m1(raw);
+  const previewGate = m4(normalizedPreview);
+  const previewTerminalEmptyTranscript = isTerminalEmptyTranscript(
+    previewGate.reasons,
+    normalizedPreview.transcript,
+  );
 
   try {
     // IDEMPOTENCY
@@ -354,10 +360,42 @@ Deno.serve(async (req: Request) => {
         (error.message?.includes("duplicate") ||
           error.message?.includes("23505"))
       ) {
+        if (previewTerminalEmptyTranscript) {
+          const { error: interactionUpdateErr } = await db
+            .from("interactions")
+            .update({
+              needs_review: false,
+              review_reasons: ["terminal_empty_transcript", ...previewGate.reasons],
+              transcript_chars: normalizedPreview.transcript?.length || 0,
+            })
+            .eq("interaction_id", iid);
+          if (interactionUpdateErr) {
+            warnings.push(`duplicate_terminalize_interaction_error: ${interactionUpdateErr.message}`);
+          }
+
+          const { error: terminalizeErr } = await db
+            .from("review_queue")
+            .update({
+              status: "dismissed",
+              resolved_at: new Date().toISOString(),
+              resolved_by: "process-call",
+              resolution_action: "auto_dismiss",
+              resolution_notes: "terminal_empty_transcript",
+            })
+            .eq("interaction_id", iid)
+            .eq("status", "pending")
+            .is("span_id", null);
+          if (terminalizeErr) {
+            warnings.push(`duplicate_terminalize_review_queue_error: ${terminalizeErr.message}`);
+          }
+        }
+
         await db.from("event_audit").insert({
           interaction_id: iid,
           gate_status: "SKIP",
-          gate_reasons: ["G1_DUPLICATE_EXACT"],
+          gate_reasons: previewTerminalEmptyTranscript
+            ? ["G1_DUPLICATE_EXACT", "G4_EMPTY_TRANSCRIPT_TERMINALIZED"]
+            : ["G1_DUPLICATE_EXACT"],
           source_system: `edge_${PROCESS_CALL_VERSION}`,
           source_run_id: run_id,
           pipeline_version: PROCESS_CALL_VERSION,
@@ -369,6 +407,8 @@ Deno.serve(async (req: Request) => {
             decision: "SKIP",
             reason: "duplicate",
             interaction_id: iid,
+            terminalized_empty_transcript: previewTerminalEmptyTranscript,
+            warnings,
             ms: Date.now() - t0,
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
@@ -398,7 +438,7 @@ Deno.serve(async (req: Request) => {
     if (ad) audit_id = ad.id;
 
     // M1: Normalize input
-    const n = m1(raw);
+    const n = normalizedPreview;
     const partyPhones = resolveCallPartyPhones(n);
     const persistedDirection = partyPhones.direction === "unknown" ? n.direction || null : partyPhones.direction;
     const lookupPhone = normalizePhoneForLookup(partyPhones.otherPartyPhone);
@@ -776,7 +816,7 @@ Deno.serve(async (req: Request) => {
     }
 
     // GATE
-    const g = m4(n);
+    const g = previewGate;
     const terminalEmptyTranscript = isTerminalEmptyTranscript(g.reasons, n.transcript);
 
     // CALLS_RAW (primary storage - includes candidate info)
