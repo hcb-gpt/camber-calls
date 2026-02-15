@@ -256,7 +256,7 @@ Deno.serve(async (req: Request) => {
           cost_cents: Math.ceil(
             ((deepgramResult.metadata?.duration || 0) / 60) * 0.25,
           ),
-        }, { onConflict: "interaction_id,engine" });
+        }, { onConflict: "interaction_id,engine,transcript_variant" });
       } catch (e) {
         console.warn(
           "transcripts_comparison upsert failed:",
