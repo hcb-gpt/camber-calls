@@ -28,25 +28,41 @@ else
   fi
 fi
 
-run_sql() {
+guard_sql() {
   local sql="$1"
   local upper
-  upper="$(printf '%s' "${sql}" | tr '[:lower:]' '[:upper:]')"
+  local stripped
+  local first_kw
+
+  # Strip leading comments and psql meta commands for guard checks.
+  # - remove /* ... */ block comments
+  # - remove -- line comments
+  # - remove lines starting with "\" (psql meta commands like \echo, \set)
+  stripped="$(
+    printf '%s' "${sql}" \
+      | perl -0777 -pe 's@/\*.*?\*/@@sg; s/--.*$//mg; s/^\s*\\.*$//mg;' \
+      | tr -d $'\r'
+  )"
+  upper="$(printf '%s' "${stripped}" | tr '[:lower:]' '[:upper:]')"
+  first_kw="$(
+    printf '%s' "${upper}" \
+      | awk '{for (i=1;i<=NF;i++) {print $i; exit}}'
+  )"
 
   # Guard: read-only entry points only.
-  if [[ ! "${upper}" =~ ^[[:space:]]*(SELECT|WITH|EXPLAIN|SHOW) ]]; then
+  if [[ -z "${first_kw}" || ! "${first_kw}" =~ ^(SELECT|WITH|EXPLAIN|SHOW)$ ]]; then
     echo "ERROR: only read-only statements are allowed (SELECT/WITH/EXPLAIN/SHOW)." >&2
     exit 1
   fi
-
-  # Avoid false positives on identifiers like `created_at` by matching whole tokens only.
-  # Note: this is not a SQL parser; keywords inside string literals may still trip the guard.
-  local mutating_re
-  mutating_re='(^|[^A-Z0-9_])(INSERT|UPDATE|DELETE|UPSERT|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE)($|[^A-Z0-9_])'
-  if [[ "${upper}" =~ ${mutating_re} ]]; then
+  if [[ "${upper}" =~ (^|[^[:alnum:]_])(INSERT|UPDATE|DELETE|UPSERT|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE|VACUUM|ANALYZE|REFRESH|CALL|DO)([^[:alnum:]_]|$) ]]; then
     echo "ERROR: mutating SQL detected; query.sh is read-only." >&2
     exit 1
   fi
+}
+
+run_sql() {
+  local sql="$1"
+  guard_sql "${sql}"
 
   "${PSQL_BIN}" "${DATABASE_URL}" -X -v ON_ERROR_STOP=1 -P pager=off -c "${sql}"
 }
@@ -60,7 +76,9 @@ if [[ "${1:-}" == "--file" ]]; then
     echo "ERROR: SQL file not found: ${2}" >&2
     exit 1
   fi
-  run_sql "$(cat "${2}")"
+  # Guard-check the file contents, then execute via -f so psql meta commands work.
+  guard_sql "$(cat "${2}")"
+  "${PSQL_BIN}" "${DATABASE_URL}" -X -v ON_ERROR_STOP=1 -P pager=off -f "${2}"
   exit 0
 fi
 
