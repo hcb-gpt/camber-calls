@@ -1,13 +1,23 @@
 /**
- * context-assembly Edge Function v1.9.0
+ * context-assembly Edge Function v2.0.0
  * Assembles LLM-ready context_package from span_id (SPAN-FIRST)
  *
- * @version 1.9.0
- * @date 2026-02-13
+ * @version 2.0.0
+ * @date 2026-02-15
  * @purpose Provide rich context for AI Router project attribution
  * @port 6-source candidate collection from process-call v3.9.6
  *
  * CORE PRINCIPLE: span_id is the unit of truth. Calls are containers only.
+ *
+ * v2.0.0 Changes (4 New Candidate Sources + Floater Modifier):
+ * - NEW Source 9: OTHER_PARTY_TRADE_MATCH — parse speaker names, match contacts, find trade→projects
+ * - NEW Source 10: CROSS_CONTACT_CLAIM_MATCH — unscoped journal keyword search across all contacts
+ * - NEW Source 11: MATERIAL_BUDGET_TIER_MATCH — material keywords → budget tier → project contract_value
+ * - NEW Source 12: STRUCTURAL_TYPE_MATCH — structural keywords → foundation_type → project_building_specs
+ * - NEW Floater modifier: when is_internal=true AND floater_flag=true:
+ *     - Halve affinity weights (Sources 2-3) via FLOATER_AFFINITY_DISCOUNT
+ *     - Expand MAX_CANDIDATES from 8 to 12
+ *     - Unscope journal context (remove contact_id filter for claims/loops)
  *
  * v1.9.0 Changes (AI-ready Geo Signal Enrichment):
  * - NEW: Candidate evidence now includes geo_signal summary:
@@ -65,9 +75,10 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const ASSEMBLY_VERSION = "v1.9.0"; // v1.9.0: AI-ready geo signal enrichment
+const ASSEMBLY_VERSION = "v2.0.0"; // v2.0.0: 4 new candidate sources + floater modifier
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
+const MAX_CANDIDATES_FLOATER = 12; // Expanded for internal floater contacts
 const MAX_TRANSCRIPT_CHARS = 8000;
 const MAX_ALIAS_TERMS_PER_PROJECT = 25;
 const GMAIL_LOOKUP_DEFAULT_LOOKBACK_DAYS = 30;
@@ -90,6 +101,45 @@ const CALLBACK_PHRASES = [
   "as we discussed",
   "like we talked about",
 ];
+
+// =========================
+// SOURCE STRENGTH CALIBRATION
+// =========================
+const SOURCE_SCORE_GMAIL_CONTENT_MATCH = 0.45;
+const SOURCE_SCORE_MATERIAL_STRUCTURAL_BASE = 0.08;
+const SOURCE_SCORE_MATERIAL_STRUCTURAL_MAX = 0.45;
+const SOURCE_SCORE_CLAIM_CONTENT_MATCH_PER_SIGNAL = 0.35;
+const SOURCE_SCORE_OTHER_PARTY_TRADE_MATCH = 0.18;
+const SOURCE_SCORE_PROJECT_CONTACT = 0.22;
+const SOURCE_SCORE_FLOATER_ANTI_SIGNAL = -0.28;
+const SOURCE_SCORE_CROSS_CONTACT_CLAIM_MATCH = 0.20; // Source 10: unscoped claim keyword match (lower than contact-scoped)
+const SOURCE_SCORE_MATERIAL_BUDGET_TIER = 0.40; // Source 11: material→budget tier→project match
+const SOURCE_SCORE_STRUCTURAL_TYPE_SINGLE = 0.50; // Source 12: structural type match (unique match)
+const SOURCE_SCORE_STRUCTURAL_TYPE_MULTI = 0.30; // Source 12: structural type match (multiple matches)
+const FLOATER_AFFINITY_DISCOUNT = 0.5; // Floater modifier: halve affinity weights for sources 2-3
+
+// Structural keywords → foundation_type mapping
+const STRUCTURAL_KEYWORD_MAP: Record<string, string> = {
+  "slab house": "slab",
+  "slab on grade": "slab",
+  "slab foundation": "slab",
+  "basement": "basement",
+  "full basement": "basement",
+  "walk out basement": "basement",
+  "walkout basement": "basement",
+  "crawl space": "crawl",
+  "crawlspace": "crawl",
+  "crawl": "crawl",
+  "pier foundation": "pier",
+  "pier and beam": "pier",
+};
+
+// Budget tier midpoints for contract_value matching
+const TIER_MIDPOINTS: Record<string, number> = {
+  premium: 1500000,
+  mid_range: 900000,
+  budget: 600000,
+};
 
 // PR-11: Project status filter - only include active client projects
 const VALID_PROJECT_STATUSES = ["active", "warranty", "estimating"];
@@ -169,6 +219,8 @@ interface CandidateEvidence {
   alias_matches: AliasMatch[];
   geo_distance_km?: number;
   geo_signal?: GeoSignal;
+  source_scores?: Record<string, number>;
+  source_strength?: number;
   weak_only?: boolean; // true if ALL alias evidence is weak (first-name-only, short token)
 }
 
@@ -319,6 +371,36 @@ function findTermInText(textLower: string, termLower: string): number {
   const isWordChar = (ch: string) => /[a-z0-9]/i.test(ch);
   if (isWordChar(before) || isWordChar(after)) return -1;
   return idx;
+}
+
+function normalizeTradeLabel(value: string | null | undefined): string {
+  return (value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
+}
+
+function clamp(num: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, num));
+}
+
+function tokenizeTextForOverlap(text: string): string[] {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .split(/\s+/)
+    .filter((t) => t.length >= 4 || (t.length >= 3 && !/^\d+$/.test(t)))
+    .filter(Boolean);
+}
+
+function tokenOverlapRatio(transcriptTokens: string[], termTokens: string[]): number {
+  const needleSet = new Set(termTokens.map((t) => t.toLowerCase()).filter(Boolean));
+  if (needleSet.size === 0) return 0;
+  const transcriptSet = new Set(transcriptTokens.map((t) => t.toLowerCase()));
+  let overlap = 0;
+  for (const t of needleSet) {
+    if (transcriptSet.has(t)) {
+      overlap += 1;
+    }
+  }
+  return overlap / needleSet.size;
 }
 
 /** Normalize alias terms (dedupe, min length) */
@@ -752,6 +834,9 @@ Deno.serve(async (req: Request) => {
     let contact_name: string | null = null;
     let contact_phone: string | null = null;
     let event_at_utc: string | null = null;
+    let interaction_project_id: string | null = null;
+    let contact_trade: string | null = null;
+    let contact_is_internal = false; // v2.0.0: for floater modifier
     let fanout_class = "unknown";
     let effective_fanout = 0;
     let floater_flag = false; // Backwards compat: derived from fanout_class
@@ -767,6 +852,20 @@ Deno.serve(async (req: Request) => {
       contact_name = interaction.contact_name;
       contact_phone = interaction.contact_phone;
       event_at_utc = interaction.event_at_utc;
+      interaction_project_id = interaction.project_id || null;
+    }
+
+    if (contact_id) {
+      const { data: contactRow } = await db
+        .from("contacts")
+        .select("trade, is_internal, floats_between_projects")
+        .eq("id", contact_id)
+        .single();
+
+      if (contactRow) {
+        if (contactRow.trade) contact_trade = String(contactRow.trade);
+        contact_is_internal = !!contactRow.is_internal;
+      }
     }
 
     // v1.5.0: Fetch fanout data from contact_fanout table (DATA-9 D4 spec)
@@ -909,6 +1008,16 @@ Deno.serve(async (req: Request) => {
       }
     }
 
+    const gmailMentionedProjectIds: string[] = Array.from(
+      new Set(
+        email_context
+          .flatMap((item) => Array.isArray(item.mentioned_project_ids) ? item.mentioned_project_ids : [])
+          .filter((id) => !!id),
+      ),
+    );
+
+    let materialStructuralSignalScore = 0;
+
     // ========================================
     // 7-SOURCE CANDIDATE COLLECTION
     // (plus Source 8 Gmail context lookup above)
@@ -919,6 +1028,8 @@ Deno.serve(async (req: Request) => {
       affinity_weight: number;
       sources: string[];
       alias_matches: AliasMatch[];
+      source_scores: Record<string, number>;
+      source_strength: number;
       geo_distance_km?: number;
       geo_signal?: GeoSignal;
     }>();
@@ -929,6 +1040,7 @@ Deno.serve(async (req: Request) => {
       weight = 0,
       geo_distance_km?: number,
       geo_signal?: GeoSignal,
+      sourceScore = 0,
     ) => {
       if (!pid) return;
       const cur = candidatesById.get(pid) || {
@@ -937,9 +1049,15 @@ Deno.serve(async (req: Request) => {
         affinity_weight: 0,
         sources: [],
         alias_matches: [],
+        source_scores: {},
+        source_strength: 0,
       };
       if (!cur.sources.includes(source)) cur.sources.push(source);
       if (weight > 0) cur.affinity_weight = Math.max(cur.affinity_weight, weight);
+      if (sourceScore !== 0) {
+        cur.source_scores[source] = (cur.source_scores[source] || 0) + sourceScore;
+        cur.source_strength += sourceScore;
+      }
       if (geo_distance_km !== undefined) {
         cur.geo_distance_km = cur.geo_distance_km !== undefined
           ? Math.min(cur.geo_distance_km, geo_distance_km)
@@ -970,29 +1088,38 @@ Deno.serve(async (req: Request) => {
     if (contact_id) {
       const { data: pcRows } = await db
         .from("project_contacts")
-        .select("project_id")
+        .select("project_id, trade")
         .eq("contact_id", contact_id);
 
       if (pcRows?.length) {
         sources_used.push("project_contacts");
         for (const r of pcRows) {
           if (r.project_id) {
-            const cur = candidatesById.get(r.project_id) || {
-              project_id: r.project_id,
-              assigned: true,
-              affinity_weight: 0,
-              sources: ["project_contacts"],
-              alias_matches: [],
-            };
-            cur.assigned = true;
-            if (!cur.sources.includes("project_contacts")) cur.sources.push("project_contacts");
-            candidatesById.set(r.project_id, cur);
+            addCandidate(r.project_id, "project_contacts", 0, undefined, undefined, SOURCE_SCORE_PROJECT_CONTACT);
+            const cur = candidatesById.get(r.project_id);
+            if (cur) {
+              cur.assigned = true;
+              const rowTrade = normalizeTradeLabel(r.trade);
+              const contactTrade = normalizeTradeLabel(contact_trade);
+              if (rowTrade && contactTrade && rowTrade === contactTrade) {
+                addCandidate(
+                  r.project_id,
+                  "other_party_trade_match",
+                  0,
+                  undefined,
+                  undefined,
+                  SOURCE_SCORE_OTHER_PARTY_TRADE_MATCH,
+                );
+              }
+            }
           }
         }
       }
     }
 
     // SOURCE 2: correspondent_project_affinity
+    // v2.0.0 Floater modifier: halve affinity weights for internal floaters
+    const isInternalFloater = floater_flag && contact_is_internal;
     if (contact_id) {
       const { data: affRows } = await db
         .from("correspondent_project_affinity")
@@ -1003,7 +1130,19 @@ Deno.serve(async (req: Request) => {
         sources_used.push("correspondent_project_affinity");
         for (const r of affRows) {
           if (r.project_id) {
-            addCandidate(r.project_id, "correspondent_project_affinity", r.weight || 0);
+            let affinityWeight = Number(r.weight || 0);
+            // v2.0.0 Floater modifier: discount affinity for internal floaters
+            if (isInternalFloater) {
+              affinityWeight *= FLOATER_AFFINITY_DISCOUNT;
+            }
+            addCandidate(
+              r.project_id,
+              "correspondent_project_affinity",
+              affinityWeight,
+              undefined,
+              undefined,
+              affinityWeight,
+            );
           }
         }
       }
@@ -1018,8 +1157,30 @@ Deno.serve(async (req: Request) => {
         .limit(1);
 
       if (irows?.[0]?.project_id) {
-        addCandidate(irows[0].project_id, "interactions_existing_project");
+        addCandidate(
+          irows[0].project_id,
+          "interactions_existing_project",
+          0,
+          undefined,
+          undefined,
+          SOURCE_SCORE_PROJECT_CONTACT / 2,
+        );
         sources_used.push("interactions_existing_project");
+      }
+    }
+
+    // SOURCE 1.5: gmail_content_match (seed by email-mentioned projects)
+    if (gmailMentionedProjectIds.length > 0) {
+      sources_used.push("gmail_content_match");
+      for (const pid of gmailMentionedProjectIds) {
+        addCandidate(
+          pid,
+          "gmail_content_match",
+          0,
+          undefined,
+          undefined,
+          SOURCE_SCORE_GMAIL_CONTENT_MATCH,
+        );
       }
     }
 
@@ -1027,11 +1188,13 @@ Deno.serve(async (req: Request) => {
     let callbackSpans: string[] = [];
     const projectMentionSpans: string[] = [];
     const place_mentions: PlaceMention[] = [];
+    let transcriptTokens: string[] = [];
 
     // SOURCE 4-7: Transcript-based sources
     if (transcript_text) {
       const transcriptClean = stripSpeakerLabels(transcript_text);
       const transcriptLower = transcriptClean.toLowerCase();
+      transcriptTokens = tokenizeTextForOverlap(transcriptClean);
       callbackSpans = findCallbackPhraseSpans(transcriptClean, transcriptLower);
 
       // Fetch all projects + aliases for matching
@@ -1054,6 +1217,35 @@ Deno.serve(async (req: Request) => {
         if (!r.project_id || !r.alias) continue;
         if (!aliasByProject.has(r.project_id)) aliasByProject.set(r.project_id, []);
         aliasByProject.get(r.project_id)!.push(r.alias);
+      }
+
+      try {
+        const { data: materialRows } = await db
+          .from("material_signal_config")
+          .select("term, aliases, boost")
+          .eq("active", true);
+        if (materialRows?.length) {
+          for (const row of materialRows) {
+            const aliases = Array.isArray(row.aliases) ? row.aliases : [];
+            const terms = [row.term, ...aliases].map((v) => String(v || "").trim()).filter(Boolean);
+            const matchFound = terms.some((term) => {
+              const termLower = String(term).toLowerCase();
+              return findTermInText(transcriptLower, termLower) >= 0;
+            });
+
+            if (matchFound) {
+              const rowBoost = Number(row.boost || 0);
+              materialStructuralSignalScore += SOURCE_SCORE_MATERIAL_STRUCTURAL_BASE + Math.max(0, rowBoost);
+            }
+          }
+          materialStructuralSignalScore = clamp(
+            materialStructuralSignalScore,
+            0,
+            SOURCE_SCORE_MATERIAL_STRUCTURAL_MAX,
+          );
+        }
+      } catch {
+        warnings.push("material_signal_config_unavailable");
       }
 
       // SOURCE 4: Name/alias/location matches in transcript
@@ -1087,12 +1279,16 @@ Deno.serve(async (req: Request) => {
                 affinity_weight: number;
                 sources: string[];
                 alias_matches: AliasMatch[];
+                source_scores: Record<string, number>;
+                source_strength: number;
               } = candidatesById.get(p.id) || {
                 project_id: p.id,
                 assigned: false,
                 affinity_weight: 0,
                 sources: [],
                 alias_matches: [],
+                source_scores: {},
+                source_strength: 0,
               };
               if (!cur.sources.includes("transcript_scan")) cur.sources.push("transcript_scan");
               const snippet = snippetAround(transcriptClean, idx, term.length);
@@ -1340,6 +1536,381 @@ Deno.serve(async (req: Request) => {
       }
     }
 
+    if (materialStructuralSignalScore > 0 && candidatesById.size > 0) {
+      sources_used.push("material_structural_mentions");
+      for (const [pid] of candidatesById) {
+        addCandidate(
+          pid,
+          "material_structural_mentions",
+          0,
+          undefined,
+          undefined,
+          materialStructuralSignalScore,
+        );
+      }
+    }
+
+    if (floater_flag && candidatesById.size > 0) {
+      sources_used.push("floater_anti_signal");
+      for (const [pid] of candidatesById) {
+        addCandidate(
+          pid,
+          "floater_anti_signal",
+          0,
+          undefined,
+          undefined,
+          SOURCE_SCORE_FLOATER_ANTI_SIGNAL,
+        );
+      }
+    }
+
+    // SOURCE 8: Journal claim content overlap (transcript against active claims)
+    if (transcript_text && transcriptTokens.length > 0) {
+      const claimProjectIds = new Set<string>();
+      for (const pid of candidatesById.keys()) {
+        claimProjectIds.add(pid);
+      }
+      if (!claimProjectIds.size && interaction_project_id) {
+        claimProjectIds.add(interaction_project_id);
+      }
+
+      if (claimProjectIds.size > 0) {
+        try {
+          const { data: claimRows, error: claimErr } = await db
+            .from("journal_claims")
+            .select("project_id, call_id, claim_text")
+            .in("project_id", Array.from(claimProjectIds))
+            .eq("active", true)
+            .order("created_at", { ascending: false })
+            .limit(Math.max(8, claimProjectIds.size * 8));
+
+          if (!claimErr && claimRows?.length) {
+            const callIds = Array.from(
+              new Set((claimRows || []).map((c) => c.call_id).filter(Boolean)),
+            );
+            const claimSourceByCall = new Map<string, { contact_id: string | null; contact_phone: string | null }>();
+
+            if (callIds.length > 0) {
+              const { data: sourceCallRows } = await db
+                .from("interactions")
+                .select("interaction_id, contact_id, contact_phone")
+                .in("interaction_id", callIds);
+
+              for (const row of (sourceCallRows || [])) {
+                claimSourceByCall.set(row.interaction_id, {
+                  contact_id: row.contact_id,
+                  contact_phone: row.contact_phone,
+                });
+              }
+            }
+
+            const bestClaimMatchByProject = new Map<
+              string,
+              { score: number; snippets: string[] }
+            >();
+
+            for (const row of claimRows) {
+              if (!row.project_id || !row.claim_text) continue;
+              const source = claimSourceByCall.get(row.call_id);
+
+              const isMatchedScope = contact_id
+                ? source ? matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone) : false
+                : interaction_project_id
+                ? row.project_id === interaction_project_id
+                : false;
+
+              if (!isMatchedScope) continue;
+
+              const overlap = tokenOverlapRatio(transcriptTokens, tokenizeTextForOverlap(row.claim_text));
+              if (overlap <= 0) continue;
+
+              const existing = bestClaimMatchByProject.get(row.project_id) || { score: 0, snippets: [] };
+              existing.score = Math.max(
+                existing.score,
+                clamp(overlap * 2.2, 0, SOURCE_SCORE_CLAIM_CONTENT_MATCH_PER_SIGNAL),
+              );
+              if (existing.snippets.length < 2) {
+                const trimmed = String(row.claim_text).slice(0, 120);
+                existing.snippets.push(trimmed);
+              }
+              bestClaimMatchByProject.set(row.project_id, existing);
+            }
+
+            if (bestClaimMatchByProject.size > 0) {
+              sources_used.push("claim_content_match");
+              for (const [pid, match] of bestClaimMatchByProject) {
+                addCandidate(
+                  pid,
+                  "claim_content_match",
+                  0,
+                  undefined,
+                  undefined,
+                  clamp(match.score, 0, SOURCE_SCORE_CLAIM_CONTENT_MATCH_PER_SIGNAL),
+                );
+
+                const cur = candidatesById.get(pid);
+                if (cur) {
+                  for (const snippet of match.snippets) {
+                    cur.alias_matches.push({
+                      term: "claim_content_match",
+                      match_type: "claim_content_match",
+                      snippet,
+                    });
+                  }
+                }
+              }
+            }
+          }
+        } catch {
+          warnings.push("claim_content_match_skipped");
+        }
+      }
+    }
+
+    // ========================================
+    // SOURCE 9: OTHER_PARTY_TRADE_MATCH (v2.0.0)
+    // Parse non-contact speaker names from transcript, fuzzy match to contacts,
+    // get their trade, find projects with that trade via project_contacts.
+    // ========================================
+    if (transcript_text) {
+      try {
+        const speakerLabelPattern = /(?:^|\n)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*:/g;
+        const detectedNames = new Set<string>();
+        let speakerMatch: RegExpExecArray | null;
+        while ((speakerMatch = speakerLabelPattern.exec(transcript_text)) !== null) {
+          const name = speakerMatch[1].trim();
+          if (name && name.length >= 3 && !/^(Agent|Customer|Speaker|Unknown|System)$/i.test(name)) {
+            detectedNames.add(name);
+          }
+        }
+
+        if (detectedNames.size > 0) {
+          const { data: allContacts } = await db
+            .from("contacts")
+            .select("id, name, trade")
+            .not("trade", "is", null);
+
+          if (allContacts?.length) {
+            const matchedTrades = new Set<string>();
+            for (const detectedName of detectedNames) {
+              const nameLower = detectedName.toLowerCase();
+              for (const c of allContacts) {
+                if (!c.name || !c.trade || c.id === contact_id) continue;
+                const contactNameLower = c.name.toLowerCase();
+                if (contactNameLower.includes(nameLower) || nameLower.includes(contactNameLower)) {
+                  matchedTrades.add(normalizeTradeLabel(c.trade));
+                }
+              }
+            }
+
+            if (matchedTrades.size > 0) {
+              const { data: tradeProjectRows } = await db
+                .from("project_contacts")
+                .select("project_id, trade")
+                .eq("is_active", true);
+
+              if (tradeProjectRows?.length) {
+                const tradeMatchProjects = new Set<string>();
+                for (const r of tradeProjectRows) {
+                  if (r.project_id && r.trade && matchedTrades.has(normalizeTradeLabel(r.trade))) {
+                    tradeMatchProjects.add(r.project_id);
+                  }
+                }
+                if (tradeMatchProjects.size > 0) {
+                  sources_used.push("other_party_trade_match_v2");
+                  for (const pid of tradeMatchProjects) {
+                    addCandidate(pid, "other_party_trade_match", 0, undefined, undefined, SOURCE_SCORE_OTHER_PARTY_TRADE_MATCH);
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        warnings.push("other_party_trade_match_skipped");
+      }
+    }
+
+    // ========================================
+    // SOURCE 10: CLAIM_CONTENT_MATCH — Cross-contact (v2.0.0)
+    // Unlike the contact-scoped claim match above, this queries ALL active claims
+    // across all contacts. Key for resolving floater calls.
+    // ========================================
+    if (transcript_text && transcriptTokens.length > 0) {
+      try {
+        const keywordsForSearch = transcriptTokens
+          .filter((t) => t.length >= 5)
+          .slice(0, 20);
+
+        if (keywordsForSearch.length >= 3) {
+          const likePatterns = keywordsForSearch.map((k) => `%${k}%`);
+
+          const { data: crossClaimRows, error: crossClaimErr } = await db
+            .from("journal_claims")
+            .select("claim_project_id_norm")
+            .eq("active", true)
+            .not("claim_project_id_norm", "is", null)
+            .or(likePatterns.map((p) => `claim_text.ilike.${p}`).join(","))
+            .limit(100);
+
+          if (!crossClaimErr && crossClaimRows?.length) {
+            const hitsByProject = new Map<string, number>();
+            for (const row of crossClaimRows) {
+              if (!row.claim_project_id_norm) continue;
+              hitsByProject.set(
+                row.claim_project_id_norm,
+                (hitsByProject.get(row.claim_project_id_norm) || 0) + 1,
+              );
+            }
+
+            const sortedProjects = Array.from(hitsByProject.entries())
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 5);
+
+            if (sortedProjects.length > 0) {
+              const projectIds = sortedProjects.map(([pid]) => pid);
+              const { data: activeProjects } = await db
+                .from("projects")
+                .select("id")
+                .in("id", projectIds)
+                .eq("status", "active");
+
+              const activeIds = new Set((activeProjects || []).map((p) => p.id));
+
+              sources_used.push("cross_contact_claim_match");
+              for (const [pid, hits] of sortedProjects) {
+                if (!activeIds.has(pid)) continue;
+                const score = SOURCE_SCORE_CROSS_CONTACT_CLAIM_MATCH * Math.min(hits / 5, 1.0);
+                addCandidate(pid, "cross_contact_claim_match", 0, undefined, undefined, score);
+              }
+            }
+          }
+        }
+      } catch {
+        warnings.push("cross_contact_claim_match_skipped");
+      }
+    }
+
+    // ========================================
+    // SOURCE 11: MATERIAL_BUDGET_TIER_MATCH (v2.0.0)
+    // Match material keywords in transcript to budget tier to projects by contract_value
+    // ========================================
+    if (transcript_text) {
+      try {
+        const transcriptLower = transcript_text.toLowerCase();
+
+        const { data: materialRows } = await db
+          .from("material_budget_tiers")
+          .select("tier, keywords");
+
+        if (materialRows?.length) {
+          const matchedTiers = new Set<string>();
+          for (const row of materialRows) {
+            if (!row.keywords || !row.tier) continue;
+            const keywords: string[] = Array.isArray(row.keywords) ? row.keywords : [];
+            for (const kw of keywords) {
+              if (kw && findTermInText(transcriptLower, kw.toLowerCase()) >= 0) {
+                matchedTiers.add(row.tier);
+                break;
+              }
+            }
+          }
+
+          if (matchedTiers.size > 0) {
+            const { data: activeProjects } = await db
+              .from("projects")
+              .select("id, contract_value")
+              .eq("status", "active")
+              .eq("project_kind", "client")
+              .not("contract_value", "is", null);
+
+            if (activeProjects?.length) {
+              const tierMatches = new Set<string>();
+              for (const tier of matchedTiers) {
+                const midpoint = TIER_MIDPOINTS[tier];
+                if (!midpoint) continue;
+
+                const sorted = activeProjects
+                  .filter((p) => p.contract_value != null)
+                  .map((p) => ({ id: p.id, distance: Math.abs(Number(p.contract_value) - midpoint) }))
+                  .sort((a, b) => a.distance - b.distance)
+                  .slice(0, 3);
+
+                for (const match of sorted) {
+                  tierMatches.add(match.id);
+                }
+              }
+
+              if (tierMatches.size > 0) {
+                sources_used.push("material_budget_tier");
+                for (const pid of tierMatches) {
+                  addCandidate(pid, "material_budget_tier", 0, undefined, undefined, SOURCE_SCORE_MATERIAL_BUDGET_TIER);
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        warnings.push("material_budget_tier_skipped");
+      }
+    }
+
+    // ========================================
+    // SOURCE 12: STRUCTURAL_TYPE_MATCH (v2.0.0)
+    // Match structural keywords to foundation_type to projects via project_building_specs
+    // ========================================
+    if (transcript_text) {
+      try {
+        const transcriptLower = transcript_text.toLowerCase();
+        const matchedFoundationTypes = new Set<string>();
+
+        for (const [keyword, foundationType] of Object.entries(STRUCTURAL_KEYWORD_MAP)) {
+          if (findTermInText(transcriptLower, keyword) >= 0) {
+            matchedFoundationTypes.add(foundationType);
+          }
+        }
+
+        if (matchedFoundationTypes.size > 0) {
+          const { data: specRows } = await db
+            .from("project_building_specs")
+            .select("project_id, foundation_type")
+            .in("foundation_type", Array.from(matchedFoundationTypes));
+
+          if (specRows?.length) {
+            const specProjectIds = specRows.map((r) => r.project_id);
+            const { data: activeProjects } = await db
+              .from("projects")
+              .select("id")
+              .in("id", specProjectIds)
+              .eq("status", "active");
+
+            const activeIds = new Set((activeProjects || []).map((p) => p.id));
+            const matchedProjects = specRows.filter((r) => activeIds.has(r.project_id));
+
+            if (matchedProjects.length > 0) {
+              sources_used.push("structural_type_match");
+              const score = matchedProjects.length === 1
+                ? SOURCE_SCORE_STRUCTURAL_TYPE_SINGLE
+                : SOURCE_SCORE_STRUCTURAL_TYPE_MULTI;
+
+              for (const r of matchedProjects) {
+                addCandidate(r.project_id, "structural_type_match", 0, undefined, undefined, score);
+                const cur = candidatesById.get(r.project_id);
+                if (cur) {
+                  cur.alias_matches.push({
+                    term: `foundation:${r.foundation_type}`,
+                    match_type: "structural_type",
+                  });
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        warnings.push("structural_type_match_skipped");
+      }
+    }
+
     // ========================================
     // CONTINUITY BUNDLE (Back-to-back calls within 48h)
     // Tiered linking: TIER_1 project mention, TIER_2 callback phrase, TIER_3 recency
@@ -1524,6 +2095,8 @@ Deno.serve(async (req: Request) => {
           affinity_weight: meta.affinity_weight,
           assigned: meta.assigned,
           alias_matches: meta.alias_matches,
+          source_scores: meta.source_scores,
+          source_strength: meta.source_strength,
           geo_distance_km: meta.geo_distance_km,
           geo_signal: meta.geo_signal,
           weak_only: weakOnly || undefined,
@@ -1545,6 +2118,11 @@ Deno.serve(async (req: Request) => {
       if (b.evidence.affinity_weight !== a.evidence.affinity_weight) {
         return b.evidence.affinity_weight - a.evidence.affinity_weight;
       }
+      const aSourceStrength = a.evidence.source_strength || 0;
+      const bSourceStrength = b.evidence.source_strength || 0;
+      if (bSourceStrength !== aSourceStrength) {
+        return bSourceStrength - aSourceStrength;
+      }
       const aGeoScore = a.evidence.geo_signal?.score || 0;
       const bGeoScore = b.evidence.geo_signal?.score || 0;
       if (bGeoScore !== aGeoScore) return bGeoScore - aGeoScore;
@@ -1557,10 +2135,11 @@ Deno.serve(async (req: Request) => {
       return 0;
     });
 
-    if (candidates.length > MAX_CANDIDATES) {
-      truncations.push(`candidates_capped_at_${MAX_CANDIDATES}`);
+    const effectiveMaxCandidates = isInternalFloater ? MAX_CANDIDATES_FLOATER : MAX_CANDIDATES;
+    if (candidates.length > effectiveMaxCandidates) {
+      truncations.push(`candidates_capped_at_${effectiveMaxCandidates}`);
     }
-    const finalCandidates = candidates.slice(0, MAX_CANDIDATES);
+    const finalCandidates = candidates.slice(0, effectiveMaxCandidates);
 
     // ========================================
     // SMART TRUNCATION OF TRANSCRIPT
@@ -1591,6 +2170,9 @@ Deno.serve(async (req: Request) => {
         if (!contact_id) {
           warnings.push("journal_source_unanchored_skipped");
         } else {
+          if (isInternalFloater) {
+            warnings.push("journal_floater_unscoped");
+          }
           // Pull a larger pool, then apply contact scoping before per-project caps.
           const { data: claimsData, error: claimsErr } = await db
             .from("journal_claims")
@@ -1640,7 +2222,8 @@ Deno.serve(async (req: Request) => {
               if (!c.project_id) continue;
               const source = c.call_id ? sourceCalls.get(c.call_id) : undefined;
               if (!source) continue;
-              if (!matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone)) {
+              // Floater modifier: internal floaters see all project claims (unscoped)
+              if (!isInternalFloater && !matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone)) {
                 continue;
               }
               if (!claimsByProject.has(c.project_id)) claimsByProject.set(c.project_id, []);
@@ -1662,7 +2245,8 @@ Deno.serve(async (req: Request) => {
               if (!l.project_id) continue;
               const source = l.call_id ? sourceCalls.get(l.call_id) : undefined;
               if (!source) continue;
-              if (!matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone)) {
+              // Floater modifier: internal floaters see all project loops (unscoped)
+              if (!isInternalFloater && !matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone)) {
                 continue;
               }
               if (!loopsByProject.has(l.project_id)) loopsByProject.set(l.project_id, []);
