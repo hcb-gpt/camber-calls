@@ -1222,7 +1222,7 @@ Deno.serve(async (req: Request) => {
         .eq("block_mode", "hard_block");
       const blockedProjectIds = new Set((blockedRows || []).map((r: { project_id: string }) => r.project_id));
       const projects = (allProjects || []).filter(
-        (p: { id: string }) => !blockedProjectIds.has(p.id)
+        (p: { id: string }) => !blockedProjectIds.has(p.id),
       );
       if (blockedProjectIds.size > 0) {
         console.log(`[context-assembly] Blocklist active: ${blockedProjectIds.size} projects filtered from candidates`);
