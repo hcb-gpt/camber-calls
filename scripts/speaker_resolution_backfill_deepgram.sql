@@ -1,5 +1,5 @@
 -- Backfill: resolve Deepgram diarization speaker labels (SPEAKER_N) to contacts
--- Requires: migration 20260215223000_deepgram_speaker_resolution_v2.sql applied
+-- Requires: migration 20260215224500_deepgram_speaker_resolution_v2.sql applied
 -- Safety: Run dry-run section first; CHAD gate before applying writes.
 
 -- ---------------------------------------------------------------------------
@@ -129,4 +129,3 @@ LIMIT 50;
 --   AND jc.speaker_contact_id IS NULL;
 --
 -- COMMIT;
-
