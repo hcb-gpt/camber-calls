@@ -1,0 +1,311 @@
+table: public.projects
+version: v1
+generated_at_utc: "2026-02-15T17:14:05Z"
+fields:
+  -
+    field: id
+    type: uuid
+    required: true
+    default: uuid_generate_v4()
+    example: 3f2b2c3a-9d1a-4db9-9c2a-0cbe7e1f0b7a
+    notes: Primary key.
+  -
+    field: name
+    type: text
+    required: true
+    example: Winship Residence
+    notes: Canonical project name used across Gandalf.
+  -
+    field: aliases
+    type: "text[]"
+    required: false
+    default: "{}"
+    example:
+      - Winship
+      - Winship House
+      - Winship - Oconee
+    notes: Common nicknames or shorthand used in calls/texts for matching.
+  -
+    field: status
+    type: text
+    required: false
+    default: active
+    allowed:
+      - active
+      - on_hold
+      - closed
+    example: active
+    notes: High-level lifecycle status (preferred over legacy phase).
+  -
+    field: project_kind
+    type: text
+    required: true
+    default: client
+    allowed:
+      - client
+      - internal_owner
+      - internal_staff
+      - spec
+      - other
+    example: client
+    notes: Who the project is for; used for filtering/reporting.
+  -
+    field: job_type
+    type: text
+    required: false
+    allowed:
+      - New Build
+      - Remodel
+      - Addition
+    example: New Build
+    notes: Construction type.
+  -
+    field: buildertrend_id
+    type: text
+    required: false
+    example: BT-12345
+    notes: Buildertrend job identifier if synced.
+  -
+    field: street
+    type: text
+    required: false
+    example: 1234 Example Rd
+    notes: Normalized street address (if known).
+  -
+    field: city
+    type: text
+    required: false
+    example: Bishop
+    notes: City for geo/permit routing and display.
+  -
+    field: state
+    type: text
+    required: false
+    default: GA
+    example: GA
+    notes: 2-letter state.
+  -
+    field: zip
+    type: text
+    required: false
+    example: 30621
+    notes: ZIP/postal.
+  -
+    field: county
+    type: text
+    required: false
+    example: Oconee
+    notes: County name; used for jurisdiction fallbacks.
+  -
+    field: address
+    type: text
+    required: false
+    example: "1234 Example Rd, Bishop, GA 30621"
+    notes: Display-friendly full address string (optional).
+  -
+    field: map_id
+    type: text
+    required: false
+    example: 04R
+    notes: County map id if you track parcel data.
+  -
+    field: parcel_id
+    type: text
+    required: false
+    example: 008B
+    notes: Parcel id if you track parcel data.
+  -
+    field: parcel_info
+    type: text
+    required: false
+    example: Map 04R Parcel 008B
+    notes: Display parcel string.
+  -
+    field: subdivision_name
+    type: text
+    required: false
+    example: Lane Creek Plantation
+    notes: Subdivision (if applicable).
+  -
+    field: lot_number
+    type: text
+    required: false
+    example: Lot 12
+    notes: Lot number within subdivision (if applicable).
+  -
+    field: client_name
+    type: text
+    required: false
+    example: Alex Winship
+    notes: Legacy display field; prefer linking via project_clients for SSOT.
+  -
+    field: client_phone
+    type: text
+    required: false
+    example: +17065551234
+    notes: Legacy display field; prefer contact records.
+  -
+    field: client_entity
+    type: text
+    required: false
+    example: Winship Family LLC
+    notes: Client LLC/company name if applicable.
+  -
+    field: client_entity_alias
+    type: text
+    required: false
+    example: Waggin Tails Farm
+    notes: DBA/trade name if applicable.
+  -
+    field: permit_jurisdiction
+    type: text
+    required: false
+    example: Oconee County
+    notes: Actual permitting authority (may differ from county).
+  -
+    field: permit_authority_type
+    type: text
+    required: false
+    example: county
+    notes: "municipality, county, city, unincorporated."
+  -
+    field: permit_notes
+    type: text
+    required: false
+    example: Septic handled by Environmental Health; building permit through county building dept.
+    notes: Free-text nuances or special requirements.
+  -
+    field: zoning
+    type: text
+    required: false
+    example: R1
+    notes: Zoning classification if recorded.
+  -
+    field: current_construction_phase_id
+    type: uuid
+    required: false
+    example: 0f3aa4df-5a1e-4d4f-9c39-8b9c7f8f3b5a
+    notes: FK to construction_phases; align with cost code taxonomy.
+  -
+    field: start_date
+    type: date
+    required: false
+    example: 2026-02-01
+    notes: Construction start (not contract signing).
+  -
+    field: target_completion_date
+    type: date
+    required: false
+    example: 2027-01-15
+    notes: Target substantial completion.
+  -
+    field: contract_value
+    type: numeric
+    required: false
+    example: 1250000
+    notes: Contract value if tracked.
+  -
+    field: has_pool
+    type: bool
+    required: false
+    default: false
+    example: false
+    notes: Whether project includes pool construction.
+  -
+    field: acreage
+    type: numeric
+    required: false
+    example: 2.4
+    notes: Lot size in acres (if known).
+  -
+    field: water_source
+    type: text
+    required: false
+    allowed:
+      - well
+      - municipal
+      - spring
+      - other
+    example: well
+    notes: Water supply.
+  -
+    field: sewer_type
+    type: text
+    required: false
+    allowed:
+      - septic
+      - municipal
+      - other
+    example: septic
+    notes: Sewer system.
+  -
+    field: septic_info
+    type: jsonb
+    required: false
+    example:
+      tank_size_gal: 1500
+      bedroom_capacity: 4
+      garbage_disposal: false
+      drain_field_type: conventional
+      notes: Initial design pending perc test
+    notes: Structured septic details.
+  -
+    field: phase
+    type: text
+    required: false
+    allowed:
+      - pre_construction
+      - active
+      - punch_list
+      - warranty
+      - closed
+      - on_hold
+    example: active
+    notes: LEGACY field; keep only if older integrations depend on it.
+  -
+    field: created_at
+    type: timestamptz
+    required: false
+    default: now()
+    example: "2026-02-15T12:00:00Z"
+    notes: DB-managed timestamp.
+  -
+    field: updated_at
+    type: timestamptz
+    required: false
+    default: now()
+    example: "2026-02-15T12:00:00Z"
+    notes: DB-managed timestamp.
+example_row:
+  id: 3f2b2c3a-9d1a-4db9-9c2a-0cbe7e1f0b7a
+  name: Winship Residence
+  aliases:
+    - Winship
+    - Winship House
+  status: active
+  project_kind: client
+  job_type: New Build
+  buildertrend_id: BT-12345
+  street: 1234 Example Rd
+  city: Bishop
+  state: GA
+  zip: 30621
+  county: Oconee
+  subdivision_name: ""
+  lot_number: ""
+  client_entity: ""
+  permit_jurisdiction: Oconee County
+  permit_authority_type: county
+  permit_notes: Septic handled by Environmental Health; building permit through county building dept.
+  current_construction_phase_id: 0f3aa4df-5a1e-4d4f-9c39-8b9c7f8f3b5a
+  start_date: 2026-02-01
+  target_completion_date: 2027-01-15
+  has_pool: false
+  water_source: well
+  sewer_type: septic
+  septic_info:
+    tank_size_gal: 1500
+    bedroom_capacity: 4
+    garbage_disposal: false
+    drain_field_type: conventional
+    notes: Initial design pending perc test
