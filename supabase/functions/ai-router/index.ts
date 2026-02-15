@@ -543,7 +543,9 @@ async function fetchPriorAssignedProjects(
     const row = latestBySpan.get(s.id);
     if (!row) continue;
     const appliedProjectId = row.applied_project_id || row.project_id || null;
-    if (row.decision === "assign" && appliedProjectId) {
+    const confidence = Number(row.confidence || 0);
+    const isStrongReviewSignal = row.decision === "review" && confidence >= THRESHOLD_AUTO_ASSIGN && !!appliedProjectId;
+    if ((row.decision === "assign" || isStrongReviewSignal) && appliedProjectId) {
       assignedProjectIds.push(appliedProjectId);
     }
   }
@@ -1145,47 +1147,54 @@ Deno.serve(async (req: Request) => {
     if (autoResegmentInvariant.triggered) {
       const invariantReason = autoResegmentInvariant.reasons.join(",");
       const reseedReason = `auto_resegment_invariant:${invariantReason}`;
-      const reseedDispatch = (dry_run || request_source === "admin-reseed")
-        ? {
-          dispatched: false,
-          status: null,
-          detail: dry_run ? "dry_run" : "source_admin_reseed_skip_dispatch",
-        }
-        : await triggerAutoReseed({
-          interaction_id: resolvedInteractionId,
-          reason: reseedReason,
-        });
+      // During admin-reseed reroute, this span has already been resegmented once.
+      // Avoid recursive 409 loops by terminalizing as review in-place.
+      if (request_source === "admin-reseed") {
+        console.warn(
+          `[ai-router] Auto-resegment invariant terminalized during admin-reseed for span ${span_id}: ${invariantReason}`,
+        );
+        decision = "review";
+        project_id = null;
+        reasoning = `${reasoning} Auto-resegment invariant persisted after reseed (${invariantReason}); terminalized to review.`;
+      } else {
+        const reseedDispatch = dry_run
+          ? { dispatched: false, status: null, detail: "dry_run" }
+          : await triggerAutoReseed({
+            interaction_id: resolvedInteractionId,
+            reason: reseedReason,
+          });
 
-      console.warn(
-        `[ai-router] Auto-resegment invariant triggered for span ${span_id}: ${invariantReason} (dispatched=${reseedDispatch.dispatched})`,
-      );
+        console.warn(
+          `[ai-router] Auto-resegment invariant triggered for span ${span_id}: ${invariantReason} (dispatched=${reseedDispatch.dispatched})`,
+        );
 
-      return new Response(
-        JSON.stringify({
-          ok: false,
-          error: "auto_resegment_required",
-          error_code: "auto_resegment_required",
-          span_id,
-          interaction_id: resolvedInteractionId,
-          span_index,
-          invariant: autoResegmentInvariant,
-          context_strong_project_ids: contextStrongProjectIdsForInvariant,
-          reseed_dispatched: reseedDispatch.dispatched,
-          reseed_status: reseedDispatch.status,
-          reseed_detail: reseedDispatch.detail,
-          dry_run,
-          function_version: FUNCTION_VERSION,
-          model_id: MODEL_ID,
-          prompt_version: PROMPT_VERSION,
-          tokens_used,
-          inference_ms,
-          ms: Date.now() - t0,
-        }),
-        {
-          status: 409,
-          headers: { "Content-Type": "application/json" },
-        },
-      );
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            error: "auto_resegment_required",
+            error_code: "auto_resegment_required",
+            span_id,
+            interaction_id: resolvedInteractionId,
+            span_index,
+            invariant: autoResegmentInvariant,
+            context_strong_project_ids: contextStrongProjectIdsForInvariant,
+            reseed_dispatched: reseedDispatch.dispatched,
+            reseed_status: reseedDispatch.status,
+            reseed_detail: reseedDispatch.detail,
+            dry_run,
+            function_version: FUNCTION_VERSION,
+            model_id: MODEL_ID,
+            prompt_version: PROMPT_VERSION,
+            tokens_used,
+            inference_ms,
+            ms: Date.now() - t0,
+          }),
+          {
+            status: 409,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
     }
 
     const coherence = evaluateAdjacentSpanCoherence({
