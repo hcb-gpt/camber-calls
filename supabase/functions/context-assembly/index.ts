@@ -1322,8 +1322,9 @@ Deno.serve(async (req: Request) => {
               const matchType = fromAliasTable.some((a) => a.toLowerCase() === termLower)
                 ? "alias"
                 : (p.name.toLowerCase() === termLower ? "exact_project_name" : "city_or_location");
-              const isCommonWordAlias = matchType === "alias" && COMMON_WORD_ALIAS_TERMS.has(termLower);
-              if (isCommonWordAlias && mysteryWhiteMaterialMentioned) {
+              const isCommonWordLexeme = COMMON_WORD_ALIAS_TERMS.has(termLower) &&
+                (matchType === "alias" || matchType === "city_or_location");
+              if (isCommonWordLexeme && mysteryWhiteMaterialMentioned) {
                 if (!commonWordAliasWarnings.has(termLower)) {
                   warnings.push(`common_word_alias_ignored:${termLower}`);
                   commonWordAliasWarnings.add(termLower);
