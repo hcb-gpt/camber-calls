@@ -1,8 +1,4 @@
-import {
-  assert,
-  assertEquals,
-  assertExists,
-} from "https://deno.land/std@0.218.0/assert/mod.ts";
+import { assert, assertEquals, assertExists } from "https://deno.land/std@0.218.0/assert/mod.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -16,8 +12,7 @@ type CanonicalCallRow = {
 };
 
 const CANONICAL_INTERACTION_ID = "cll_06DSX0CVZHZK72VCVW54EH9G3C";
-const RUN_PIPELINE_INTEGRATION =
-  Deno.env.get("RUN_PIPELINE_INTEGRATION") === "1";
+const RUN_PIPELINE_INTEGRATION = Deno.env.get("RUN_PIPELINE_INTEGRATION") === "1";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ??
   "";
@@ -100,8 +95,7 @@ function integrationEnabled(): boolean {
 }
 
 Deno.test({
-  name:
-    "integration scaffold: process-call -> segment-call -> segment-llm -> context-assembly -> ai-router",
+  name: "integration scaffold: process-call -> segment-call -> segment-llm -> context-assembly -> ai-router",
   ignore: !integrationEnabled(),
   fn: async () => {
     const canonical = await fetchCanonicalCall();
@@ -216,6 +210,55 @@ Deno.test({
       reasons.includes("G4_EMPTY_TRANSCRIPT"),
       "expected G4_EMPTY_TRANSCRIPT reason",
     );
+
+    const interactionQuery = `interaction_id=eq.${
+      encodeURIComponent(interactionId)
+    }&select=interaction_id,needs_review,review_reasons&limit=1`;
+    const interactionResp = await fetch(
+      `${SUPABASE_URL}/rest/v1/interactions?${interactionQuery}`,
+      {
+        method: "GET",
+        headers: {
+          "apikey": SUPABASE_SERVICE_ROLE_KEY,
+          "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        },
+      },
+    );
+    assertEquals(interactionResp.status, 200, "failed to fetch interaction row");
+    const interactionRows = (await interactionResp.json()) as Array<{
+      interaction_id: string;
+      needs_review: boolean | null;
+      review_reasons: string[] | null;
+    }>;
+    assert(interactionRows.length > 0, "interaction row missing");
+    assertEquals(interactionRows[0].needs_review, false);
+    assert(
+      Array.isArray(interactionRows[0].review_reasons) &&
+        interactionRows[0].review_reasons.includes("terminal_empty_transcript") &&
+        interactionRows[0].review_reasons.includes("G4_EMPTY_TRANSCRIPT"),
+      "expected terminal_empty_transcript review reason",
+    );
+
+    const reviewQueueQuery = `interaction_id=eq.${
+      encodeURIComponent(interactionId)
+    }&status=eq.pending&select=id,span_id,status&limit=20`;
+    const reviewQueueResp = await fetch(
+      `${SUPABASE_URL}/rest/v1/review_queue?${reviewQueueQuery}`,
+      {
+        method: "GET",
+        headers: {
+          "apikey": SUPABASE_SERVICE_ROLE_KEY,
+          "Authorization": `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+        },
+      },
+    );
+    assertEquals(reviewQueueResp.status, 200, "failed to fetch review_queue rows");
+    const reviewQueueRows = (await reviewQueueResp.json()) as Array<{
+      id: string;
+      span_id: string | null;
+      status: string;
+    }>;
+    assertEquals(reviewQueueRows.length, 0, "expected no pending review_queue rows for empty transcript");
   },
 });
 
