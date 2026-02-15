@@ -16,7 +16,7 @@ Add a call-aware resolution path for diarization labels:
 2. Restrict to 2-speaker calls (deterministic case).
 3. Infer which diarization speaker corresponds to `owner` vs `other_party` using:
    - `calls_raw.direction` (inbound/outbound)
-   - earliest speaker id from `transcripts_comparison.words` (Deepgram word timings)
+   - earliest speaker id from `transcripts_comparison.words` (preferred), or the first `SPEAKER_<n>:` line in `transcripts_comparison.transcript` (fallback)
 4. Resolve to `contacts` via:
    - `lookup_contact_by_phone(calls_raw.owner_phone / other_party_phone)` (preferred)
    - fallback to `resolve_speaker_contact(calls_raw.owner_name / other_party_name)`
@@ -34,7 +34,7 @@ All of the above is implemented in SQL only (no edge-function code changes requi
 
 - **No direction → no guess.** If `calls_raw.direction` is missing or not in an inbound/outbound family, v2 returns no match.
 - **Non-2-speaker calls are skipped.** Speaker resolution for multi-party calls needs a separate design (manual review / diarization-to-name alignment).
-- **Assumption:** earliest Deepgram word speaker ≈ answerer for 2-party calls.
+- **Assumption:** earliest Deepgram speaker (word-timing if available; else first transcript line) ≈ answerer for 2-party calls.
 
 ## 5. Dry-Run Measurement Queries
 
@@ -89,4 +89,3 @@ ORDER BY resolved_by_type DESC NULLS LAST;
 Backfill script is provided at `scripts/speaker_resolution_backfill_deepgram.sql`.
 
 **Gate:** CHAD approval required before executing any write/backfill in production.
-

@@ -58,6 +58,8 @@ DECLARE
   v_other_name TEXT;
   v_first_speaker INT;
   v_speaker_count INT;
+  v_words JSONB;
+  v_transcript TEXT;
   v_inferred_role TEXT; -- 'owner' | 'other_party'
 BEGIN
   IF p_speaker_label IS NULL OR TRIM(p_speaker_label) = '' THEN
@@ -85,32 +87,59 @@ BEGIN
       v_other_name
     FROM public.calls_raw cr
     WHERE cr.interaction_id = p_call_id
+    ORDER BY
+      cr.event_at_utc DESC NULLS LAST,
+      cr.ingested_at_utc DESC NULLS LAST,
+      cr.received_at_utc DESC NULLS LAST,
+      cr.id DESC
     LIMIT 1;
 
     IF v_owner_phone IS NULL AND v_other_phone IS NULL AND v_owner_name IS NULL AND v_other_name IS NULL THEN
       RETURN;
     END IF;
 
-    -- Determine first speaker id and speaker count from Deepgram word timings
+    -- Determine speaker_count (prefer persisted) + first_speaker (prefer words; fallback transcript lines)
     SELECT
-      (
-        SELECT NULLIF((w->>'speaker')::INT, NULL)
-        FROM jsonb_array_elements(tc.words) w
-        WHERE w ? 'speaker' AND w ? 'start'
-        ORDER BY (w->>'start')::NUMERIC ASC
-        LIMIT 1
-      ) AS first_speaker,
-      (
-        SELECT COUNT(DISTINCT (w2->>'speaker')::INT)
-        FROM jsonb_array_elements(tc.words) w2
-        WHERE w2 ? 'speaker'
-      ) AS speaker_count
-    INTO v_first_speaker, v_speaker_count
+      tc.speaker_count,
+      tc.words,
+      tc.transcript
+    INTO v_speaker_count, v_words, v_transcript
     FROM public.transcripts_comparison tc
     WHERE tc.interaction_id = p_call_id
       AND tc.engine = 'deepgram'
-      AND tc.words IS NOT NULL
+    ORDER BY
+      tc.created_at DESC NULLS LAST,
+      tc.id DESC
     LIMIT 1;
+
+    -- Compute speaker_count if not persisted
+    IF v_speaker_count IS NULL THEN
+      IF v_words IS NOT NULL THEN
+        SELECT COUNT(DISTINCT (w2->>'speaker')::INT)
+        INTO v_speaker_count
+        FROM jsonb_array_elements(v_words) w2
+        WHERE w2 ? 'speaker';
+      ELSIF v_transcript IS NOT NULL THEN
+        SELECT COUNT(DISTINCT (m[1])::INT)
+        INTO v_speaker_count
+        FROM regexp_matches(v_transcript, '(?m)^SPEAKER_([0-9]+):', 'g') AS m;
+      END IF;
+    END IF;
+
+    -- Prefer word-level timings for first speaker
+    IF v_words IS NOT NULL THEN
+      SELECT (w->>'speaker')::INT
+      INTO v_first_speaker
+      FROM jsonb_array_elements(v_words) w
+      WHERE w ? 'speaker' AND w ? 'start'
+      ORDER BY (w->>'start')::NUMERIC ASC
+      LIMIT 1;
+    END IF;
+
+    -- Fallback: parse first transcript line label (Deepgram utterances are chronological)
+    IF v_first_speaker IS NULL AND v_transcript IS NOT NULL THEN
+      v_first_speaker := NULLIF((regexp_match(v_transcript, '(?m)^SPEAKER_([0-9]+):'))[1], '')::INT;
+    END IF;
 
     -- Only handle the deterministic 2-speaker case.
     IF v_first_speaker IS NULL OR v_speaker_count IS NULL OR v_speaker_count != 2 THEN
@@ -253,4 +282,3 @@ CREATE TRIGGER trg_resolve_journal_claim_speakers
 COMMENT ON FUNCTION public.resolve_journal_claim_speakers IS
   'Auto-resolves speaker_label and reported_by_label to contact_ids on journal_claims insert/update. '
   'v2: uses resolve_speaker_contact_v2 (call-aware Deepgram diarization handling).';;
-
