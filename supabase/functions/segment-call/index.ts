@@ -161,6 +161,7 @@ Deno.serve(async (req: Request) => {
     });
   }
 
+  try {
   // ============================================================
   // INTERNAL AUTH GATE (verify_jwt: false - auth handled here)
   // ============================================================
@@ -831,4 +832,18 @@ Deno.serve(async (req: Request) => {
     }),
     { status: 200, headers: jsonHeaders },
   );
+
+  } catch (e: any) {
+    // Defense-in-depth: catch any unhandled exception in the handler
+    console.error("segment-call unhandled:", e.message);
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error_code: "unhandled_error",
+        error: e.message,
+        segment_call_version: SEGMENT_CALL_VERSION,
+      }),
+      { status: 500, headers: jsonHeaders },
+    );
+  }
 });

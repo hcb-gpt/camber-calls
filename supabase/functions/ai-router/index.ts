@@ -516,7 +516,7 @@ async function upsertReviewQueue(
     reasons: string[];
     context_payload: Record<string, unknown>;
   },
-) {
+): Promise<{ error: { message: string; details?: string } | null }> {
   const { error } = await db
     .from("review_queue")
     .upsert(
@@ -534,6 +534,7 @@ async function upsertReviewQueue(
   if (error) {
     console.error("[ai-router] review_queue upsert failed:", error.message);
   }
+  return { error };
 }
 
 async function resolveReviewQueue(
@@ -1228,6 +1229,20 @@ Deno.serve(async (req: Request) => {
 
     if (upsertErr) {
       console.error("[ai-router] span_attributions upsert failed:", upsertErr.message, upsertErr.details);
+      const interaction_id = context_package.meta?.interaction_id;
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error_code: "attribution_write_failed",
+          error: upsertErr.message,
+          interaction_id,
+          span_id,
+        }),
+        {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
     }
 
     // ========================================
@@ -1307,12 +1322,27 @@ Deno.serve(async (req: Request) => {
         created_at_utc: new Date().toISOString(),
       };
 
-      await upsertReviewQueue(db, {
+      const reviewQueueResult = await upsertReviewQueue(db, {
         span_id,
         interaction_id: interaction_id || span_id,
         reasons: reason_codes,
         context_payload,
       });
+      if (reviewQueueResult.error) {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            error_code: "review_queue_write_failed",
+            error: reviewQueueResult.error.message,
+            interaction_id,
+            span_id,
+          }),
+          {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
       console.log(`[ai-router] Created review_queue item for span ${span_id}, reasons: ${reason_codes.join(",")}`);
     } else {
       await resolveReviewQueue(db, span_id, "auto-applied by ai-router");
