@@ -31,6 +31,9 @@ __pycache__/
 .temp/
 supabase/.temp/
 
+# Local worktrees (developer machine only)
+.worktrees/
+
 # Artifacts (backfill runs, spotcheck outputs)
 artifacts/
 

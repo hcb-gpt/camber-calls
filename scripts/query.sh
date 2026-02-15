@@ -38,7 +38,12 @@ run_sql() {
     echo "ERROR: only read-only statements are allowed (SELECT/WITH/EXPLAIN/SHOW)." >&2
     exit 1
   fi
-  if [[ "${upper}" =~ (INSERT|UPDATE|DELETE|UPSERT|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE) ]]; then
+
+  # Avoid false positives on identifiers like `created_at` by matching whole tokens only.
+  # Note: this is not a SQL parser; keywords inside string literals may still trip the guard.
+  local mutating_re
+  mutating_re='(^|[^A-Z0-9_])(INSERT|UPDATE|DELETE|UPSERT|CREATE|ALTER|DROP|TRUNCATE|GRANT|REVOKE)($|[^A-Z0-9_])'
+  if [[ "${upper}" =~ ${mutating_re} ]]; then
     echo "ERROR: mutating SQL detected; query.sh is read-only." >&2
     exit 1
   fi
