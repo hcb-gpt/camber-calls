@@ -10,6 +10,7 @@ export function stripCodeFences(raw: string): string {
 }
 
 export function stripControlChars(s: string): string {
+  // deno-lint-ignore no-control-regex -- intentional: scrub control chars from LLM output
   return s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
 }
 

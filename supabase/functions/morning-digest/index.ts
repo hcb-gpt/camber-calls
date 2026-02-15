@@ -69,7 +69,7 @@ Deno.serve(async (req: Request) => {
 
     // Get project context for striking signals via span_attributions
     const strikingSpanIds = (strikingRaw || []).map((s: any) => s.span_id).filter(Boolean);
-    let spanProjectMap: Record<string, { project_id: string; project_name: string }> = {};
+    const spanProjectMap: Record<string, { project_id: string; project_name: string }> = {};
 
     if (strikingSpanIds.length > 0) {
       const { data: attrData } = await db
@@ -77,11 +77,13 @@ Deno.serve(async (req: Request) => {
         .select("span_id, applied_project_id, project_id")
         .in("span_id", strikingSpanIds);
 
-      const projectIds = [...new Set(
-        (attrData || [])
-          .map((a: any) => a.applied_project_id || a.project_id)
-          .filter(Boolean),
-      )];
+      const projectIds = [
+        ...new Set(
+          (attrData || [])
+            .map((a: any) => a.applied_project_id || a.project_id)
+            .filter(Boolean),
+        ),
+      ];
 
       if (projectIds.length > 0) {
         const { data: projects } = await db
@@ -139,11 +141,13 @@ Deno.serve(async (req: Request) => {
     if (loopsErr) console.error("[morning-digest] journal_open_loops error:", loopsErr.message);
 
     // Get project names for open loops
-    const loopProjectIds = [...new Set(
-      (loopsRaw || []).map((l: any) => l.project_id).filter(Boolean),
-    )];
+    const loopProjectIds = [
+      ...new Set(
+        (loopsRaw || []).map((l: any) => l.project_id).filter(Boolean),
+      ),
+    ];
 
-    let loopProjectNameMap: Record<string, string> = {};
+    const loopProjectNameMap: Record<string, string> = {};
     if (loopProjectIds.length > 0) {
       const { data: projects } = await db
         .from("projects")
@@ -221,15 +225,17 @@ Deno.serve(async (req: Request) => {
 
     // Group by claim_type
     const claimsByType: Record<string, number> = {};
-    const claimProjectIds = [...new Set(
-      (recentClaimsRaw || []).map((c: any) => c.project_id).filter(Boolean),
-    )];
+    const claimProjectIds = [
+      ...new Set(
+        (recentClaimsRaw || []).map((c: any) => c.project_id).filter(Boolean),
+      ),
+    ];
 
     for (const c of recentClaimsRaw || []) {
       claimsByType[c.claim_type] = (claimsByType[c.claim_type] || 0) + 1;
     }
 
-    let claimProjectNameMap: Record<string, string> = {};
+    const claimProjectNameMap: Record<string, string> = {};
     if (claimProjectIds.length > 0) {
       const { data: projects } = await db
         .from("projects")

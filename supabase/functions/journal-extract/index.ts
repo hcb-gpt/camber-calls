@@ -129,6 +129,7 @@ function stripCodeFences(raw: string): string {
  * These can appear in LLM output and break JSON.parse().
  */
 function stripControlChars(s: string): string {
+  // deno-lint-ignore no-control-regex -- intentional: scrub control chars from LLM output
   return s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
 }
 
@@ -161,15 +162,8 @@ function fixUnescapedQuotes(s: string): string {
   // Strategy: find patterns like "key": "value with "unescaped" quotes"
   // This is inherently fragile, so we only apply it as a fallback.
   // Replace sequences of ": " followed by a string that has internal unescaped quotes
-  try {
-    // Simple approach: within string values, replace unescaped internal quotes
-    // Look for patterns where a quote appears mid-value (not preceded by \ and not at field boundary)
-    // Simple best-effort: this function is a last-resort fallback
-    // Just return the input — the retry mechanism handles truly broken JSON
-    return s;
-  } catch {
-    return s;
-  }
+  // Simple best-effort: currently a no-op; the retry mechanism handles truly broken JSON.
+  return s;
 }
 
 /**
@@ -611,12 +605,12 @@ Deno.serve(async (req: Request) => {
     // Cap transcript to prevent Haiku inference timeouts on very long spans.
     // Spans up to 38K chars were causing 30s+ inference → auto-timeout cascade.
     const truncated = transcript.length > MAX_TRANSCRIPT_CHARS;
-    const promptTranscript = truncated
-      ? transcript.slice(0, MAX_TRANSCRIPT_CHARS) + "\n...[truncated]"
-      : transcript;
+    const promptTranscript = truncated ? transcript.slice(0, MAX_TRANSCRIPT_CHARS) + "\n...[truncated]" : transcript;
 
     if (truncated) {
-      console.log(`[journal-extract] Truncated transcript from ${transcript.length} to ${MAX_TRANSCRIPT_CHARS} chars for span ${span_id}`);
+      console.log(
+        `[journal-extract] Truncated transcript from ${transcript.length} to ${MAX_TRANSCRIPT_CHARS} chars for span ${span_id}`,
+      );
     }
 
     const userPrompt =
@@ -701,7 +695,9 @@ Deno.serve(async (req: Request) => {
           claims_extracted: 0,
           error_message: "no_project_attribution: claims extracted but not written (FK constraint)",
         }).eq("run_id", run_id);
-        if (noProjectUpdateErr) console.error("[journal-extract] journal_runs update (no project) failed:", noProjectUpdateErr.message);
+        if (noProjectUpdateErr) {
+          console.error("[journal-extract] journal_runs update (no project) failed:", noProjectUpdateErr.message);
+        }
       } else {
         const claimRows = extraction.claims.map((c) => {
           const speaker = c.speaker_label ? speakerContactMap.get(c.speaker_label) : null;
@@ -780,7 +776,9 @@ Deno.serve(async (req: Request) => {
           completed_at: new Date().toISOString(),
           claims_extracted: claims_written,
         }).eq("run_id", run_id);
-        if (successUpdateErr) console.error("[journal-extract] journal_runs update (success) failed:", successUpdateErr.message);
+        if (successUpdateErr) {
+          console.error("[journal-extract] journal_runs update (success) failed:", successUpdateErr.message);
+        }
 
         if (claims_written > 0 && project_id && run_id && expectedSecret) {
           const supabaseUrl = Deno.env.get("SUPABASE_URL");
@@ -833,7 +831,9 @@ Deno.serve(async (req: Request) => {
           completed_at: new Date().toISOString(),
           error_message: e.message?.slice(0, 500),
         }).eq("run_id", run_id).eq("status", "running");
-        if (failUpdateErr) console.error("[journal-extract] journal_runs update (failed) error:", failUpdateErr.message);
+        if (failUpdateErr) {
+          console.error("[journal-extract] journal_runs update (failed) error:", failUpdateErr.message);
+        }
       } catch { /* ignore — best-effort failure recording */ }
     }
 
