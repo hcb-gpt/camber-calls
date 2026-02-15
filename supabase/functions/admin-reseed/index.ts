@@ -25,6 +25,7 @@
  * MODES (legacy names, concept is "rechunk"):
  * - resegment_only (default): Just rechunk, don't call downstream
  * - resegment_and_reroute: Rechunk + call context-assembly + ai-router
+ * - reseed_and_close_loop: Rechunk + reroute + integrity close-loop guarantees
  *
  * FAIL CLOSED: Any DB write failure returns 500
  */
@@ -32,8 +33,11 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { authErrorResponse, requireEdgeSecret } from "../_shared/auth.ts";
 
-const VERSION = "1.3.1"; // Version tracking for admin-reseed endpoint
+const VERSION = "1.4.0"; // v1.4.0: reseed_and_close_loop integrity guarantees
 const ALLOWED_SOURCES = ["admin-reseed", "system"];
+const CLOSE_LOOP_MAX_ATTEMPTS = 2;
+const CLOSE_LOOP_MODEL_ID = "admin-reseed-close-loop";
+const CLOSE_LOOP_PROMPT_VERSION = "v1";
 
 // ============================================================
 // STRUCTURED LOGGING (per GPT-DEV-6 spec)
@@ -99,7 +103,7 @@ interface ReseedRequest {
   interaction_id: string;
   reason: string;
   idempotency_key: string;
-  mode?: "resegment_only" | "resegment_and_reroute";
+  mode?: "resegment_only" | "resegment_and_reroute" | "reseed_and_close_loop";
   requested_by?: string;
 }
 
@@ -117,6 +121,14 @@ interface ReseedReceipt {
   new_span_ids?: string[];
   superseded_span_ids?: string[];
   reroute_triggered?: boolean;
+  close_loop_applied?: boolean;
+  close_loop_attempts?: number;
+  close_loop_missing_before?: number;
+  close_loop_missing_after?: number;
+  close_loop_fallback_inserted?: number;
+  close_loop_stale_pending_dismissed?: number;
+  close_loop_pending_on_superseded_after?: number;
+  close_loop_pending_null_after?: number;
   ms?: number;
 }
 
@@ -164,9 +176,14 @@ Deno.serve(async (req: Request) => {
   if (!idempotency_key || idempotency_key.trim().length === 0) {
     return jsonResponse({ error: "missing_idempotency_key" }, 400);
   }
-  if (!["resegment_only", "resegment_and_reroute"].includes(mode)) {
-    return jsonResponse({ error: "invalid_mode", valid: ["resegment_only", "resegment_and_reroute"] }, 400);
+  if (!["resegment_only", "resegment_and_reroute", "reseed_and_close_loop"].includes(mode)) {
+    return jsonResponse({
+      error: "invalid_mode",
+      valid: ["resegment_only", "resegment_and_reroute", "reseed_and_close_loop"],
+    }, 400);
   }
+
+  const rerouteMode = mode === "resegment_and_reroute" || mode === "reseed_and_close_loop";
 
   // ========================================
   // 3. INIT DB CLIENT
@@ -400,7 +417,7 @@ Deno.serve(async (req: Request) => {
     structuredLog("INFO", "reseed_start", requestId, interaction_id, newGeneration, {
       transcript_chars: transcriptChars,
       reseed_mode: mode,
-      reroute: mode === "resegment_and_reroute",
+      reroute: rerouteMode,
     });
 
     // Structured log: reseed_segment_request
@@ -716,22 +733,13 @@ Deno.serve(async (req: Request) => {
     reroute_triggered: false,
   };
 
-  await writeOverrideLog(db, {
-    interaction_id,
-    idempotency_key,
-    reason,
-    mode,
-    requested_by,
-    receipt,
-  });
-
   // ========================================
   // 12. OPTIONAL: TRIGGER REROUTE
   // ========================================
-  if (mode === "resegment_and_reroute" && newSpanIds.length > 0) {
+  if (rerouteMode && newSpanIds.length > 0) {
     receipt.reroute_triggered = true;
 
-    // Call context-assembly -> ai-router for each new span
+    // Call context-assembly -> ai-router for each new span, then close-loop integrity checks.
     const contextAssemblyUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/context-assembly`;
     const aiRouterUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/ai-router`;
     const strikingDetectUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/striking-detect`;
@@ -750,92 +758,72 @@ Deno.serve(async (req: Request) => {
       internalHeaders["X-Source"] = "admin-reseed";
     }
 
+    const internalEndpoints: InternalEndpoints = {
+      contextAssemblyUrl,
+      aiRouterUrl,
+      strikingDetectUrl,
+      journalExtractUrl,
+    };
+
     for (const spanId of newSpanIds) {
-      try {
-        // Call context-assembly
-        const ctxResp = await fetch(contextAssemblyUrl, {
-          method: "POST",
-          headers: internalHeaders,
-          body: JSON.stringify({ span_id: spanId }),
-        });
-
-        if (!ctxResp.ok) {
-          const errText = await ctxResp.text().catch(() => "");
-          console.error(`[admin-reseed] context-assembly failed for span ${spanId}: ${ctxResp.status} ${errText}`);
-          continue;
-        }
-
-        const ctxData = await ctxResp.json();
-        if (!ctxData.ok || !ctxData.context_package) {
-          console.error(`[admin-reseed] context-assembly returned no package for span ${spanId}`);
-          continue;
-        }
-
-        // Call ai-router
-        const routerResp = await fetch(aiRouterUrl, {
-          method: "POST",
-          headers: internalHeaders,
-          body: JSON.stringify({
-            context_package: ctxData.context_package,
-            dry_run: false,
-          }),
-        });
-
-        if (!routerResp.ok) {
-          console.error(`[admin-reseed] ai-router failed for span ${spanId}: ${routerResp.status}`);
-        } else {
-          let routerData: any = null;
-          try {
-            routerData = await routerResp.json();
-          } catch {
-            // Non-fatal: keep reseed success even if router response isn't parseable.
-          }
-
-          // Post-hook 1: striking-detect (always attempt, non-blocking).
-          fetch(strikingDetectUrl, {
-            method: "POST",
-            headers: internalHeaders,
-            body: JSON.stringify({
-              span_id: spanId,
-              interaction_id,
-              source: "admin-reseed",
-            }),
-          }).catch((e: unknown) => {
-            const msg = e instanceof Error ? e.message : "Unknown error";
-            console.error(`[admin-reseed] striking-detect post-hook failed for span ${spanId}: ${msg}`);
-          });
-
-          // Post-hook 2: journal-extract (only when router assigns a project; non-blocking).
-          const appliedProjectId = routerData?.gatekeeper?.applied_project_id;
-          const routerDecision = routerData?.decision;
-          if (routerDecision === "assign" && appliedProjectId) {
-            fetch(journalExtractUrl, {
-              method: "POST",
-              headers: internalHeaders,
-              body: JSON.stringify({
-                span_id: spanId,
-                interaction_id,
-                project_id: appliedProjectId,
-                source: "admin-reseed",
-              }),
-            }).catch((e: unknown) => {
-              const msg = e instanceof Error ? e.message : "Unknown error";
-              console.error(`[admin-reseed] journal-extract post-hook failed for span ${spanId}: ${msg}`);
-            });
-          }
-
-          console.log(`[admin-reseed] Rerouted span ${spanId}`);
-        }
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : "Unknown error";
-        console.error(`[admin-reseed] Reroute error for span ${spanId}: ${msg}`);
-      }
+      await rerouteSpan({
+        spanId,
+        interactionId: interaction_id,
+        internalHeaders,
+        internalEndpoints,
+      });
     }
+
+    const closeLoop = await closeLoopAfterReseed({
+      db,
+      interactionId: interaction_id,
+      internalHeaders,
+      internalEndpoints,
+    });
+
+    receipt.close_loop_applied = true;
+    receipt.close_loop_attempts = closeLoop.attempts;
+    receipt.close_loop_missing_before = closeLoop.missingBefore;
+    receipt.close_loop_missing_after = closeLoop.missingAfter;
+    receipt.close_loop_fallback_inserted = closeLoop.fallbackInserted;
+    receipt.close_loop_stale_pending_dismissed = closeLoop.stalePendingDismissed;
+    receipt.close_loop_pending_on_superseded_after = closeLoop.pendingOnSuperseded;
+    receipt.close_loop_pending_null_after = closeLoop.pendingNullSpan;
+    receipt.attrib_count_after = closeLoop.latestAttributions;
+
+    if (!closeLoop.ok) {
+      receipt.ok = false;
+      receipt.status = "error";
+      await writeOverrideLog(db, {
+        interaction_id,
+        idempotency_key,
+        reason,
+        mode,
+        requested_by,
+        receipt,
+      });
+      return jsonResponse({
+        ok: false,
+        error: "close_loop_integrity_failed",
+        detail: closeLoop.detail,
+        receipt: { ...receipt, ms: Date.now() - t0 },
+      }, 500);
+    }
+  } else {
+    receipt.attrib_count_after = 0;
   }
 
   // ========================================
   // 13. RESPONSE
   // ========================================
+  await writeOverrideLog(db, {
+    interaction_id,
+    idempotency_key,
+    reason,
+    mode,
+    requested_by,
+    receipt,
+  });
 
   // Structured log: reseed_end
   structuredLog("INFO", "reseed_end", requestId, interaction_id, newGeneration, {
@@ -860,6 +848,417 @@ Deno.serve(async (req: Request) => {
 // ============================================================
 // HELPERS
 // ============================================================
+
+interface InternalEndpoints {
+  contextAssemblyUrl: string;
+  aiRouterUrl: string;
+  strikingDetectUrl: string;
+  journalExtractUrl: string;
+}
+
+interface CloseLoopResult {
+  ok: boolean;
+  detail: string;
+  attempts: number;
+  missingBefore: number;
+  missingAfter: number;
+  fallbackInserted: number;
+  stalePendingDismissed: number;
+  pendingOnSuperseded: number;
+  pendingNullSpan: number;
+  latestAttributions: number;
+}
+
+async function rerouteSpan(params: {
+  spanId: string;
+  interactionId: string;
+  internalHeaders: Record<string, string>;
+  internalEndpoints: InternalEndpoints;
+}): Promise<boolean> {
+  const { spanId, interactionId, internalHeaders, internalEndpoints } = params;
+
+  try {
+    const ctxResp = await fetch(internalEndpoints.contextAssemblyUrl, {
+      method: "POST",
+      headers: internalHeaders,
+      body: JSON.stringify({ span_id: spanId }),
+    });
+
+    if (!ctxResp.ok) {
+      const errText = await ctxResp.text().catch(() => "");
+      console.error(`[admin-reseed] context-assembly failed for span ${spanId}: ${ctxResp.status} ${errText}`);
+      return false;
+    }
+
+    const ctxData = await ctxResp.json();
+    if (!ctxData.ok || !ctxData.context_package) {
+      console.error(`[admin-reseed] context-assembly returned no package for span ${spanId}`);
+      return false;
+    }
+
+    const routerResp = await fetch(internalEndpoints.aiRouterUrl, {
+      method: "POST",
+      headers: internalHeaders,
+      body: JSON.stringify({
+        context_package: ctxData.context_package,
+        dry_run: false,
+      }),
+    });
+
+    if (!routerResp.ok) {
+      console.error(`[admin-reseed] ai-router failed for span ${spanId}: ${routerResp.status}`);
+      return false;
+    }
+
+    let routerData: any = null;
+    try {
+      routerData = await routerResp.json();
+    } catch {
+      // Non-fatal: still consider reroute successful if HTTP succeeded.
+    }
+
+    fetch(internalEndpoints.strikingDetectUrl, {
+      method: "POST",
+      headers: internalHeaders,
+      body: JSON.stringify({
+        span_id: spanId,
+        interaction_id: interactionId,
+        source: "admin-reseed",
+      }),
+    }).catch((e: unknown) => {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      console.error(`[admin-reseed] striking-detect post-hook failed for span ${spanId}: ${msg}`);
+    });
+
+    const appliedProjectId = routerData?.gatekeeper?.applied_project_id;
+    const routerDecision = routerData?.decision;
+    if (routerDecision === "assign" && appliedProjectId) {
+      fetch(internalEndpoints.journalExtractUrl, {
+        method: "POST",
+        headers: internalHeaders,
+        body: JSON.stringify({
+          span_id: spanId,
+          interaction_id: interactionId,
+          project_id: appliedProjectId,
+          source: "admin-reseed",
+        }),
+      }).catch((e: unknown) => {
+        const msg = e instanceof Error ? e.message : "Unknown error";
+        console.error(`[admin-reseed] journal-extract post-hook failed for span ${spanId}: ${msg}`);
+      });
+    }
+
+    console.log(`[admin-reseed] Rerouted span ${spanId}`);
+    return true;
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : "Unknown error";
+    console.error(`[admin-reseed] Reroute error for span ${spanId}: ${msg}`);
+    return false;
+  }
+}
+
+async function fetchLatestActiveSpans(
+  db: any,
+  interactionId: string,
+): Promise<Array<{ id: string; span_index: number; segment_generation: number }>> {
+  const { data, error } = await db
+    .from("conversation_spans")
+    .select("id, span_index, segment_generation")
+    .eq("interaction_id", interactionId)
+    .eq("is_superseded", false)
+    .order("span_index");
+
+  if (error) {
+    throw new Error(`latest_spans_fetch_failed:${error.message}`);
+  }
+
+  const spans = data || [];
+  if (spans.length === 0) return [];
+  const maxGeneration = Math.max(...spans.map((s: any) => Number(s.segment_generation || 0)));
+  return spans.filter((s: any) => Number(s.segment_generation || 0) === maxGeneration);
+}
+
+async function fetchAttributedSpanSet(
+  db: any,
+  spanIds: string[],
+): Promise<Set<string>> {
+  if (spanIds.length === 0) return new Set();
+  const { data, error } = await db
+    .from("span_attributions")
+    .select("span_id")
+    .in("span_id", spanIds);
+  if (error) {
+    throw new Error(`attribution_fetch_failed:${error.message}`);
+  }
+  return new Set((data || []).map((row: any) => row.span_id));
+}
+
+async function insertCloseLoopFallbackAttributions(
+  db: any,
+  interactionId: string,
+  spanIds: string[],
+): Promise<number> {
+  if (spanIds.length === 0) return 0;
+  const now = new Date().toISOString();
+  const rows = spanIds.map((spanId) => ({
+    span_id: spanId,
+    decision: "review",
+    confidence: 0,
+    reasoning: "admin-reseed close-loop fallback: missing attribution after reroute retries",
+    anchors: [],
+    suggested_aliases: [],
+    journal_references: [],
+    needs_review: true,
+    attribution_source: "system_close_loop_fallback",
+    evidence_tier: 3,
+    model_id: CLOSE_LOOP_MODEL_ID,
+    prompt_version: CLOSE_LOOP_PROMPT_VERSION,
+    attributed_by: `admin-reseed-${VERSION}`,
+    attributed_at: now,
+    raw_response: {
+      source: "admin-reseed-close-loop",
+      interaction_id: interactionId,
+      fallback_reason: "missing_attribution_after_reroute",
+    },
+  }));
+
+  const { data, error } = await db
+    .from("span_attributions")
+    .upsert(rows, {
+      onConflict: "span_id,model_id,prompt_version",
+      ignoreDuplicates: false,
+    })
+    .select("span_id");
+
+  if (error) {
+    throw new Error(`fallback_attribution_upsert_failed:${error.message}`);
+  }
+  return (data || []).length;
+}
+
+async function upsertCloseLoopReviewRows(
+  db: any,
+  interactionId: string,
+  spanIds: string[],
+): Promise<void> {
+  if (spanIds.length === 0) return;
+  const now = new Date().toISOString();
+  const rows = spanIds.map((spanId) => ({
+    interaction_id: interactionId,
+    span_id: spanId,
+    status: "pending",
+    reason_codes: ["close_loop_missing_attribution"],
+    reasons: ["close_loop_missing_attribution"],
+    context_payload: {
+      source: "admin-reseed-close-loop",
+      span_id: spanId,
+      created_at_utc: now,
+    },
+  }));
+
+  const { error } = await db
+    .from("review_queue")
+    .upsert(rows, { onConflict: "span_id" });
+
+  if (error) {
+    throw new Error(`close_loop_review_queue_upsert_failed:${error.message}`);
+  }
+}
+
+async function dismissStalePendingRows(
+  db: any,
+  interactionId: string,
+): Promise<number> {
+  const { data: staleRows, error: staleErr } = await db
+    .from("review_queue")
+    .select("id, span_id")
+    .eq("interaction_id", interactionId)
+    .eq("status", "pending");
+
+  if (staleErr) {
+    throw new Error(`stale_rows_query_failed:${staleErr.message}`);
+  }
+
+  const pendingRows = staleRows || [];
+  if (pendingRows.length === 0) return 0;
+
+  const spanIds = pendingRows.map((row: any) => row.span_id).filter(Boolean);
+  let spanScope = new Map<string, { interaction_id: string; is_superseded: boolean }>();
+  if (spanIds.length > 0) {
+    const { data: spans, error: spansErr } = await db
+      .from("conversation_spans")
+      .select("id, interaction_id, is_superseded")
+      .in("id", spanIds);
+    if (spansErr) {
+      throw new Error(`stale_rows_span_scope_failed:${spansErr.message}`);
+    }
+    spanScope = new Map((spans || []).map((s: any) => [s.id, {
+      interaction_id: s.interaction_id,
+      is_superseded: Boolean(s.is_superseded),
+    }]));
+  }
+
+  const staleIds = pendingRows
+    .filter((row: any) => {
+      if (!row.span_id) return true;
+      const scope = spanScope.get(row.span_id);
+      if (!scope) return true;
+      if (scope.interaction_id !== interactionId) return true;
+      return scope.is_superseded === true;
+    })
+    .map((row: any) => row.id);
+
+  if (staleIds.length === 0) return 0;
+
+  const { error: updErr } = await db
+    .from("review_queue")
+    .update({
+      status: "dismissed",
+      resolved_at: new Date().toISOString(),
+      resolved_by: "admin-reseed",
+      resolution_action: "auto_dismiss",
+      resolution_notes: "[admin-reseed close-loop] stale pending row auto-dismissed",
+    })
+    .in("id", staleIds);
+
+  if (updErr) {
+    throw new Error(`stale_rows_dismiss_failed:${updErr.message}`);
+  }
+  return staleIds.length;
+}
+
+async function getPendingScopeCounts(
+  db: any,
+  interactionId: string,
+): Promise<{ pendingOnSuperseded: number; pendingNullSpan: number; pendingOnActive: number }> {
+  const { data, error } = await db
+    .from("review_queue")
+    .select("id, span_id, status")
+    .eq("interaction_id", interactionId)
+    .eq("status", "pending");
+
+  if (error) {
+    throw new Error(`pending_counts_query_failed:${error.message}`);
+  }
+
+  const rows = data || [];
+  const spanIds = rows.map((row: any) => row.span_id).filter(Boolean);
+  const scope = new Map<string, { is_superseded: boolean }>();
+  if (spanIds.length > 0) {
+    const { data: spans, error: spansErr } = await db
+      .from("conversation_spans")
+      .select("id, is_superseded")
+      .in("id", spanIds);
+    if (spansErr) {
+      throw new Error(`pending_counts_span_scope_failed:${spansErr.message}`);
+    }
+    for (const span of spans || []) {
+      scope.set((span as any).id, { is_superseded: Boolean((span as any).is_superseded) });
+    }
+  }
+
+  let pendingOnSuperseded = 0;
+  let pendingNullSpan = 0;
+  let pendingOnActive = 0;
+  for (const row of rows) {
+    const spanId = (row as any).span_id;
+    if (!spanId) {
+      pendingNullSpan++;
+      continue;
+    }
+    const state = scope.get(spanId);
+    if (!state) {
+      pendingNullSpan++;
+      continue;
+    }
+    if (state.is_superseded) pendingOnSuperseded++;
+    else pendingOnActive++;
+  }
+
+  return { pendingOnSuperseded, pendingNullSpan, pendingOnActive };
+}
+
+async function closeLoopAfterReseed(params: {
+  db: any;
+  interactionId: string;
+  internalHeaders: Record<string, string>;
+  internalEndpoints: InternalEndpoints;
+}): Promise<CloseLoopResult> {
+  const { db, interactionId, internalHeaders, internalEndpoints } = params;
+
+  let attempts = 0;
+  let missingBefore = 0;
+  let missingAfter = 0;
+  let fallbackInserted = 0;
+
+  try {
+    for (let attempt = 1; attempt <= CLOSE_LOOP_MAX_ATTEMPTS; attempt++) {
+      attempts = attempt;
+      const latestSpans = await fetchLatestActiveSpans(db, interactionId);
+      const latestIds = latestSpans.map((s) => s.id);
+      const attributed = await fetchAttributedSpanSet(db, latestIds);
+      const missing = latestIds.filter((id) => !attributed.has(id));
+      if (attempt === 1) missingBefore = missing.length;
+      if (missing.length === 0) break;
+
+      for (const spanId of missing) {
+        await rerouteSpan({
+          spanId,
+          interactionId,
+          internalHeaders,
+          internalEndpoints,
+        });
+      }
+    }
+
+    const latestSpansAfter = await fetchLatestActiveSpans(db, interactionId);
+    const latestIdsAfter = latestSpansAfter.map((s) => s.id);
+    const attributedAfter = await fetchAttributedSpanSet(db, latestIdsAfter);
+    let missingFinal = latestIdsAfter.filter((id) => !attributedAfter.has(id));
+
+    if (missingFinal.length > 0) {
+      fallbackInserted = await insertCloseLoopFallbackAttributions(db, interactionId, missingFinal);
+      await upsertCloseLoopReviewRows(db, interactionId, missingFinal);
+
+      const attributedAfterFallback = await fetchAttributedSpanSet(db, latestIdsAfter);
+      missingFinal = latestIdsAfter.filter((id) => !attributedAfterFallback.has(id));
+    }
+    missingAfter = missingFinal.length;
+
+    const stalePendingDismissed = await dismissStalePendingRows(db, interactionId);
+    const pendingCounts = await getPendingScopeCounts(db, interactionId);
+    const ok = missingAfter === 0 && pendingCounts.pendingOnSuperseded === 0 && pendingCounts.pendingNullSpan === 0;
+
+    return {
+      ok,
+      detail: ok
+        ? "close_loop_ok"
+        : `integrity_violation missing_after=${missingAfter} pending_on_superseded=${pendingCounts.pendingOnSuperseded} pending_null=${pendingCounts.pendingNullSpan}`,
+      attempts,
+      missingBefore,
+      missingAfter,
+      fallbackInserted,
+      stalePendingDismissed,
+      pendingOnSuperseded: pendingCounts.pendingOnSuperseded,
+      pendingNullSpan: pendingCounts.pendingNullSpan,
+      latestAttributions: latestIdsAfter.length - missingAfter,
+    };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : "unknown";
+    return {
+      ok: false,
+      detail: `close_loop_error:${msg}`,
+      attempts,
+      missingBefore,
+      missingAfter: Number.MAX_SAFE_INTEGER,
+      fallbackInserted,
+      stalePendingDismissed: 0,
+      pendingOnSuperseded: Number.MAX_SAFE_INTEGER,
+      pendingNullSpan: Number.MAX_SAFE_INTEGER,
+      latestAttributions: 0,
+    };
+  }
+}
 
 function jsonResponse(data: Record<string, unknown>, status: number): Response {
   return new Response(JSON.stringify(data), {
@@ -951,7 +1350,7 @@ function deterministicSplit(transcript: string, transcriptChars: number): Segmen
 }
 
 async function writeOverrideLog(
-  db: ReturnType<typeof createClient>,
+  db: any,
   params: {
     interaction_id: string;
     idempotency_key: string;
