@@ -33,7 +33,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { authErrorResponse, requireEdgeSecret } from "../_shared/auth.ts";
 
-const VERSION = "1.5.0"; // v1.5.0: bounded reroute concurrency + timeout hardening for 504 reliability
+const VERSION = "1.6.0"; // v1.6.0: duplicate-key race recovery for conversation_spans_active_unique
 const ALLOWED_SOURCES = ["admin-reseed", "system"];
 const CLOSE_LOOP_MAX_ATTEMPTS = 2;
 const CLOSE_LOOP_MODEL_ID = "admin-reseed-close-loop";
@@ -126,6 +126,9 @@ interface ReseedReceipt {
   reroute_attempted?: number;
   reroute_succeeded?: number;
   reroute_failed?: number;
+  insert_conflict_recovered?: boolean;
+  conflict_constraint?: string | null;
+  adopted_generation?: number | null;
   close_loop_applied?: boolean;
   close_loop_attempts?: number;
   close_loop_missing_before?: number;
@@ -402,6 +405,9 @@ Deno.serve(async (req: Request) => {
   // not a trivial single-span chunker.
   // ========================================
   const newSpanIds: string[] = [];
+  let insertConflictRecoveredOverall = false;
+  let conflictConstraintOverall: string | null = null;
+  let adoptedGenerationOverall: number | null = null;
 
   // Generate request_id for structured logging
   const requestId = crypto.randomUUID();
@@ -659,6 +665,25 @@ Deno.serve(async (req: Request) => {
 
     // Insert attempt #1 (with segment_metadata); fallback if column not present.
     let inserted: { id: string; span_index: number }[] = [];
+    let insertConflictRecovered = false;
+    let conflictConstraint: string | null = null;
+    let adoptedGeneration: number | null = null;
+
+    const adoptActiveSpansAfterConflict = async (): Promise<boolean> => {
+      const active = await fetchLatestActiveSpans(db, interaction_id);
+      if (active.length === 0) return false;
+      inserted = active.map((row) => ({ id: row.id, span_index: row.span_index }));
+      adoptedGeneration = active[0]?.segment_generation ?? null;
+      insertConflictRecovered = true;
+      segmenterWarnings.push("insert_conflict_recovered_adopt_active");
+      structuredLog("WARN", "reseed_insert_conflict_recovered", requestId, interaction_id, newGeneration, {
+        conflict_constraint: conflictConstraint,
+        adopted_spans: inserted.length,
+        adopted_generation: adoptedGeneration,
+      });
+      return true;
+    };
+
     const ins1 = await db
       .from("conversation_spans")
       .insert(spanRowsWithMetadata)
@@ -667,7 +692,18 @@ Deno.serve(async (req: Request) => {
     if (ins1.error) {
       const msg = (ins1.error.message || "").toLowerCase();
       const missingMetaCol = msg.includes("segment_metadata") && msg.includes("does not exist");
-      if (!missingMetaCol) {
+      const duplicateActiveUnique = isActiveSpanUniqueConflict(ins1.error);
+      if (duplicateActiveUnique) {
+        conflictConstraint = "conversation_spans_active_unique";
+        const adopted = await adoptActiveSpansAfterConflict();
+        if (!adopted) {
+          return jsonResponse({
+            ok: false,
+            error: "db_write_failed",
+            detail: "duplicate_conflict_recovery_failed_no_active_spans",
+          }, 500);
+        }
+      } else if (!missingMetaCol) {
         console.error("[admin-reseed] Failed to insert new spans:", ins1.error.message);
         // FAIL CLOSED: rollback by marking old spans as not superseded
         if (activeSpanIds.length > 0) {
@@ -683,27 +719,42 @@ Deno.serve(async (req: Request) => {
         return jsonResponse({ ok: false, error: "db_write_failed", detail: ins1.error.message }, 500);
       }
 
-      const spanRowsNoMetadata = spanRowsWithMetadata.map(({ segment_metadata: _segment_metadata, ...rest }) => rest);
-      const ins2 = await db
-        .from("conversation_spans")
-        .insert(spanRowsNoMetadata as any)
-        .select("id, span_index");
+      if (missingMetaCol && !insertConflictRecovered) {
+        const spanRowsNoMetadata = spanRowsWithMetadata.map(({ segment_metadata: _segment_metadata, ...rest }) => rest);
+        const ins2 = await db
+          .from("conversation_spans")
+          .insert(spanRowsNoMetadata as any)
+          .select("id, span_index");
 
-      if (ins2.error) {
-        console.error("[admin-reseed] Failed to insert new spans:", ins2.error.message);
-        if (activeSpanIds.length > 0) {
-          await db
-            .from("conversation_spans")
-            .update({
-              is_superseded: false,
-              superseded_at: null,
-              superseded_by_action_id: null,
-            })
-            .in("id", activeSpanIds);
+        if (ins2.error) {
+          if (isActiveSpanUniqueConflict(ins2.error)) {
+            conflictConstraint = "conversation_spans_active_unique";
+            const adopted = await adoptActiveSpansAfterConflict();
+            if (!adopted) {
+              return jsonResponse({
+                ok: false,
+                error: "db_write_failed",
+                detail: "duplicate_conflict_recovery_failed_no_active_spans",
+              }, 500);
+            }
+          } else {
+            console.error("[admin-reseed] Failed to insert new spans:", ins2.error.message);
+            if (activeSpanIds.length > 0) {
+              await db
+                .from("conversation_spans")
+                .update({
+                  is_superseded: false,
+                  superseded_at: null,
+                  superseded_by_action_id: null,
+                })
+                .in("id", activeSpanIds);
+            }
+            return jsonResponse({ ok: false, error: "db_write_failed", detail: ins2.error.message }, 500);
+          }
+        } else {
+          inserted = (ins2.data || []) as any;
         }
-        return jsonResponse({ ok: false, error: "db_write_failed", detail: ins2.error.message }, 500);
       }
-      inserted = (ins2.data || []) as any;
     } else {
       inserted = (ins1.data || []) as any;
     }
@@ -717,7 +768,17 @@ Deno.serve(async (req: Request) => {
       superseded_count: activeSpanIds.length,
       spans_active_after: newSpanIds.length,
       segmenter_version: segmenterVersion,
+      insert_conflict_recovered: insertConflictRecovered,
+      conflict_constraint: conflictConstraint,
+      adopted_generation: adoptedGeneration,
     });
+
+    if (insertConflictRecovered) {
+      segmenterWarnings.push("active_unique_conflict_recovered");
+    }
+    insertConflictRecoveredOverall = insertConflictRecovered;
+    conflictConstraintOverall = conflictConstraint;
+    adoptedGenerationOverall = adoptedGeneration;
   }
 
   // ========================================
@@ -736,6 +797,9 @@ Deno.serve(async (req: Request) => {
     superseded_span_ids: activeSpanIds,
     new_span_ids: newSpanIds,
     reroute_triggered: false,
+    insert_conflict_recovered: insertConflictRecoveredOverall,
+    conflict_constraint: conflictConstraintOverall,
+    adopted_generation: adoptedGenerationOverall,
   };
 
   // ========================================
@@ -1071,6 +1135,16 @@ async function fetchAttributedSpanSet(
     throw new Error(`attribution_fetch_failed:${error.message}`);
   }
   return new Set((data || []).map((row: any) => row.span_id));
+}
+
+function isActiveSpanUniqueConflict(
+  error: { message?: string | null; details?: string | null; code?: string | null } | null | undefined,
+): boolean {
+  if (!error) return false;
+  const blob = `${error.message || ""} ${error.details || ""}`.toLowerCase();
+  return blob.includes("conversation_spans_active_unique") ||
+    (blob.includes("duplicate key value violates unique constraint") &&
+      blob.includes("conversation_spans"));
 }
 
 async function insertCloseLoopFallbackAttributions(
