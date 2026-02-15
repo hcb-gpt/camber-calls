@@ -598,7 +598,19 @@ Deno.serve(async (req: Request) => {
         status: "running",
         config: { model, prompt_version: PROMPT_VERSION, function_version: FUNCTION_VERSION, span_id },
       });
-      if (runErr) console.error("[journal-extract] journal_runs insert failed:", runErr.message);
+      if (runErr) {
+        console.error("[journal-extract] journal_runs insert failed:", runErr.message);
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            error_code: "journal_runs_insert_failed",
+            error: runErr.message,
+            interaction_id,
+            span_id,
+          }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        );
+      }
     }
 
     // ── TRANSCRIPT TRUNCATION ────────────────────────────────────
@@ -697,6 +709,16 @@ Deno.serve(async (req: Request) => {
         }).eq("run_id", run_id);
         if (noProjectUpdateErr) {
           console.error("[journal-extract] journal_runs update (no project) failed:", noProjectUpdateErr.message);
+          return new Response(
+            JSON.stringify({
+              ok: false,
+              error_code: "journal_runs_status_update_failed",
+              error: noProjectUpdateErr.message,
+              interaction_id,
+              span_id,
+            }),
+            { status: 500, headers: { "Content-Type": "application/json" } },
+          );
         }
       } else {
         const claimRows = extraction.claims.map((c) => {
@@ -748,6 +770,24 @@ Deno.serve(async (req: Request) => {
 
         if (claimErr) {
           console.error("[journal-extract] journal_claims insert failed:", claimErr.message);
+          // Best-effort: mark the run as failed
+          try {
+            await db.from("journal_runs").update({
+              status: "failed",
+              completed_at: new Date().toISOString(),
+              error_message: `journal_claims_write_failed: ${claimErr.message}`.slice(0, 500),
+            }).eq("run_id", run_id);
+          } catch { /* best-effort */ }
+          return new Response(
+            JSON.stringify({
+              ok: false,
+              error_code: "journal_claims_write_failed",
+              error: claimErr.message,
+              interaction_id,
+              span_id,
+            }),
+            { status: 500, headers: { "Content-Type": "application/json" } },
+          );
         } else {
           const insertedCount = typeof insertedCountRaw === "number"
             ? insertedCountRaw
@@ -771,6 +811,16 @@ Deno.serve(async (req: Request) => {
           const { error: loopErr } = await db.from("journal_open_loops").insert(loopRows);
           if (loopErr) {
             console.error("[journal-extract] journal_open_loops insert failed:", loopErr.message);
+            return new Response(
+              JSON.stringify({
+                ok: false,
+                error_code: "journal_open_loops_write_failed",
+                error: loopErr.message,
+                interaction_id,
+                span_id,
+              }),
+              { status: 500, headers: { "Content-Type": "application/json" } },
+            );
           } else {
             loops_written = loopRows.length;
           }
@@ -783,6 +833,16 @@ Deno.serve(async (req: Request) => {
         }).eq("run_id", run_id);
         if (successUpdateErr) {
           console.error("[journal-extract] journal_runs update (success) failed:", successUpdateErr.message);
+          return new Response(
+            JSON.stringify({
+              ok: false,
+              error_code: "journal_runs_status_update_failed",
+              error: successUpdateErr.message,
+              interaction_id,
+              span_id,
+            }),
+            { status: 500, headers: { "Content-Type": "application/json" } },
+          );
         }
 
         if (claims_written > 0 && project_id && run_id && expectedSecret) {
