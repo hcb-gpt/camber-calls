@@ -1,13 +1,19 @@
 /**
- * ai-router Edge Function v1.11.0
+ * ai-router Edge Function v1.11.1
  * LLM-based project attribution for conversation spans
  *
- * @version 1.11.0
+ * @version 1.11.1
  * @date 2026-02-15
  * @purpose Use Claude Haiku to attribute spans to projects with anchored evidence
  *
  * CORE PRINCIPLE: span_attributions is the single source of truth.
  * NO writes to interactions.project_id from this path.
+ *
+ * v1.11.1 Changes (homeowner override strong-anchor equivalence):
+ * - Treats context_package.meta.homeowner_override=true (without contradiction metadata)
+ *   as a strong-anchor equivalent for gating/review-queue reason generation.
+ * - Prevents weak_anchor / geo_only review reasons for deterministic homeowner overrides
+ *   unless explicit contradiction metadata is present.
  *
  * v1.11.0 Changes (bizdev/prospect commitment gate):
  * - Added bizdev/prospect classifier with evidence tags from transcript terms
@@ -60,9 +66,10 @@ import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 import { parseLlmJson } from "../_shared/llm_json.ts";
 import { applyCommonAliasCorroborationGuardrail, isCommonWordAlias } from "./alias_guardrails.ts";
 import { applyBizDevCommitmentGate } from "./bizdev_guardrails.ts";
+import { homeownerOverrideActsAsStrongAnchor } from "./homeowner_override_gate.ts";
 
-const PROMPT_VERSION = "v1.11.0"; // v1.11.0: bizdev/prospect commitment gate
-const FUNCTION_VERSION = "v1.11.0";
+const PROMPT_VERSION = "v1.11.0"; // prompt unchanged since v1.11.0
+const FUNCTION_VERSION = "v1.11.1";
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
 
@@ -784,6 +791,8 @@ Deno.serve(async (req: Request) => {
     });
   }
 
+  const homeownerOverrideStrongAnchor = homeownerOverrideActsAsStrongAnchor(context_package.meta);
+
   const db = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
@@ -857,10 +866,14 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    if (decision === "assign" && !hasStrongAnchor(validatedAnchors)) {
+    if (decision === "assign" && !hasStrongAnchor(validatedAnchors) && !homeownerOverrideStrongAnchor) {
       decision = "review";
       console.log(
         `[ai-router] Downgraded to review: only weak anchors (city/location), no strong anchor (project name, address, client)`,
+      );
+    } else if (decision === "assign" && !hasStrongAnchor(validatedAnchors) && homeownerOverrideStrongAnchor) {
+      console.log(
+        "[ai-router] Homeowner override active: preserving assign despite weak anchor set",
       );
     }
 
@@ -1052,11 +1065,12 @@ Deno.serve(async (req: Request) => {
     const interaction_id = context_package.meta?.interaction_id;
     const quoteVerified = result.anchors.length > 0;
     const strongAnchorPresent = hasStrongAnchor(result.anchors);
+    const effectiveStrongAnchor = strongAnchorPresent || homeownerOverrideStrongAnchor;
 
     const needsReviewQueue = result.decision !== "assign" ||
       needs_review === true ||
       !quoteVerified ||
-      !strongAnchorPresent ||
+      !effectiveStrongAnchor ||
       common_alias_unconfirmed ||
       bizdev_without_commitment ||
       model_error;
@@ -1065,11 +1079,11 @@ Deno.serve(async (req: Request) => {
       const reason_codes = buildReasonCodes({
         modelReasons: null,
         quoteVerified,
-        strongAnchor: strongAnchorPresent,
+        strongAnchor: effectiveStrongAnchor,
         modelError: model_error,
         ambiguousContact: (context_package.contact?.fanout_class === "floater" ||
           context_package.contact?.fanout_class === "drifter") || (context_package.contact?.floater_flag === true),
-        geoOnly: !strongAnchorPresent && result.anchors.some((a) => a.match_type === "city_or_location"),
+        geoOnly: !effectiveStrongAnchor && result.anchors.some((a) => a.match_type === "city_or_location"),
         commonAliasUnconfirmed: common_alias_unconfirmed,
         bizdevWithoutCommitment: bizdev_without_commitment,
       });
@@ -1095,6 +1109,12 @@ Deno.serve(async (req: Request) => {
           commitment_to_start: bizdev_commitment_to_start,
           commitment_tags: bizdev_commitment_tags,
           gate_active: bizdev_without_commitment,
+        },
+        homeowner_override: {
+          active: homeownerOverrideStrongAnchor,
+          project_id: context_package.meta?.homeowner_override_project_id || null,
+          conflict_project_id: context_package.meta?.homeowner_override_conflict_project_id || null,
+          conflict_term: context_package.meta?.homeowner_override_conflict_term || null,
         },
         model_id: MODEL_ID,
         prompt_version: PROMPT_VERSION,

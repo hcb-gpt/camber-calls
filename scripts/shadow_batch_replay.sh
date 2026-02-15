@@ -109,7 +109,7 @@ call_admin_reseed() {
   local out_dir="$3"
 
   local url="${SUPABASE_URL}/functions/v1/admin-reseed"
-  local body="{\"interaction_id\":\"${interaction_id}\",\"mode\":\"resegment_and_reroute\",\"idempotency_key\":\"${idem_key}\",\"reason\":\"shadow_batch_replay\"}"
+  local body="{\"interaction_id\":\"${interaction_id}\",\"mode\":\"reseed_and_close_loop\",\"idempotency_key\":\"${idem_key}\",\"reason\":\"shadow_batch_replay\"}"
 
   local attempt=0
   local http_status="000"
