@@ -255,7 +255,7 @@ function levenshteinDistanceWithLimit(a: string, b: string, maxDistance: number)
 
     for (let j = 1; j <= b.length; j++) {
       const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      let value = Math.min(
+      const value = Math.min(
         prevRow[j] + 1,
         row[j - 1] + 1,
         prevRow[j - 1] + cost,
@@ -627,9 +627,7 @@ function buildUserPrompt(ctx: ContextPackage): string {
    - Status: ${c.status || "N/A"}, Phase: ${c.phase || "N/A"}
    - Evidence: assigned=${c.evidence.assigned}, affinity=${c.evidence.affinity_weight.toFixed(2)}, source_strength=${
       (c.evidence.source_strength ?? 0).toFixed(2)
-    }, sources=[${
-      c.evidence.sources.join(",")
-    }]
+    }, sources=[${c.evidence.sources.join(",")}]
    - ${geoSummary}
    - ${aliasMatchSummary}
 ${journalSummary}`;

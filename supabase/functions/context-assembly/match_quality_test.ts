@@ -22,7 +22,9 @@ function classifyMatchStrength(
   const nameLower = projectName.toLowerCase();
 
   if (termLower === nameLower || matchType === "exact_project_name" || matchType === "name_match") return "strong";
-  const isExplicitAddress = /\d/.test(termLower) || /\b(?:st|street|ave|avenue|blvd|boulevard|rd|road|dr|drive|ln|lane|ct|court|cir|circle|pl|place|pkwy|parkway|way)\b/.test(termLower);
+  const isExplicitAddress = /\d/.test(termLower) ||
+    /\b(?:st|street|ave|avenue|blvd|boulevard|rd|road|dr|drive|ln|lane|ct|court|cir|circle|pl|place|pkwy|parkway|way)\b/
+      .test(termLower);
   if (matchType === "city_or_location" || matchType === "location_match") {
     if (isExplicitAddress) return "strong";
     return "weak";

@@ -72,10 +72,10 @@ function parseConsolidationJson(raw: string): ConsolidationResponse {
 
   const cross_project_signals = Array.isArray(parsed.cross_project_signals)
     ? parsed.cross_project_signals.map((s: any) => ({
-        claim_id: String(s.claim_id || ""),
-        implied_project_hint: String(s.implied_project_hint || "").slice(0, 200),
-        reasoning: String(s.reasoning || "").slice(0, 500),
-      }))
+      claim_id: String(s.claim_id || ""),
+      implied_project_hint: String(s.implied_project_hint || "").slice(0, 200),
+      reasoning: String(s.reasoning || "").slice(0, 500),
+    }))
     : [];
 
   return { judgments, cross_project_signals };
@@ -93,7 +93,8 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
   }
 }
 
-const SYSTEM_PROMPT = `You are a construction project knowledge consolidation engine for HCB (Heartwood Custom Builders).
+const SYSTEM_PROMPT =
+  `You are a construction project knowledge consolidation engine for HCB (Heartwood Custom Builders).
 
 You receive:
 1. NEW CLAIMS - recently extracted from phone call transcripts
@@ -151,7 +152,8 @@ Deno.serve(async (req: Request) => {
 
   if (req.method !== "POST") {
     return new Response(JSON.stringify({ error: "POST only" }), {
-      status: 405, headers: { "Content-Type": "application/json" },
+      status: 405,
+      headers: { "Content-Type": "application/json" },
     });
   }
 
@@ -172,7 +174,8 @@ Deno.serve(async (req: Request) => {
     body = await req.json();
   } catch {
     return new Response(JSON.stringify({ error: "Invalid JSON" }), {
-      status: 400, headers: { "Content-Type": "application/json" },
+      status: 400,
+      headers: { "Content-Type": "application/json" },
     });
   }
 
@@ -345,7 +348,6 @@ If there are no existing claims, mark everything as "new" with confidence 1.0.`;
             .update({ active: false })
             .eq("claim_id", j.related_claim_id);
           superseded++;
-
         } else if (j.relationship === "corroborates" && j.related_claim_id) {
           await db.from("journal_claims")
             .update({ relationship: "corroborates" })
@@ -356,7 +358,6 @@ If there are no existing claims, mark everything as "new" with confidence 1.0.`;
               .eq("claim_id", j.related_claim_id);
           }
           corroborated++;
-
         } else if (j.relationship === "conflicts" && j.related_claim_id) {
           await db.from("journal_claims")
             .update({ relationship: "conflicts" })
@@ -376,10 +377,20 @@ If there are no existing claims, mark everything as "new" with confidence 1.0.`;
             item_id: j.claim_id,
             call_id: claimB?.call_id || null,
             project_id,
-            reason: `Conflict detected: ${j.conflict_type || 'factual'}`,
+            reason: `Conflict detected: ${j.conflict_type || "factual"}`,
             data: {
-              claim_a: { claim_id: j.related_claim_id, claim_text: claimA?.claim_text || "(unknown)", call_id: claimA?.call_id || null, created_at: claimA?.created_at || null },
-              claim_b: { claim_id: j.claim_id, claim_text: claimB?.claim_text || "(unknown)", call_id: claimB?.call_id || null, created_at: claimB?.created_at || null },
+              claim_a: {
+                claim_id: j.related_claim_id,
+                claim_text: claimA?.claim_text || "(unknown)",
+                call_id: claimA?.call_id || null,
+                created_at: claimA?.created_at || null,
+              },
+              claim_b: {
+                claim_id: j.claim_id,
+                claim_text: claimB?.claim_text || "(unknown)",
+                call_id: claimB?.call_id || null,
+                created_at: claimB?.created_at || null,
+              },
               conflict_type: j.conflict_type,
               llm_reasoning: j.reasoning,
               confidence: j.confidence,
@@ -388,7 +399,6 @@ If there are no existing claims, mark everything as "new" with confidence 1.0.`;
           });
           conflicts_detected++;
           review_queue_entries++;
-
         } else {
           remained_new++;
         }
@@ -456,7 +466,6 @@ If there are no existing claims, mark everything as "new" with confidence 1.0.`;
       }),
       { status: 200, headers: { "Content-Type": "application/json" } },
     );
-
   } catch (e: any) {
     console.error("[journal-consolidate] Error:", e.message);
 

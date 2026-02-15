@@ -49,6 +49,7 @@ function stripCodeFences(raw: string): string {
 }
 
 function stripControlChars(s: string): string {
+  // deno-lint-ignore no-control-regex -- intentional: scrub control chars from LLM output
   return s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
 }
 
@@ -322,8 +323,8 @@ Deno.serve(async (req: Request) => {
     const llmResult = parseLlmJson(rawContent);
 
     // 5. Filter to resolved matches above confidence threshold
-    const validLoopIds = new Set(openLoops.map(l => l.id));
-    const resolvedMatches = llmResult.matches.filter(m =>
+    const validLoopIds = new Set(openLoops.map((l) => l.id));
+    const resolvedMatches = llmResult.matches.filter((m) =>
       m.resolved &&
       m.confidence >= CLOSURE_CONFIDENCE_THRESHOLD &&
       m.evidence.length > 0 &&
@@ -370,12 +371,12 @@ Deno.serve(async (req: Request) => {
     }
 
     // 7. Also report below-threshold matches for visibility
-    const belowThreshold = llmResult.matches.filter(m =>
+    const belowThreshold = llmResult.matches.filter((m) =>
       m.resolved &&
       m.confidence < CLOSURE_CONFIDENCE_THRESHOLD &&
       m.confidence > 0 &&
       validLoopIds.has(m.loop_id)
-    ).map(m => ({
+    ).map((m) => ({
       loop_id: m.loop_id,
       confidence: m.confidence,
       reason: "below_threshold",

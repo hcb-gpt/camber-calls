@@ -128,7 +128,9 @@ function classifyMatchStrength(
   // Exact project name match is always strong
   if (termLower === nameLower || matchType === "name_match") return "strong";
 
-  const isExplicitAddress = /\d/.test(termLower) || /\b(?:st|street|ave|avenue|blvd|boulevard|rd|road|dr|drive|ln|lane|ct|court|cir|circle|pl|place|pkwy|parkway|way)\b/.test(termLower);
+  const isExplicitAddress = /\d/.test(termLower) ||
+    /\b(?:st|street|ave|avenue|blvd|boulevard|rd|road|dr|drive|ln|lane|ct|court|cir|circle|pl|place|pkwy|parkway|way)\b/
+      .test(termLower);
 
   // Location matches are weak (city-only corroboration) unless explicitly address-like
   if (matchType === "location_match" || matchType === "city_or_location") {

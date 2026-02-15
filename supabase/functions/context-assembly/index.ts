@@ -440,7 +440,9 @@ function classifyMatchStrength(
   // Exact project name match is always strong
   if (termLower === nameLower || matchType === "exact_project_name" || matchType === "name_match") return "strong";
 
-  const isExplicitAddress = /\d/.test(termLower) || /\b(?:st|street|ave|avenue|blvd|boulevard|rd|road|dr|drive|ln|lane|ct|court|cir|circle|pl|place|pkwy|parkway|way)\b/.test(termLower);
+  const isExplicitAddress = /\d/.test(termLower) ||
+    /\b(?:st|street|ave|avenue|blvd|boulevard|rd|road|dr|drive|ln|lane|ct|court|cir|circle|pl|place|pkwy|parkway|way)\b/
+      .test(termLower);
 
   // Location matches are weak (city-only corroboration) unless explicitly address-like
   if (matchType === "city_or_location" || matchType === "location_match") {
@@ -1621,7 +1623,9 @@ Deno.serve(async (req: Request) => {
               const source = claimSourceByCall.get(row.call_id);
 
               const isMatchedScope = contact_id
-                ? source ? matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone) : false
+                ? source
+                  ? matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone)
+                  : false
                 : interaction_project_id
                 ? row.project_id === interaction_project_id
                 : false;
@@ -1726,7 +1730,14 @@ Deno.serve(async (req: Request) => {
                 if (tradeMatchProjects.size > 0) {
                   sources_used.push("other_party_trade_match_v2");
                   for (const pid of tradeMatchProjects) {
-                    addCandidate(pid, "other_party_trade_match", 0, undefined, undefined, SOURCE_SCORE_OTHER_PARTY_TRADE_MATCH);
+                    addCandidate(
+                      pid,
+                      "other_party_trade_match",
+                      0,
+                      undefined,
+                      undefined,
+                      SOURCE_SCORE_OTHER_PARTY_TRADE_MATCH,
+                    );
                   }
                 }
               }
@@ -2234,7 +2245,10 @@ Deno.serve(async (req: Request) => {
               const source = c.call_id ? sourceCalls.get(c.call_id) : undefined;
               if (!source) continue;
               // Floater modifier: internal floaters see all project claims (unscoped)
-              if (!isInternalFloater && !matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone)) {
+              if (
+                !isInternalFloater &&
+                !matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone)
+              ) {
                 continue;
               }
               if (!claimsByProject.has(c.project_id)) claimsByProject.set(c.project_id, []);
@@ -2257,7 +2271,10 @@ Deno.serve(async (req: Request) => {
               const source = l.call_id ? sourceCalls.get(l.call_id) : undefined;
               if (!source) continue;
               // Floater modifier: internal floaters see all project loops (unscoped)
-              if (!isInternalFloater && !matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone)) {
+              if (
+                !isInternalFloater &&
+                !matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone)
+              ) {
                 continue;
               }
               if (!loopsByProject.has(l.project_id)) loopsByProject.set(l.project_id, []);
