@@ -2051,6 +2051,7 @@ Deno.serve(async (req: Request) => {
             .select("project_id, call_id, claim_text")
             .in("project_id", Array.from(claimProjectIds))
             .eq("active", true)
+            .eq("claim_confirmation_state", "confirmed")
             .order("created_at", { ascending: false })
             .limit(Math.max(8, claimProjectIds.size * 8));
 
@@ -2243,6 +2244,7 @@ Deno.serve(async (req: Request) => {
             .from("journal_claims")
             .select("claim_project_id")
             .eq("active", true)
+            .eq("claim_confirmation_state", "confirmed")
             .not("claim_project_id", "is", null)
             .or(likePatterns.map((p) => `claim_text.ilike.${p}`).join(","))
             .limit(100);
@@ -2814,6 +2816,7 @@ Deno.serve(async (req: Request) => {
             .select("project_id, call_id, claim_type, claim_text, epistemic_status, created_at")
             .in("project_id", candidateProjectIds)
             .eq("active", true)
+            .eq("claim_confirmation_state", "confirmed")
             .order("created_at", { ascending: false })
             .limit(candidateProjectIds.length * 25);
 

@@ -255,6 +255,7 @@ Deno.serve(async (req: Request) => {
       .select("claim_id, call_id, claim_type, claim_text, epistemic_status, warrant_level, relationship, created_at")
       .eq("project_id", project_id)
       .eq("active", true)
+      .eq("claim_confirmation_state", "confirmed")
       .not("claim_id", "in", `(${newClaimIds.join(",")})`)
       .order("created_at", { ascending: true })
       .limit(MAX_EXISTING_CLAIMS_CONTEXT);
