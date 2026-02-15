@@ -714,15 +714,18 @@ Deno.serve(async (req: Request) => {
         skipped_non_assign_write_gate = true;
         blocked_by_write_gate_claims = extraction.claims.length;
         console.log(
-          `[journal-extract][metric] review_contamination_write_blocked span_id=${span_id} decision=${attribution_decision ?? "unknown"} blocked_claims=${blocked_by_write_gate_claims}`,
+          `[journal-extract][metric] review_contamination_write_blocked span_id=${span_id} decision=${
+            attribution_decision ?? "unknown"
+          } blocked_claims=${blocked_by_write_gate_claims}`,
         );
 
         const { error: gateUpdateErr } = await db.from("journal_runs").update({
           status: "success",
           completed_at: new Date().toISOString(),
           claims_extracted: extraction.claims.length,
-          error_message:
-            `write_gate_non_assign_blocked: decision=${attribution_decision ?? "unknown"} blocked_claims=${blocked_by_write_gate_claims}`,
+          error_message: `write_gate_non_assign_blocked: decision=${
+            attribution_decision ?? "unknown"
+          } blocked_claims=${blocked_by_write_gate_claims}`,
         }).eq("run_id", run_id);
         if (gateUpdateErr) {
           console.error("[journal-extract] journal_runs update (write gate) failed:", gateUpdateErr.message);
