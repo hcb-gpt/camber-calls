@@ -22,6 +22,8 @@ export function normalizeDirection(direction: unknown): CallDirection {
 
 type ResolveCallPartyPhonesInput = {
   direction?: unknown;
+  from_phone_norm?: unknown;
+  to_phone_norm?: unknown;
   from_phone?: unknown;
   to_phone?: unknown;
   owner_phone?: unknown;
@@ -39,8 +41,8 @@ export function resolveCallPartyPhones(
   input: ResolveCallPartyPhonesInput,
 ): ResolveCallPartyPhonesResult {
   const direction = normalizeDirection(input.direction);
-  const fromPhone = firstNonEmpty(input.from_phone);
-  const toPhone = firstNonEmpty(input.to_phone);
+  const fromPhone = firstNonEmpty(input.from_phone_norm, input.from_phone);
+  const toPhone = firstNonEmpty(input.to_phone_norm, input.to_phone);
 
   const ownerPhone = firstNonEmpty(
     input.owner_phone,

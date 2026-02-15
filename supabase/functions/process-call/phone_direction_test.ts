@@ -21,6 +21,21 @@ Deno.test("resolveCallPartyPhones inbound uses to=owner and from=other_party", (
   assertEquals(result.otherPartyPhone, "+15551230001");
 });
 
+Deno.test("resolveCallPartyPhones inbound uses normalized phones when present", () => {
+  const result = resolveCallPartyPhones({
+    direction: "inbound",
+    from_phone_norm: "+15551230001",
+    to_phone_norm: "+15551239999",
+    // Raw fields can be absent in some webhook payloads.
+    from_phone: null,
+    to_phone: null,
+  });
+
+  assertEquals(result.direction, "inbound");
+  assertEquals(result.ownerPhone, "+15551239999");
+  assertEquals(result.otherPartyPhone, "+15551230001");
+});
+
 Deno.test("resolveCallPartyPhones outbound uses from=owner and to=other_party", () => {
   const result = resolveCallPartyPhones({
     direction: "outbound",
@@ -44,6 +59,19 @@ Deno.test("resolveCallPartyPhones respects explicit owner/other_party fields", (
 
   assertEquals(result.ownerPhone, "+15550000001");
   assertEquals(result.otherPartyPhone, "+15550000002");
+});
+
+Deno.test("resolveCallPartyPhones prefers normalized values over raw values", () => {
+  const result = resolveCallPartyPhones({
+    direction: "inbound",
+    from_phone_norm: "+15550000001",
+    to_phone_norm: "+15550000002",
+    from_phone: "+16660000001",
+    to_phone: "+16660000002",
+  });
+
+  assertEquals(result.ownerPhone, "+15550000002");
+  assertEquals(result.otherPartyPhone, "+15550000001");
 });
 
 Deno.test("resolveCallPartyPhones unknown direction keeps historical fallback", () => {
