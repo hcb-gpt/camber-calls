@@ -2,6 +2,5 @@
 -- Run: scripts/query.sh --file scripts/sql/proofs/ci_gates_summary.sql
 
 select *
-from public.ci_gate_all()
+from public.ci_run_all_gates()
 order by gate_name;
-
