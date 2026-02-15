@@ -703,6 +703,7 @@ Deno.serve(async (req: Request) => {
           const speaker = c.speaker_label ? speakerContactMap.get(c.speaker_label) : null;
           const claim_id = crypto.randomUUID();
           claim_ids.push(claim_id);
+          const claimIsConfirmed = attribution?.decision === "assign" && !!project_id;
 
           return {
             claim_id,
@@ -714,6 +715,10 @@ Deno.serve(async (req: Request) => {
             source_span_id: span_id,
             claim_type: c.claim_type,
             claim_text: c.claim_text,
+            attribution_decision: attribution?.decision || null,
+            claim_confirmation_state: claimIsConfirmed ? "confirmed" : "unconfirmed",
+            confirmed_at: claimIsConfirmed ? new Date().toISOString() : null,
+            confirmed_by: claimIsConfirmed ? "journal_extract_auto_assign" : null,
             epistemic_status: c.epistemic_status,
             warrant_level: c.warrant_level,
             testimony_type: c.testimony_type,
