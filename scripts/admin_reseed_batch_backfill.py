@@ -12,6 +12,8 @@ Required env vars:
 - SUPABASE_URL
 - SUPABASE_SERVICE_ROLE_KEY
 - EDGE_SHARED_SECRET
+- ORIGIN_SESSION
+- CLAIM_RECEIPT
 
 Example:
   python3 scripts/admin_reseed_batch_backfill.py \
@@ -57,6 +59,15 @@ def _require_env(name: str) -> str:
     value = (os.environ.get(name) or "").strip()
     if not value:
         raise RuntimeError(f"Missing required env var: {name}")
+    return value
+
+
+def _require_claim_env(name: str) -> str:
+    value = (os.environ.get(name) or "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required claim context env var: {name}")
+    if name == "CLAIM_RECEIPT" and not value.startswith("claim__"):
+        raise RuntimeError(f"CLAIM_RECEIPT must begin with 'claim__' (got: {value})")
     return value
 
 
@@ -155,6 +166,8 @@ def _call_admin_reseed(
     base_url: str,
     service_key: str,
     edge_secret: str,
+    origin_session: str,
+    claim_receipt: str,
     interaction_id: str,
     mode: str,
     reason: str,
@@ -165,13 +178,16 @@ def _call_admin_reseed(
         "Authorization": f"Bearer {service_key}",
         "X-Edge-Secret": edge_secret,
         "X-Source": "admin-reseed",
+        "X-Origin-Session": origin_session,
+        "X-Claim-Receipt": claim_receipt,
     }
     payload = {
         "interaction_id": interaction_id,
         "reason": reason,
         "idempotency_key": f"{idempotency_prefix}:{interaction_id}",
         "mode": mode,
-        "requested_by": "dev-12-batch-reseed",
+        "requested_by": origin_session,
+        "claim_receipt": claim_receipt,
     }
     url = f"{base_url}/functions/v1/admin-reseed"
     t0 = time.time()
@@ -225,6 +241,8 @@ def main() -> int:
         base_url = _require_env("SUPABASE_URL").rstrip("/")
         service_key = _require_env("SUPABASE_SERVICE_ROLE_KEY")
         edge_secret = _require_env("EDGE_SHARED_SECRET")
+        origin_session = _require_claim_env("ORIGIN_SESSION")
+        claim_receipt = _require_claim_env("CLAIM_RECEIPT")
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -243,6 +261,8 @@ def main() -> int:
     print(f"max_per_minute: {args.max_per_minute}")
     print(f"progress_every: {args.progress_every}")
     print(f"output_dir: {output_dir}")
+    print(f"origin_session: {origin_session}")
+    print(f"claim_receipt: {claim_receipt}")
 
     try:
         candidates = _list_unsegmented_interactions(base_url, service_key)
@@ -291,6 +311,8 @@ def main() -> int:
                 base_url=base_url,
                 service_key=service_key,
                 edge_secret=edge_secret,
+                origin_session=origin_session,
+                claim_receipt=claim_receipt,
                 interaction_id=interaction_id,
                 mode=args.mode,
                 reason=args.reason,
@@ -342,6 +364,8 @@ def main() -> int:
         "mode": args.mode,
         "max_per_minute": args.max_per_minute,
         "progress_every": args.progress_every,
+        "origin_session": origin_session,
+        "claim_receipt": claim_receipt,
         "total_candidates": stats.total_candidates,
         "attempted": stats.attempted,
         "succeeded": stats.succeeded,
@@ -364,4 +388,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
