@@ -1,9 +1,9 @@
 /**
- * process-call Edge Function v4.3.3
+ * process-call Edge Function v4.3.4
  * Full v3.6 pipeline in Supabase - Ported from v4.0.22 context_assembly
  *
- * @version 4.3.3
- * @date 2026-02-14
+ * @version 4.3.4
+ * @date 2026-02-15
  * @port context_assembly v4.0.22 - 6-source ranking, word boundaries, speaker stripping
  *
  * PR-12 HARDENING:
@@ -17,6 +17,12 @@
  *
  * v4.3.2 CHANGES (lineage persistence):
  * - Persist zapier_zap_id and zapier_run_id from _zapier_ingest_meta into calls_raw.
+ *
+ * v4.3.4 CHANGES (phone role mapping fix):
+ * - Resolve owner/other-party phones by explicit fields first.
+ * - Apply direction-aware fallback from from_phone/to_phone:
+ *   inbound => owner=to_phone, other_party=from_phone
+ *   outbound => owner=from_phone, other_party=to_phone
  *
  * v4.3.3 CHANGES (shadow replay support):
  * - Persist `is_shadow` on calls_raw + interactions.
@@ -34,8 +40,9 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { normalizePhoneForLookup } from "./phone_lookup.ts";
+import { resolveCallPartyPhones } from "./phone_direction.ts";
 
-const PROCESS_CALL_VERSION = "v4.3.3"; // shadow replay + auth hardening + lineage persistence + pipeline chain fix
+const PROCESS_CALL_VERSION = "v4.3.4"; // direction-aware phone role mapping + shadow replay + auth hardening + lineage persistence + pipeline chain fix
 const GATE = { PASS: "PASS", SKIP: "SKIP", NEEDS_REVIEW: "NEEDS_REVIEW" };
 const ID_PATTERN = /^cll_[a-zA-Z0-9_]+$/;
 const ALLOWED_PROVENANCE_SOURCES = [
@@ -365,15 +372,22 @@ Deno.serve(async (req: Request) => {
       pipeline_version: PROCESS_CALL_VERSION,
       processed_by: "process-call",
       persisted_to_calls_raw: false,
-      i1_phone_present: !!(raw.from_phone || raw.to_phone),
+      i1_phone_present: !!(
+        raw.from_phone ||
+        raw.to_phone ||
+        raw.owner_phone ||
+        raw.other_party_phone ||
+        raw.contact_phone
+      ),
       i2_unique_id: !id_gen,
     }).select("id").single();
     if (ad) audit_id = ad.id;
 
     // M1: Normalize input
     const n = m1(raw);
-    const phone = n.to_phone || n.other_party_phone || n.contact_phone;
-    const lookupPhone = normalizePhoneForLookup(phone);
+    const partyPhones = resolveCallPartyPhones(n);
+    const persistedDirection = partyPhones.direction === "unknown" ? n.direction || null : partyPhones.direction;
+    const lookupPhone = normalizePhoneForLookup(partyPhones.otherPartyPhone);
 
     // ========================================
     // CONTACT RESOLUTION
@@ -754,9 +768,9 @@ Deno.serve(async (req: Request) => {
     const { data: cr } = await db.from("calls_raw").upsert({
       interaction_id: iid,
       channel: "call",
-      direction: n.direction || null,
-      owner_phone: n.from_phone || null,
-      other_party_phone: phone || null,
+      direction: persistedDirection,
+      owner_phone: partyPhones.ownerPhone,
+      other_party_phone: partyPhones.otherPartyPhone,
       event_at_utc: n.event_at_utc || null,
       transcript: n.transcript || null,
       recording_url: n.recording_url || n.beside_note_url || null,
@@ -813,8 +827,8 @@ Deno.serve(async (req: Request) => {
         channel: "call",
         contact_id: contact_id || null,
         contact_name: contact_name || null,
-        contact_phone: phone || null,
-        owner_phone: n.from_phone || null,
+        contact_phone: partyPhones.otherPartyPhone,
+        owner_phone: partyPhones.ownerPhone,
         candidate_projects: candidateProjectsJson.length > 0 ? candidateProjectsJson : null,
         event_at_utc: n.event_at_utc || null,
         needs_review: true, // Default true; auto_assign_project may override below
