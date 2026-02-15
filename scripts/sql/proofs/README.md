@@ -30,3 +30,7 @@ Read-only query helpers for verifying time-sync invariants and provenance hygien
   - Pipeline error sink counts (interactions moved to `interactions_errors`) by reason for last 30d.
 - `span_oversize_last30d.sql`
   - Heuristic oversize span scan for last 30d (very long transcript_segment/word_count).
+- `attributions_to_closed_projects_last30d.sql`
+  - Quantifies span attributions in last 30d that point to projects with `phase='closed'` (or closed-ish status) and breaks down by contact.
+- `span_oversize_last30d_with_people.sql`
+  - Oversize spans joined to interactions for owner/contact context (useful for GT acceptance like Randy Booth/Jimmy Chastain).
