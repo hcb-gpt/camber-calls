@@ -1,13 +1,20 @@
 /**
- * context-assembly Edge Function v2.0.0
+ * context-assembly Edge Function v2.1.0
  * Assembles LLM-ready context_package from span_id (SPAN-FIRST)
  *
- * @version 2.0.0
+ * @version 2.1.0
  * @date 2026-02-15
  * @purpose Provide rich context for AI Router project attribution
  * @port 6-source candidate collection from process-call v3.9.6
  *
  * CORE PRINCIPLE: span_id is the unit of truth. Calls are containers only.
+ *
+ * v2.1.0 Changes (Sort Order Fix — source_strength over affinity_weight):
+ * - Candidate sort now prioritizes source_strength (transcript evidence quality)
+ *   ABOVE affinity_weight (call-history frequency)
+ * - Fixes Permar-class bug where high-affinity projects with weak transcript evidence
+ *   outranked low-affinity projects with strong evidence (e.g., source_strength +1.22)
+ * - Sort order: assigned > weak_only > alias_matches > source_strength > affinity > geo
  *
  * v2.0.0 Changes (4 New Candidate Sources + Floater Modifier):
  * - NEW Source 9: OTHER_PARTY_TRADE_MATCH — parse speaker names, match contacts, find trade→projects
@@ -2105,7 +2112,10 @@ Deno.serve(async (req: Request) => {
     }
 
     // Sort by evidence strength
-    // PHONETIC-ADJACENT-ONLY: weak-only candidates sort below strong candidates
+    // Priority: assigned > weak_only > alias_matches > source_strength > affinity_weight > geo
+    // v2.1.0: source_strength (transcript evidence quality) now ranks ABOVE affinity_weight
+    // (call-history frequency). Fixes Permar-class bug where high-affinity projects
+    // with weak transcript evidence outranked low-affinity projects with strong evidence.
     candidates.sort((a, b) => {
       if (a.evidence.assigned !== b.evidence.assigned) return a.evidence.assigned ? -1 : 1;
       // Strong evidence beats weak evidence
@@ -2115,13 +2125,14 @@ Deno.serve(async (req: Request) => {
       if (b.evidence.alias_matches.length !== a.evidence.alias_matches.length) {
         return b.evidence.alias_matches.length - a.evidence.alias_matches.length;
       }
-      if (b.evidence.affinity_weight !== a.evidence.affinity_weight) {
-        return b.evidence.affinity_weight - a.evidence.affinity_weight;
-      }
+      // source_strength (transcript evidence quality) before affinity_weight (call frequency)
       const aSourceStrength = a.evidence.source_strength || 0;
       const bSourceStrength = b.evidence.source_strength || 0;
       if (bSourceStrength !== aSourceStrength) {
         return bSourceStrength - aSourceStrength;
+      }
+      if (b.evidence.affinity_weight !== a.evidence.affinity_weight) {
+        return b.evidence.affinity_weight - a.evidence.affinity_weight;
       }
       const aGeoScore = a.evidence.geo_signal?.score || 0;
       const bGeoScore = b.evidence.geo_signal?.score || 0;

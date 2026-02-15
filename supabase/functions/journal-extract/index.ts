@@ -1,10 +1,14 @@
 /**
- * journal-extract Edge Function v1.2.1
+ * journal-extract Edge Function v1.2.2
  * Extracts structured epistemic claims from attributed conversation spans
  *
- * @version 1.2.1
+ * @version 1.2.2
  * @date 2026-02-14
  * @purpose D1 deliverable - journal claim extraction from spans
+ *
+ * v1.2.2 changes (DEV-1):
+ *   - Fire-and-forget chain to journal-consolidate for successful writes with
+ *     written claims so new extractions flow directly into relationship updates.
  *
  * v1.2.1 changes (DEV-2):
  *   - INCIDENT MITIGATION: Add transcript truncation (max 8000 chars) to prevent
@@ -58,12 +62,13 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const FUNCTION_VERSION = "v1.2.1";
+const FUNCTION_VERSION = "v1.2.2";
 const PROMPT_VERSION = "journal-extract-v2";
 const MAX_TOKENS = 4096;
 const DEFAULT_MODEL = "claude-3-haiku-20240307";
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_TRANSCRIPT_CHARS = 8000; // Cap transcript to prevent inference timeouts
+const JOURNAL_CONSOLIDATE_TIMEOUT_MS = 120000;
 
 const VALID_CLAIM_TYPES = [
   "commitment",
@@ -244,6 +249,48 @@ function validateExtraction(parsed: any): ExtractionResponse {
   }
 
   return { claims, summary: parsed.summary || "" };
+}
+
+async function triggerJournalConsolidate(
+  baseUrl: string,
+  edgeSecret: string,
+  runId: string,
+): Promise<void> {
+  try {
+    const timeoutMs = Number(Deno.env.get("JOURNAL_CONSOLIDATE_TRIGGER_TIMEOUT_MS")) || JOURNAL_CONSOLIDATE_TIMEOUT_MS;
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const resp = await fetch(`${baseUrl}/functions/v1/journal-consolidate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Edge-Secret": edgeSecret,
+        },
+        body: JSON.stringify({ run_id: runId }),
+        signal: controller.signal,
+      });
+
+      if (!resp.ok) {
+        const errBody = await resp.text().catch(() => "unknown");
+        console.warn(
+          `[journal-extract] journal-consolidate trigger ${resp.status}: ${errBody.slice(0, 200)}`,
+        );
+        return;
+      }
+
+      const payload = await resp.json().catch(() => null);
+      console.log(
+        `[journal-extract] journal-consolidate trigger OK: run_id=${runId}, ` +
+          `claims_processed=${payload?.claims_processed ?? "?"}`,
+      );
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
+  } catch (err: any) {
+    console.warn(`[journal-extract] journal-consolidate trigger failed for run ${runId}: ${err.message}`);
+  }
 }
 
 /**
@@ -634,6 +681,7 @@ Deno.serve(async (req: Request) => {
     let loops_written = 0;
     const claim_ids: string[] = [];
     let skipped_no_project = false;
+    let journal_consolidate_fired = false;
 
     if (!dry_run && extraction.claims.length > 0) {
       // ── NULL PROJECT_ID GUARD ────────────────────────────────────
@@ -733,6 +781,14 @@ Deno.serve(async (req: Request) => {
           claims_extracted: claims_written,
         }).eq("run_id", run_id);
         if (successUpdateErr) console.error("[journal-extract] journal_runs update (success) failed:", successUpdateErr.message);
+
+        if (claims_written > 0 && project_id && run_id && expectedSecret) {
+          const supabaseUrl = Deno.env.get("SUPABASE_URL");
+          if (supabaseUrl) {
+            journal_consolidate_fired = true;
+            void triggerJournalConsolidate(supabaseUrl, expectedSecret, run_id);
+          }
+        }
       }
     }
 
@@ -752,6 +808,7 @@ Deno.serve(async (req: Request) => {
         skipped_no_project,
         ...(skipped_no_project ? { reason: "no_project_attribution: re-trigger after ai-router attributes span" } : {}),
         model,
+        journal_consolidate_fired,
         tokens_used,
         inference_ms,
         retried,

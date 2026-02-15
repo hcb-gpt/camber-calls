@@ -1,13 +1,20 @@
 /**
- * ai-router Edge Function v1.8.1
+ * ai-router Edge Function v1.9.0
  * LLM-based project attribution for conversation spans
  *
- * @version 1.8.1
- * @date 2026-02-14
+ * @version 1.9.0
+ * @date 2026-02-15
  * @purpose Use Claude Haiku to attribute spans to projects with anchored evidence
  *
  * CORE PRINCIPLE: span_attributions is the single source of truth.
  * NO writes to interactions.project_id from this path.
+ *
+ * v1.9.0 Changes (source_strength in Evidence line):
+ * - Prompt now includes source_strength per candidate in the Evidence line
+ *   (was missing — LLM never saw transcript evidence quality scores)
+ * - ContextPackage type updated to include source_strength field
+ * - Prompt version bumped to v1.9.0 (content change)
+ * - Pairs with context-assembly v2.1.0 sort fix (source_strength > affinity_weight)
  *
  * v1.8.1 Changes (Pipeline chain wiring):
  * - Added fire-and-forget chain call to journal-extract after span_attributions write
@@ -39,8 +46,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 import { parseLlmJson } from "../_shared/llm_json.ts";
 
-const PROMPT_VERSION = "v1.8.0"; // Prompt unchanged from v1.8.0
-const FUNCTION_VERSION = "v1.8.3";
+const PROMPT_VERSION = "v1.9.0"; // v1.9.0: Evidence line now includes source_strength
+const FUNCTION_VERSION = "v1.9.0";
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
 
@@ -174,6 +181,7 @@ interface ContextPackage {
     evidence: {
       sources: string[];
       affinity_weight: number;
+      source_strength?: number;
       assigned: boolean;
       alias_matches: Array<{ term: string; match_type: string; snippet?: string }>;
       geo_distance_km?: number;
@@ -211,6 +219,85 @@ function anchorContainsStaffName(quote: string): boolean {
   return false;
 }
 
+function normalizeForQuoteMatch(text: string): string {
+  return (text || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[“”„‟‘’`"]/g, "")
+    .replace(/[\-–—]/g, " ")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeForQuoteMatch(text: string): string[] {
+  return normalizeForQuoteMatch(text)
+    .split(" ")
+    .map((token) => token.trim())
+    .filter((token) => token.length > 0);
+}
+
+function levenshteinDistanceWithLimit(a: string, b: string, maxDistance: number): number {
+  if (a.length === 0) return Math.min(b.length, maxDistance + 1);
+  if (b.length === 0) return Math.min(a.length, maxDistance + 1);
+  if (Math.abs(a.length - b.length) > maxDistance) return maxDistance + 1;
+
+  const row = new Int32Array(b.length + 1);
+  const prevRow = new Int32Array(b.length + 1);
+
+  for (let j = 0; j <= b.length; j++) {
+    prevRow[j] = j;
+  }
+
+  for (let i = 1; i <= a.length; i++) {
+    row[0] = i;
+    let bestInRow = row[0];
+
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      let value = Math.min(
+        prevRow[j] + 1,
+        row[j - 1] + 1,
+        prevRow[j - 1] + cost,
+      );
+      row[j] = value;
+      if (value < bestInRow) bestInRow = value;
+    }
+
+    if (bestInRow > maxDistance) {
+      return maxDistance + 1;
+    }
+
+    prevRow.set(row);
+  }
+
+  return prevRow[b.length];
+}
+
+function hasFuzzyMatch(
+  haystackTokens: string[],
+  quoteNorm: string,
+  quoteTokens: string[],
+): boolean {
+  const maxWindowDelta = Math.max(1, Math.floor(quoteTokens.length * 0.25));
+  const minWindowLen = Math.max(1, quoteTokens.length - maxWindowDelta);
+  const maxWindowLen = Math.min(haystackTokens.length, quoteTokens.length + maxWindowDelta);
+
+  const maxDistance = Math.max(3, Math.floor(quoteNorm.length * 0.18));
+
+  for (let windowLen = minWindowLen; windowLen <= maxWindowLen; windowLen++) {
+    for (let i = 0; i + windowLen <= haystackTokens.length; i++) {
+      const candidate = haystackTokens.slice(i, i + windowLen).join(" ");
+      const distance = levenshteinDistanceWithLimit(quoteNorm, candidate, maxDistance);
+      if (distance <= maxDistance) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 function validateAnchorQuotes(
   anchors: Anchor[],
   transcript: string,
@@ -219,8 +306,8 @@ function validateAnchorQuotes(
     return { valid: false, validatedAnchors: [], rejectedStaffAnchors: 0 };
   }
 
-  const normalizeText = (s: string) => (s || "").toLowerCase().replace(/\s+/g, " ").trim();
-  const transcriptNorm = normalizeText(transcript);
+  const transcriptNorm = normalizeForQuoteMatch(transcript);
+  const transcriptTokens = tokenizeForQuoteMatch(transcriptNorm);
 
   const validatedAnchors: Anchor[] = [];
   let rejectedStaffAnchors = 0;
@@ -228,7 +315,7 @@ function validateAnchorQuotes(
   for (const anchor of anchors) {
     if (!anchor.quote || anchor.quote.length === 0) continue;
 
-    const quoteNorm = normalizeText(anchor.quote);
+    const quoteNorm = normalizeForQuoteMatch(anchor.quote);
     if (quoteNorm.length < 3) continue;
 
     if (anchorContainsStaffName(anchor.quote) || anchorContainsStaffName(anchor.text || "")) {
@@ -237,12 +324,18 @@ function validateAnchorQuotes(
       continue;
     }
 
-    if (!transcriptNorm.includes(quoteNorm)) {
+    const quoteTokens = tokenizeForQuoteMatch(quoteNorm);
+    const exactMatch = transcriptNorm.includes(quoteNorm);
+    const fuzzyMatch = !exactMatch && quoteTokens.length >= 3
+      ? hasFuzzyMatch(transcriptTokens, quoteNorm, quoteTokens)
+      : false;
+
+    if (!exactMatch && !fuzzyMatch) {
       console.log(`[ai-router] Rejected anchor: quote not in transcript: "${anchor.quote}"`);
       continue;
     }
 
-    const textNorm = normalizeText(anchor.text || "");
+    const textNorm = normalizeForQuoteMatch(anchor.text || "");
     if (textNorm.length >= 3 && !quoteNorm.includes(textNorm)) {
       console.log(`[ai-router] Rejected anchor: text "${anchor.text}" not found in quote "${anchor.quote}"`);
       continue;
@@ -532,7 +625,9 @@ function buildUserPrompt(ctx: ContextPackage): string {
    - Client: ${c.client_name || "N/A"}
    - Aliases: ${c.aliases.length > 0 ? c.aliases.slice(0, 5).join(", ") : "None"}
    - Status: ${c.status || "N/A"}, Phase: ${c.phase || "N/A"}
-   - Evidence: assigned=${c.evidence.assigned}, affinity=${c.evidence.affinity_weight.toFixed(2)}, sources=[${
+   - Evidence: assigned=${c.evidence.assigned}, affinity=${c.evidence.affinity_weight.toFixed(2)}, source_strength=${
+      (c.evidence.source_strength ?? 0).toFixed(2)
+    }, sources=[${
       c.evidence.sources.join(",")
     }]
    - ${geoSummary}

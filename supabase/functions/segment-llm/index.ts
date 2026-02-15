@@ -15,6 +15,7 @@
  * - Never drops transcript content
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { parseLlmJson } from "../_shared/llm_json.ts";
 
 const SEGMENT_LLM_VERSION = "segment-llm_v1.2.0";
 
@@ -305,8 +306,6 @@ Deno.serve(async (req: Request) => {
   let rawContent = "";
   try {
     rawContent = llmResponse.choices?.[0]?.message?.content || "";
-    // Strip markdown code fences if present
-    rawContent = rawContent.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
   } catch {
     console.error("[segment-llm] Failed to extract LLM text");
     return fallbackResponse(transcriptLength, ["llm_parse_error_extract"], t0);
@@ -314,7 +313,7 @@ Deno.serve(async (req: Request) => {
 
   let parsed: { segments?: Segment[] };
   try {
-    parsed = JSON.parse(rawContent);
+    parsed = parseLlmJson<{ segments?: Segment[] }>(rawContent).value;
   } catch (_parseErr) {
     console.error(`[segment-llm] JSON parse failed: ${rawContent.slice(0, 200)}`);
     return fallbackResponse(transcriptLength, ["llm_parse_error_json"], t0);
@@ -501,7 +500,7 @@ TRANSCRIPT:
           .replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
 
         try {
-          const retryParsed = JSON.parse(retryContent);
+          const retryParsed = parseLlmJson<{ segments?: Segment[] }>(retryContent).value;
           if (Array.isArray(retryParsed.segments) && retryParsed.segments.length > 0) {
             // Re-run guardrails on retry result (simplified version)
             let retrySegments = retryParsed.segments;
