@@ -18,6 +18,11 @@
  * v4.3.2 CHANGES (lineage persistence):
  * - Persist zapier_zap_id and zapier_run_id from _zapier_ingest_meta into calls_raw.
  *
+ * v4.3.5 CHANGES (inbound owner phone + quality warnings):
+ * - Accept normalized fields (`to_phone_norm` / `from_phone_norm`) for party role mapping.
+ * - Flatten nested signal payload fields for direction + phone normalization.
+ * - Surface STRAT-visible warnings when direction/owner_phone are missing.
+ *
  * v4.3.4 CHANGES (phone role mapping fix):
  * - Resolve owner/other-party phones by explicit fields first.
  * - Apply direction-aware fallback from from_phone/to_phone:
@@ -47,7 +52,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { normalizePhoneForLookup } from "./phone_lookup.ts";
 import { resolveCallPartyPhones } from "./phone_direction.ts";
 
-const PROCESS_CALL_VERSION = "v4.3.5"; // empty-transcript terminalization + null-span review_queue cleanup
+const PROCESS_CALL_VERSION = "v4.3.5"; // normalized-phone owner mapping + quality warnings + empty-transcript terminalization + auth/lineage chain hardening
 const GATE = { PASS: "PASS", SKIP: "SKIP", NEEDS_REVIEW: "NEEDS_REVIEW" };
 const ID_PATTERN = /^cll_[a-zA-Z0-9_]+$/;
 const ALLOWED_PROVENANCE_SOURCES = [
@@ -186,8 +191,36 @@ type CandidateProject = {
 // ============================================================
 function m1(raw: any) {
   const a = { ...raw };
+  const signal = a.signal && typeof a.signal === "object" ? a.signal : {};
+  const rawEvent = signal.raw_event && typeof signal.raw_event === "object" ? signal.raw_event : {};
   if (a.transcript_text && !a.transcript) a.transcript = a.transcript_text;
+  if (signal.transcript && !a.transcript) a.transcript = signal.transcript;
   if (!a.interaction_id && a.call_id) a.interaction_id = a.call_id;
+  if (!a.interaction_id && signal.interaction_id) {
+    a.interaction_id = signal.interaction_id;
+  }
+  if (!a.direction && signal.direction) a.direction = signal.direction;
+  if (!a.direction && rawEvent.direction) a.direction = rawEvent.direction;
+  if (!a.from_phone_norm && signal.from_phone_norm) {
+    a.from_phone_norm = signal.from_phone_norm;
+  }
+  if (!a.to_phone_norm && signal.to_phone_norm) {
+    a.to_phone_norm = signal.to_phone_norm;
+  }
+  if (!a.from_phone_norm && rawEvent.from_phone_norm) {
+    a.from_phone_norm = rawEvent.from_phone_norm;
+  }
+  if (!a.to_phone_norm && rawEvent.to_phone_norm) {
+    a.to_phone_norm = rawEvent.to_phone_norm;
+  }
+  if (!a.from_phone && a.from_phone_norm) a.from_phone = a.from_phone_norm;
+  if (!a.to_phone && a.to_phone_norm) a.to_phone = a.to_phone_norm;
+  if (!a.owner_phone && signal.owner_phone_norm) {
+    a.owner_phone = signal.owner_phone_norm;
+  }
+  if (!a.other_party_phone && signal.other_party_phone_norm) {
+    a.other_party_phone = signal.other_party_phone_norm;
+  }
   return a;
 }
 
@@ -389,6 +422,8 @@ Deno.serve(async (req: Request) => {
       i1_phone_present: !!(
         raw.from_phone ||
         raw.to_phone ||
+        raw.from_phone_norm ||
+        raw.to_phone_norm ||
         raw.owner_phone ||
         raw.other_party_phone ||
         raw.contact_phone
@@ -402,6 +437,12 @@ Deno.serve(async (req: Request) => {
     const partyPhones = resolveCallPartyPhones(n);
     const persistedDirection = partyPhones.direction === "unknown" ? n.direction || null : partyPhones.direction;
     const lookupPhone = normalizePhoneForLookup(partyPhones.otherPartyPhone);
+    if (partyPhones.direction === "unknown") {
+      warnings.push("data_quality_missing_direction");
+    }
+    if (!partyPhones.ownerPhone) {
+      warnings.push("data_quality_missing_owner_phone");
+    }
 
     // ========================================
     // CONTACT RESOLUTION
