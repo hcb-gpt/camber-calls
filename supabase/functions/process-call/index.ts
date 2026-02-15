@@ -192,9 +192,7 @@ type CandidateProject = {
 function m1(raw: any) {
   const a = { ...raw };
   const signal = a.signal && typeof a.signal === "object" ? a.signal : {};
-  const rawEvent = signal.raw_event && typeof signal.raw_event === "object"
-    ? signal.raw_event
-    : {};
+  const rawEvent = signal.raw_event && typeof signal.raw_event === "object" ? signal.raw_event : {};
   if (a.transcript_text && !a.transcript) a.transcript = a.transcript_text;
   if (signal.transcript && !a.transcript) a.transcript = signal.transcript;
   if (!a.interaction_id && a.call_id) a.interaction_id = a.call_id;
