@@ -132,6 +132,7 @@ const CROSS_CONTACT_MAX_LIKE_PATTERNS = 24;
 const CROSS_CONTACT_MIN_SEARCH_TERMS = 2;
 const CROSS_CONTACT_EVIDENCE_TERM_LIMIT = 5;
 const CLAIM_CONTENT_EVIDENCE_TERM_LIMIT = 5;
+const MATERIAL_BUDGET_EVIDENCE_TERM_LIMIT = 5;
 const CROSS_CONTACT_LOW_SIGNAL_COLORS = new Set([
   "white",
   "black",
@@ -226,6 +227,68 @@ const CROSS_CONTACT_STREET_SUFFIXES = new Set([
   "way",
   "pkwy",
   "parkway",
+]);
+const MATERIAL_BUDGET_LOW_SIGNAL_KEYWORDS = new Set([
+  "white",
+  "black",
+  "gray",
+  "grey",
+  "beige",
+  "cream",
+  "tile",
+  "paint",
+  "stone",
+  "material",
+  "home",
+  "house",
+  "residence",
+  "project",
+  "job",
+  "site",
+  "mystery",
+  "classic",
+  "pure",
+]);
+const LOW_SIGNAL_COMMON_TOKENS = new Set([
+  "the",
+  "this",
+  "that",
+  "these",
+  "those",
+  "there",
+  "here",
+  "with",
+  "from",
+  "into",
+  "onto",
+  "only",
+  "just",
+  "like",
+  "okay",
+  "yeah",
+  "yep",
+  "got",
+  "get",
+  "have",
+  "has",
+  "had",
+  "then",
+  "than",
+  "when",
+  "what",
+  "where",
+  "which",
+  "about",
+  "around",
+  "over",
+  "under",
+  "after",
+  "before",
+  "customer",
+  "doesn",
+  "dont",
+  "didn",
+  "new",
 ]);
 
 // Structural keywords → foundation_type mapping
@@ -336,6 +399,7 @@ interface CandidateEvidence {
   claim_crossref_snippets?: string[];
   claim_content_match_terms?: string[];
   cross_contact_claim_match_terms?: string[];
+  material_budget_tier_terms?: string[];
   weak_only?: boolean; // true if ALL alias evidence is weak (first-name-only, short token)
   common_word_alias_demoted?: boolean;
 }
@@ -533,6 +597,30 @@ function isLowSignalCrossContactToken(token: string): boolean {
     CROSS_CONTACT_LOW_SIGNAL_DESCRIPTORS.has(token) ||
     CROSS_CONTACT_LOW_SIGNAL_MATERIALS.has(token) ||
     CROSS_CONTACT_LOW_SIGNAL_DISAMBIGUATORS.has(token);
+}
+
+function isLowSignalLexeme(rawToken: string): boolean {
+  const token = sanitizeCrossContactTerm(rawToken);
+  if (!token) return true;
+  return LOW_SIGNAL_COMMON_TOKENS.has(token) ||
+    isLowSignalCrossContactToken(token) ||
+    MATERIAL_BUDGET_LOW_SIGNAL_KEYWORDS.has(token);
+}
+
+function isLowSignalMaterialBudgetKeyword(rawKeyword: string): boolean {
+  const keyword = sanitizeCrossContactTerm(rawKeyword);
+  if (!keyword) return true;
+  const tokens = keyword.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return true;
+
+  const isLowSignalToken = (token: string) => isLowSignalLexeme(token);
+
+  if (tokens.length === 1) {
+    const token = tokens[0];
+    if (isLowSignalToken(token)) return true;
+  }
+
+  return tokens.every((token) => isLowSignalToken(token));
 }
 
 function isAddressLikeCrossContactTerm(term: string): boolean {
@@ -1321,6 +1409,7 @@ Deno.serve(async (req: Request) => {
       source_strength: number;
       claim_content_match_terms?: string[];
       cross_contact_claim_match_terms?: string[];
+      material_budget_tier_terms?: string[];
       geo_distance_km?: number;
       geo_signal?: GeoSignal;
     }>();
@@ -1891,7 +1980,7 @@ Deno.serve(async (req: Request) => {
 
     // SOURCE 8: Journal claim content overlap (transcript against active claims)
     if (transcript_text && transcriptTokens.length > 0) {
-      const transcriptHighSignalTokens = transcriptTokens.filter((t) => !isLowSignalCrossContactToken(t));
+      const transcriptHighSignalTokens = transcriptTokens.filter((t) => !isLowSignalLexeme(t));
       if (transcriptHighSignalTokens.length === 0) {
         warnings.push("claim_content_match_low_signal_terms");
       }
@@ -1954,7 +2043,7 @@ Deno.serve(async (req: Request) => {
 
               const claimHighSignalTokens = tokenizeTextForOverlap(row.claim_text)
                 .map((t) => t.toLowerCase())
-                .filter((t) => !isLowSignalCrossContactToken(t));
+                .filter((t) => !isLowSignalLexeme(t));
               const overlapTerms = overlappingTokenTerms(transcriptHighSignalTokens, claimHighSignalTokens);
               const overlapDenominator = new Set(claimHighSignalTokens).size;
               const overlap = overlapDenominator > 0 ? overlapTerms.length / overlapDenominator : 0;
@@ -2168,15 +2257,32 @@ Deno.serve(async (req: Request) => {
 
         if (materialRows?.length) {
           const matchedTiers = new Set<string>();
+          const matchedTermsByTier = new Map<string, string[]>();
+          let lowSignalKeywordFilteredCount = 0;
           for (const row of materialRows) {
             if (!row.keywords || !row.tier) continue;
             const keywords: string[] = Array.isArray(row.keywords) ? row.keywords : [];
             for (const kw of keywords) {
-              if (kw && findTermInText(transcriptLower, kw.toLowerCase()) >= 0) {
+              const normalizedKeyword = sanitizeCrossContactTerm(String(kw || ""));
+              if (!normalizedKeyword) continue;
+              if (isLowSignalMaterialBudgetKeyword(normalizedKeyword)) {
+                lowSignalKeywordFilteredCount += 1;
+                continue;
+              }
+              if (findTermInText(transcriptLower, normalizedKeyword) >= 0) {
                 matchedTiers.add(row.tier);
+                const terms = matchedTermsByTier.get(row.tier) || [];
+                if (!terms.includes(normalizedKeyword) && terms.length < MATERIAL_BUDGET_EVIDENCE_TERM_LIMIT) {
+                  terms.push(normalizedKeyword);
+                }
+                matchedTermsByTier.set(row.tier, terms);
                 break;
               }
             }
+          }
+
+          if (lowSignalKeywordFilteredCount > 0) {
+            warnings.push(`material_budget_tier_low_signal_filtered:${lowSignalKeywordFilteredCount}`);
           }
 
           if (matchedTiers.size > 0) {
@@ -2206,8 +2312,17 @@ Deno.serve(async (req: Request) => {
 
               if (tierMatches.size > 0) {
                 sources_used.push("material_budget_tier");
+                const evidenceTerms = Array.from(
+                  new Set(
+                    Array.from(matchedTiers).flatMap((tier) => matchedTermsByTier.get(tier) || []),
+                  ),
+                ).slice(0, MATERIAL_BUDGET_EVIDENCE_TERM_LIMIT);
                 for (const pid of tierMatches) {
                   addCandidate(pid, "material_budget_tier", 0, undefined, undefined, SOURCE_SCORE_MATERIAL_BUDGET_TIER);
+                  const cur = candidatesById.get(pid);
+                  if (cur && evidenceTerms.length > 0) {
+                    cur.material_budget_tier_terms = evidenceTerms;
+                  }
                 }
               }
             }
@@ -2501,6 +2616,7 @@ Deno.serve(async (req: Request) => {
             0,
             CROSS_CONTACT_EVIDENCE_TERM_LIMIT,
           ),
+          material_budget_tier_terms: meta.material_budget_tier_terms?.slice(0, MATERIAL_BUDGET_EVIDENCE_TERM_LIMIT),
           weak_only: weakOnly || undefined,
           common_word_alias_demoted: commonWordAliasDemoted || undefined,
         },
