@@ -16,4 +16,17 @@ Read-only query helpers for verifying time-sync invariants and provenance hygien
   - Template to check AS_OF vs POST_HOC (requires setting the `interaction_id` literal).
 - `project_facts_window_counts.sql`
   - Quick counts of facts inside/outside a default 90d window (requires setting the `interaction_id` literal).
-
+- `ci_gates_summary.sql`
+  - Calls the built-in CI gates (PASS/FAIL) and returns violation counts.
+- `span_attribution_coverage_last30d.sql`
+  - Coverage snapshot for active spans in the last 30d: attributed vs pending-review vs uncovered.
+- `span_attribution_coverage_for_interaction_template.sql`
+  - Template: coverage for a single interaction_id.
+- `review_queue_pending_null_span.sql`
+  - Counts pending review items missing span_id, broken down by reason_codes.
+- `review_queue_pending_on_superseded_span.sql`
+  - Finds pending review items pointing at superseded spans (stale review rows).
+- `interactions_errors_last30d.sql`
+  - Pipeline error sink counts (interactions moved to `interactions_errors`) by reason for last 30d.
+- `span_oversize_last30d.sql`
+  - Heuristic oversize span scan for last 30d (very long transcript_segment/word_count).
