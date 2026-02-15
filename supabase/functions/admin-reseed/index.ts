@@ -2,7 +2,7 @@
  * admin-reseed Edge Function
  * Re-chunk an interaction's conversation spans (non-destructive)
  *
- * @version 1.1.0
+ * @version 1.5.0
  * @date 2026-01-31
  * @purpose Supersede old spans and create new spans for an interaction
  *
@@ -33,11 +33,13 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { authErrorResponse, requireEdgeSecret } from "../_shared/auth.ts";
 
-const VERSION = "1.4.0"; // v1.4.0: reseed_and_close_loop integrity guarantees
+const VERSION = "1.5.0"; // v1.5.0: bounded reroute concurrency + timeout hardening for 504 reliability
 const ALLOWED_SOURCES = ["admin-reseed", "system"];
 const CLOSE_LOOP_MAX_ATTEMPTS = 2;
 const CLOSE_LOOP_MODEL_ID = "admin-reseed-close-loop";
 const CLOSE_LOOP_PROMPT_VERSION = "v1";
+const REROUTE_CONCURRENCY = Math.max(1, Number(Deno.env.get("ADMIN_RESEED_REROUTE_CONCURRENCY") || "4"));
+const INTERNAL_CALL_TIMEOUT_MS = Math.max(5000, Number(Deno.env.get("ADMIN_RESEED_INTERNAL_TIMEOUT_MS") || "18000"));
 
 // ============================================================
 // STRUCTURED LOGGING (per GPT-DEV-6 spec)
@@ -121,6 +123,9 @@ interface ReseedReceipt {
   new_span_ids?: string[];
   superseded_span_ids?: string[];
   reroute_triggered?: boolean;
+  reroute_attempted?: number;
+  reroute_succeeded?: number;
+  reroute_failed?: number;
   close_loop_applied?: boolean;
   close_loop_attempts?: number;
   close_loop_missing_before?: number;
@@ -765,49 +770,65 @@ Deno.serve(async (req: Request) => {
       journalExtractUrl,
     };
 
-    for (const spanId of newSpanIds) {
-      await rerouteSpan({
-        spanId,
+    const rerouteStats = await rerouteSpansWithConcurrency({
+      spanIds: newSpanIds,
+      interactionId: interaction_id,
+      internalHeaders,
+      internalEndpoints,
+      concurrency: REROUTE_CONCURRENCY,
+    });
+
+    receipt.reroute_attempted = rerouteStats.attempted;
+    receipt.reroute_succeeded = rerouteStats.succeeded;
+    receipt.reroute_failed = rerouteStats.failed;
+
+    if (mode === "reseed_and_close_loop") {
+      const closeLoop = await closeLoopAfterReseed({
+        db,
         interactionId: interaction_id,
         internalHeaders,
         internalEndpoints,
       });
-    }
 
-    const closeLoop = await closeLoopAfterReseed({
-      db,
-      interactionId: interaction_id,
-      internalHeaders,
-      internalEndpoints,
-    });
+      receipt.close_loop_applied = true;
+      receipt.close_loop_attempts = closeLoop.attempts;
+      receipt.close_loop_missing_before = closeLoop.missingBefore;
+      receipt.close_loop_missing_after = closeLoop.missingAfter;
+      receipt.close_loop_fallback_inserted = closeLoop.fallbackInserted;
+      receipt.close_loop_stale_pending_dismissed = closeLoop.stalePendingDismissed;
+      receipt.close_loop_pending_on_superseded_after = closeLoop.pendingOnSuperseded;
+      receipt.close_loop_pending_null_after = closeLoop.pendingNullSpan;
+      receipt.attrib_count_after = closeLoop.latestAttributions;
 
-    receipt.close_loop_applied = true;
-    receipt.close_loop_attempts = closeLoop.attempts;
-    receipt.close_loop_missing_before = closeLoop.missingBefore;
-    receipt.close_loop_missing_after = closeLoop.missingAfter;
-    receipt.close_loop_fallback_inserted = closeLoop.fallbackInserted;
-    receipt.close_loop_stale_pending_dismissed = closeLoop.stalePendingDismissed;
-    receipt.close_loop_pending_on_superseded_after = closeLoop.pendingOnSuperseded;
-    receipt.close_loop_pending_null_after = closeLoop.pendingNullSpan;
-    receipt.attrib_count_after = closeLoop.latestAttributions;
-
-    if (!closeLoop.ok) {
-      receipt.ok = false;
-      receipt.status = "error";
-      await writeOverrideLog(db, {
-        interaction_id,
-        idempotency_key,
-        reason,
-        mode,
-        requested_by,
-        receipt,
-      });
-      return jsonResponse({
-        ok: false,
-        error: "close_loop_integrity_failed",
-        detail: closeLoop.detail,
-        receipt: { ...receipt, ms: Date.now() - t0 },
-      }, 500);
+      if (!closeLoop.ok) {
+        receipt.ok = false;
+        receipt.status = "error";
+        await writeOverrideLog(db, {
+          interaction_id,
+          idempotency_key,
+          reason,
+          mode,
+          requested_by,
+          receipt,
+        });
+        return jsonResponse({
+          ok: false,
+          error: "close_loop_integrity_failed",
+          detail: closeLoop.detail,
+          receipt: { ...receipt, ms: Date.now() - t0 },
+        }, 500);
+      }
+    } else {
+      const attributedAfter = await fetchAttributedSpanSet(db, newSpanIds);
+      receipt.close_loop_applied = false;
+      receipt.close_loop_attempts = 0;
+      receipt.close_loop_missing_before = Math.max(0, newSpanIds.length - rerouteStats.succeeded);
+      receipt.close_loop_missing_after = Math.max(0, newSpanIds.length - attributedAfter.size);
+      receipt.close_loop_fallback_inserted = 0;
+      receipt.close_loop_stale_pending_dismissed = 0;
+      receipt.close_loop_pending_on_superseded_after = 0;
+      receipt.close_loop_pending_null_after = 0;
+      receipt.attrib_count_after = attributedAfter.size;
     }
   } else {
     receipt.attrib_count_after = 0;
@@ -869,6 +890,57 @@ interface CloseLoopResult {
   latestAttributions: number;
 }
 
+interface RerouteBatchResult {
+  attempted: number;
+  succeeded: number;
+  failed: number;
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const signal = AbortSignal.timeout(timeoutMs);
+  return await fetch(url, { ...init, signal });
+}
+
+async function rerouteSpansWithConcurrency(params: {
+  spanIds: string[];
+  interactionId: string;
+  internalHeaders: Record<string, string>;
+  internalEndpoints: InternalEndpoints;
+  concurrency: number;
+}): Promise<RerouteBatchResult> {
+  const { spanIds, interactionId, internalHeaders, internalEndpoints } = params;
+  if (spanIds.length === 0) {
+    return { attempted: 0, succeeded: 0, failed: 0 };
+  }
+
+  const queue = [...spanIds];
+  const workerCount = Math.min(Math.max(1, params.concurrency), queue.length);
+  let succeeded = 0;
+  let failed = 0;
+
+  async function worker() {
+    while (queue.length > 0) {
+      const spanId = queue.shift();
+      if (!spanId) break;
+      const ok = await rerouteSpan({
+        spanId,
+        interactionId,
+        internalHeaders,
+        internalEndpoints,
+      });
+      if (ok) succeeded++;
+      else failed++;
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return { attempted: spanIds.length, succeeded, failed };
+}
+
 async function rerouteSpan(params: {
   spanId: string;
   interactionId: string;
@@ -878,11 +950,15 @@ async function rerouteSpan(params: {
   const { spanId, interactionId, internalHeaders, internalEndpoints } = params;
 
   try {
-    const ctxResp = await fetch(internalEndpoints.contextAssemblyUrl, {
-      method: "POST",
-      headers: internalHeaders,
-      body: JSON.stringify({ span_id: spanId }),
-    });
+    const ctxResp = await fetchWithTimeout(
+      internalEndpoints.contextAssemblyUrl,
+      {
+        method: "POST",
+        headers: internalHeaders,
+        body: JSON.stringify({ span_id: spanId }),
+      },
+      INTERNAL_CALL_TIMEOUT_MS,
+    );
 
     if (!ctxResp.ok) {
       const errText = await ctxResp.text().catch(() => "");
@@ -896,14 +972,18 @@ async function rerouteSpan(params: {
       return false;
     }
 
-    const routerResp = await fetch(internalEndpoints.aiRouterUrl, {
-      method: "POST",
-      headers: internalHeaders,
-      body: JSON.stringify({
-        context_package: ctxData.context_package,
-        dry_run: false,
-      }),
-    });
+    const routerResp = await fetchWithTimeout(
+      internalEndpoints.aiRouterUrl,
+      {
+        method: "POST",
+        headers: internalHeaders,
+        body: JSON.stringify({
+          context_package: ctxData.context_package,
+          dry_run: false,
+        }),
+      },
+      INTERNAL_CALL_TIMEOUT_MS,
+    );
 
     if (!routerResp.ok) {
       console.error(`[admin-reseed] ai-router failed for span ${spanId}: ${routerResp.status}`);
@@ -917,7 +997,7 @@ async function rerouteSpan(params: {
       // Non-fatal: still consider reroute successful if HTTP succeeded.
     }
 
-    fetch(internalEndpoints.strikingDetectUrl, {
+    fetchWithTimeout(internalEndpoints.strikingDetectUrl, {
       method: "POST",
       headers: internalHeaders,
       body: JSON.stringify({
@@ -925,7 +1005,7 @@ async function rerouteSpan(params: {
         interaction_id: interactionId,
         source: "admin-reseed",
       }),
-    }).catch((e: unknown) => {
+    }, Math.floor(INTERNAL_CALL_TIMEOUT_MS / 2)).catch((e: unknown) => {
       const msg = e instanceof Error ? e.message : "Unknown error";
       console.error(`[admin-reseed] striking-detect post-hook failed for span ${spanId}: ${msg}`);
     });
@@ -933,7 +1013,7 @@ async function rerouteSpan(params: {
     const appliedProjectId = routerData?.gatekeeper?.applied_project_id;
     const routerDecision = routerData?.decision;
     if (routerDecision === "assign" && appliedProjectId) {
-      fetch(internalEndpoints.journalExtractUrl, {
+      fetchWithTimeout(internalEndpoints.journalExtractUrl, {
         method: "POST",
         headers: internalHeaders,
         body: JSON.stringify({
@@ -942,7 +1022,7 @@ async function rerouteSpan(params: {
           project_id: appliedProjectId,
           source: "admin-reseed",
         }),
-      }).catch((e: unknown) => {
+      }, Math.floor(INTERNAL_CALL_TIMEOUT_MS / 2)).catch((e: unknown) => {
         const msg = e instanceof Error ? e.message : "Unknown error";
         console.error(`[admin-reseed] journal-extract post-hook failed for span ${spanId}: ${msg}`);
       });
@@ -1201,14 +1281,13 @@ async function closeLoopAfterReseed(params: {
       if (attempt === 1) missingBefore = missing.length;
       if (missing.length === 0) break;
 
-      for (const spanId of missing) {
-        await rerouteSpan({
-          spanId,
-          interactionId,
-          internalHeaders,
-          internalEndpoints,
-        });
-      }
+      await rerouteSpansWithConcurrency({
+        spanIds: missing,
+        interactionId,
+        internalHeaders,
+        internalEndpoints,
+        concurrency: REROUTE_CONCURRENCY,
+      });
     }
 
     const latestSpansAfter = await fetchLatestActiveSpans(db, interactionId);
