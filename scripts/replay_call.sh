@@ -178,7 +178,7 @@ if [[ "$DO_RESEED" == "true" || "$DO_REROUTE" == "true" ]]; then
   elif [[ "$DO_RESEED" == "true" ]]; then
     MODE="resegment_only"
   else
-    MODE="reroute_only"
+    MODE="resegment_and_reroute"
   fi
 
   log "Step 1: admin-reseed (mode=$MODE)"
