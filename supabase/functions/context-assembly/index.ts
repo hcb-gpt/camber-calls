@@ -325,8 +325,14 @@ const TIER_MIDPOINTS: Record<string, number> = {
 
 // PR-11: Project status filter - only include active client projects
 const VALID_PROJECT_STATUSES = ["active", "warranty", "estimating"];
+const VALID_PROJECT_STATUS_SET = new Set(VALID_PROJECT_STATUSES.map((s) => s.toLowerCase()));
 // PR-11 (STRAT TURN14): Filter by project_kind to exclude internal/owner projects
 const VALID_PROJECT_KIND = "client";
+
+function isAttributionEligibleProjectStatus(status: string | null | undefined): boolean {
+  if (!status) return false;
+  return VALID_PROJECT_STATUS_SET.has(String(status).trim().toLowerCase());
+}
 
 // ============================================================
 // ADMIN ALLOWLIST (PR-10 hardening)
@@ -1305,7 +1311,9 @@ Deno.serve(async (req: Request) => {
         const { data: prows } = await db
           .from("projects")
           .select("id, name")
-          .in("id", projectIds);
+          .in("id", projectIds)
+          .in("status", VALID_PROJECT_STATUSES)
+          .eq("project_kind", VALID_PROJECT_KIND);
 
         const nameById = new Map((prows || []).map((p) => [p.id, p.name]));
 
@@ -1649,7 +1657,11 @@ Deno.serve(async (req: Request) => {
       callbackSpans = findCallbackPhraseSpans(transcriptClean, transcriptLower);
 
       // Fetch all projects + aliases for matching
-      const { data: allProjects } = await db.from("projects").select("id, name, aliases, city, address");
+      const { data: allProjects } = await db
+        .from("projects")
+        .select("id, name, aliases, city, address")
+        .in("status", VALID_PROJECT_STATUSES)
+        .eq("project_kind", VALID_PROJECT_KIND);
 
       // Pre-filter transcript-scan project corpus by blocklist; final global filter is applied later.
       const projects = (allProjects || []).filter(
@@ -2467,7 +2479,12 @@ Deno.serve(async (req: Request) => {
           );
           const priorProjectNames = new Map<string, string>();
           if (projectIds.length) {
-            const { data: pnameRows } = await db.from("projects").select("id, name").in("id", projectIds);
+            const { data: pnameRows } = await db
+              .from("projects")
+              .select("id, name")
+              .in("id", projectIds)
+              .in("status", VALID_PROJECT_STATUSES)
+              .eq("project_kind", VALID_PROJECT_KIND);
             for (const r of (pnameRows || [])) {
               if (r.id) priorProjectNames.set(r.id, r.name || r.id);
             }
@@ -2655,6 +2672,35 @@ Deno.serve(async (req: Request) => {
       } catch {
         // View doesn't exist
       }
+    }
+
+    // ========================================
+    // CLOSED-PROJECT HARD FILTER (global, fail-safe)
+    // Ensure closed / non-client projects never reach attribution scoring.
+    // ========================================
+    const filteredByStatusIds: string[] = [];
+    for (const [pid, details] of projectDetailsById.entries()) {
+      if (!isAttributionEligibleProjectStatus(details.status)) {
+        filteredByStatusIds.push(pid);
+      }
+    }
+
+    if (filteredByStatusIds.length > 0) {
+      for (const pid of filteredByStatusIds) {
+        candidatesById.delete(pid);
+        projectDetailsById.delete(pid);
+      }
+      warnings.push(`closed_project_filtered_global:${filteredByStatusIds.length}`);
+      console.log(
+        `[context-assembly] Closed-project hard filter removed ${filteredByStatusIds.length} candidates pre-rank`,
+      );
+    }
+
+    if (homeownerOverrideProjectId && filteredByStatusIds.includes(homeownerOverrideProjectId)) {
+      homeownerOverrideSkippedReason = "homeowner_override_project_closed_or_ineligible";
+      homeownerOverrideProjectId = null;
+      homeownerOverrideApplied = false;
+      warnings.push("homeowner_override_ineligible_project");
     }
 
     // ========================================

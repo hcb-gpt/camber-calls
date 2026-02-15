@@ -1,10 +1,15 @@
 /**
- * journal-extract Edge Function v1.2.2
+ * journal-extract Edge Function v1.3.0
  * Extracts structured epistemic claims from attributed conversation spans
  *
- * @version 1.2.2
+ * @version 1.3.0
  * @date 2026-02-14
  * @purpose D1 deliverable - journal claim extraction from spans
+ *
+ * v1.3.0 changes (closed-project hard filter):
+ *   - Enforce attribution eligibility check (project status + kind) before writes.
+ *   - Skip claim/loop writes when span attribution points to closed/ineligible project.
+ *   - Return explicit skipped_closed_project signal for observability.
  *
  * v1.2.2 changes (DEV-1):
  *   - Fire-and-forget chain to journal-consolidate for successful writes with
@@ -62,13 +67,15 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const FUNCTION_VERSION = "v1.2.2";
+const FUNCTION_VERSION = "v1.3.0";
 const PROMPT_VERSION = "journal-extract-v2";
 const MAX_TOKENS = 4096;
 const DEFAULT_MODEL = "claude-3-haiku-20240307";
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_TRANSCRIPT_CHARS = 8000; // Cap transcript to prevent inference timeouts
 const JOURNAL_CONSOLIDATE_TIMEOUT_MS = 120000;
+const ATTRIBUTION_ELIGIBLE_PROJECT_STATUSES = new Set(["active", "warranty", "estimating"]);
+const ATTRIBUTION_ELIGIBLE_PROJECT_KIND = "client";
 
 const VALID_CLAIM_TYPES = [
   "commitment",
@@ -118,6 +125,15 @@ interface ExtractedClaim {
 interface ExtractionResponse {
   claims: ExtractedClaim[];
   summary: string;
+}
+
+function isAttributionEligibleProject(status: string | null | undefined, projectKind?: string | null): boolean {
+  const normalizedStatus = String(status || "").trim().toLowerCase();
+  if (!ATTRIBUTION_ELIGIBLE_PROJECT_STATUSES.has(normalizedStatus)) return false;
+  if (projectKind != null && String(projectKind || "").trim().toLowerCase() !== ATTRIBUTION_ELIGIBLE_PROJECT_KIND) {
+    return false;
+  }
+  return true;
 }
 
 function stripCodeFences(raw: string): string {
@@ -552,7 +568,24 @@ Deno.serve(async (req: Request) => {
       .limit(1)
       .single();
 
-    const project_id = attribution?.applied_project_id || attribution?.project_id || null;
+    let project_id = attribution?.applied_project_id || attribution?.project_id || null;
+    let skipped_closed_project = false;
+    if (project_id) {
+      const { data: projectRow } = await db
+        .from("projects")
+        .select("status, project_kind")
+        .eq("id", project_id)
+        .maybeSingle();
+
+      const eligible = !!projectRow && isAttributionEligibleProject(projectRow.status, projectRow.project_kind);
+      if (!eligible) {
+        skipped_closed_project = true;
+        console.warn(
+          `[journal-extract] Closed-project hard filter skipped extraction writes for span ${span_id} (project=${project_id})`,
+        );
+        project_id = null;
+      }
+    }
 
     // ── IDEMPOTENCY GUARD ──────────────────────────────────────────
     // Check if completed claims already exist for this span_id.
@@ -577,6 +610,7 @@ Deno.serve(async (req: Request) => {
             span_id,
             interaction_id,
             project_id,
+            skipped_closed_project,
             idempotent_skip: true,
             existing_claims: count || 0,
             reason: "claims_already_exist_for_span",
@@ -675,6 +709,7 @@ Deno.serve(async (req: Request) => {
     let loops_written = 0;
     const claim_ids: string[] = [];
     let skipped_no_project = false;
+    let skip_reason: string | null = null;
     let journal_consolidate_fired = false;
 
     if (!dry_run && extraction.claims.length > 0) {
@@ -685,6 +720,9 @@ Deno.serve(async (req: Request) => {
       // knows claims were found, and can re-trigger after attribution.
       if (!project_id) {
         skipped_no_project = true;
+        skip_reason = skipped_closed_project
+          ? "closed_or_ineligible_project_attribution"
+          : "no_project_attribution";
         console.warn(
           `[journal-extract] Skipping claim insert: span ${span_id} has no project attribution (FK constraint).`,
         );
@@ -693,7 +731,7 @@ Deno.serve(async (req: Request) => {
           status: "success",
           completed_at: new Date().toISOString(),
           claims_extracted: 0,
-          error_message: "no_project_attribution: claims extracted but not written (FK constraint)",
+          error_message: `${skip_reason}: claims extracted but not written`,
         }).eq("run_id", run_id);
         if (noProjectUpdateErr) {
           console.error("[journal-extract] journal_runs update (no project) failed:", noProjectUpdateErr.message);
@@ -809,7 +847,8 @@ Deno.serve(async (req: Request) => {
         summary: extraction.summary,
         speakers_resolved: speakerContactMap.size,
         skipped_no_project,
-        ...(skipped_no_project ? { reason: "no_project_attribution: re-trigger after ai-router attributes span" } : {}),
+        skipped_closed_project,
+        ...(skipped_no_project ? { reason: `${skip_reason}: re-trigger after valid attribution` } : {}),
         model,
         journal_consolidate_fired,
         tokens_used,

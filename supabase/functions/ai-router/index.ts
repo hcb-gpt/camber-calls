@@ -1,13 +1,21 @@
 /**
- * ai-router Edge Function v1.11.1
+ * ai-router Edge Function v1.12.0
  * LLM-based project attribution for conversation spans
  *
- * @version 1.11.1
+ * @version 1.12.0
  * @date 2026-02-15
  * @purpose Use Claude Haiku to attribute spans to projects with anchored evidence
  *
  * CORE PRINCIPLE: span_attributions is the single source of truth.
  * NO writes to interactions.project_id from this path.
+ *
+ * v1.12.0 Changes (closed-project hard filter + resegment invariant + early-span coherence):
+ * - Enforces closed-project hard filter pre-inference (candidate list) and post-inference
+ *   (chosen project status check) to prevent closed-project leakage.
+ * - Adds auto-resegment invariant: span_chars > 3000 OR multiple strong-anchor projects
+ *   returns 409 + triggers admin-reseed resegment_and_reroute path.
+ * - Adds adjacent-span coherence guard for spans 0-3: prevent project hops without
+ *   transcript switch signal by overriding to coherent prior project (or downgrading review).
  *
  * v1.11.1 Changes (homeowner override strong-anchor equivalence):
  * - Treats context_package.meta.homeowner_override=true (without contradiction metadata)
@@ -67,15 +75,20 @@ import { parseLlmJson } from "../_shared/llm_json.ts";
 import { applyCommonAliasCorroborationGuardrail, isCommonWordAlias } from "./alias_guardrails.ts";
 import { applyBizDevCommitmentGate } from "./bizdev_guardrails.ts";
 import { homeownerOverrideActsAsStrongAnchor } from "./homeowner_override_gate.ts";
+import { evaluateAutoResegmentInvariant } from "./resegment_guardrails.ts";
+import { evaluateAdjacentSpanCoherence } from "./adjacent_coherence_guardrails.ts";
 
 const PROMPT_VERSION = "v1.11.0"; // prompt unchanged since v1.11.0
-const FUNCTION_VERSION = "v1.11.1";
+const FUNCTION_VERSION = "v1.12.0";
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
 
 // Confidence thresholds
 const THRESHOLD_AUTO_ASSIGN = 0.75;
 const THRESHOLD_REVIEW = 0.50;
+const ATTRIBUTION_ELIGIBLE_PROJECT_STATUSES = new Set(["active", "warranty", "estimating"]);
+const ATTRIBUTION_ELIGIBLE_PROJECT_KIND = "client";
+const AUTO_RESEGMENT_IDEMPOTENCY_VERSION = "v2";
 
 // ============================================================
 // TYPES
@@ -418,6 +431,168 @@ function deriveEvidenceTier(anchors: Anchor[], confidence: number, modelError: b
   return 3;
 }
 
+function isAttributionEligibleProject(status: string | null | undefined, projectKind?: string | null): boolean {
+  const normalizedStatus = String(status || "").trim().toLowerCase();
+  if (!ATTRIBUTION_ELIGIBLE_PROJECT_STATUSES.has(normalizedStatus)) return false;
+  if (projectKind != null && String(projectKind || "").trim().toLowerCase() !== ATTRIBUTION_ELIGIBLE_PROJECT_KIND) {
+    return false;
+  }
+  return true;
+}
+
+function filterClosedProjectCandidates(ctx: ContextPackage): {
+  filtered: ContextPackage;
+  removed_count: number;
+} {
+  const candidates = Array.isArray(ctx.candidates) ? ctx.candidates : [];
+  const filteredCandidates = candidates.filter((c) => isAttributionEligibleProject(c.status));
+  const removedCount = candidates.length - filteredCandidates.length;
+  if (removedCount <= 0) {
+    return { filtered: ctx, removed_count: 0 };
+  }
+
+  const existingWarnings = Array.isArray(ctx.meta?.warnings) ? ctx.meta.warnings : [];
+  return {
+    filtered: {
+      ...ctx,
+      meta: {
+        ...(ctx.meta || {}),
+        warnings: [...existingWarnings, `closed_project_filtered_router:${removedCount}`],
+      },
+      candidates: filteredCandidates,
+    },
+    removed_count: removedCount,
+  };
+}
+
+function normalizeAnchorTerm(term: string): string {
+  return String(term || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function inferStrongProjectIdsFromCandidates(candidates: ContextPackage["candidates"]): string[] {
+  const projectIds = new Set<string>();
+  for (const candidate of candidates || []) {
+    const normalizedAliases = new Set<string>();
+    for (const alias of candidate.aliases || []) {
+      const norm = normalizeAnchorTerm(alias);
+      if (norm) normalizedAliases.add(norm);
+    }
+    const projectNameNorm = normalizeAnchorTerm(candidate.project_name || "");
+    if (projectNameNorm) normalizedAliases.add(projectNameNorm);
+
+    const hasStrongSignal = (candidate.evidence?.alias_matches || []).some((m) => {
+      const matchType = String(m.match_type || "");
+      if (STRONG_ANCHOR_TYPES.includes(matchType)) return true;
+      if (matchType !== "city_or_location") return false;
+      const termNorm = normalizeAnchorTerm(String(m.term || ""));
+      if (!termNorm || termNorm.length < 5) return false;
+      return normalizedAliases.has(termNorm);
+    });
+
+    if (hasStrongSignal && candidate.project_id) {
+      projectIds.add(candidate.project_id);
+    }
+  }
+  return Array.from(projectIds);
+}
+
+async function fetchPriorAssignedProjects(
+  db: any,
+  interactionId: string | null,
+  spanIndex: number,
+): Promise<string[]> {
+  if (!interactionId || spanIndex < 1 || spanIndex > 3) return [];
+
+  const { data: priorSpans, error: priorErr } = await db
+    .from("conversation_spans")
+    .select("id, span_index")
+    .eq("interaction_id", interactionId)
+    .eq("is_superseded", false)
+    .lt("span_index", spanIndex)
+    .order("span_index", { ascending: false })
+    .limit(3);
+
+  if (priorErr || !priorSpans?.length) return [];
+
+  const priorSpanIds = priorSpans.map((s: any) => s.id).filter(Boolean);
+  if (priorSpanIds.length === 0) return [];
+
+  const { data: attribRows, error: attribErr } = await db
+    .from("span_attributions")
+    .select("span_id, project_id, applied_project_id, decision, confidence, attributed_at")
+    .in("span_id", priorSpanIds)
+    .order("attributed_at", { ascending: false });
+
+  if (attribErr || !attribRows?.length) return [];
+
+  const latestBySpan = new Map<string, any>();
+  for (const row of attribRows) {
+    if (!row.span_id || latestBySpan.has(row.span_id)) continue;
+    latestBySpan.set(row.span_id, row);
+  }
+
+  const orderedPrior = priorSpans
+    .slice()
+    .sort((a: any, b: any) => Number(a.span_index || 0) - Number(b.span_index || 0));
+  const assignedProjectIds: string[] = [];
+  for (const s of orderedPrior) {
+    const row = latestBySpan.get(s.id);
+    if (!row) continue;
+    const appliedProjectId = row.applied_project_id || row.project_id || null;
+    if (row.decision === "assign" && appliedProjectId) {
+      assignedProjectIds.push(appliedProjectId);
+    }
+  }
+  return assignedProjectIds;
+}
+
+async function triggerAutoReseed(params: {
+  interaction_id: string | null;
+  reason: string;
+}): Promise<{ dispatched: boolean; status: number | null; detail: string | null }> {
+  if (!params.interaction_id) {
+    return { dispatched: false, status: null, detail: "missing_interaction_id" };
+  }
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const edgeSecret = Deno.env.get("EDGE_SHARED_SECRET");
+  if (!supabaseUrl || !edgeSecret) {
+    return { dispatched: false, status: null, detail: "missing_runtime_env" };
+  }
+
+  const reseedUrl = `${supabaseUrl}/functions/v1/admin-reseed`;
+  const idempotencyKey = `ai-router:auto-resegment:${params.interaction_id}:${AUTO_RESEGMENT_IDEMPOTENCY_VERSION}`;
+  try {
+    const resp = await fetch(reseedUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Edge-Secret": edgeSecret,
+        "X-Source": "system",
+      },
+      body: JSON.stringify({
+        interaction_id: params.interaction_id,
+        reason: params.reason,
+        idempotency_key: idempotencyKey,
+        mode: "resegment_and_reroute",
+        requested_by: "system",
+      }),
+    });
+
+    if (!resp.ok) {
+      const bodyText = await resp.text().catch(() => "unknown");
+      return { dispatched: false, status: resp.status, detail: bodyText.slice(0, 200) };
+    }
+
+    return { dispatched: true, status: resp.status, detail: null };
+  } catch (e: any) {
+    return { dispatched: false, status: null, detail: e?.message || "unknown_error" };
+  }
+}
+
 function canOverwriteLock(currentLock: string | null, newLock: string | null): boolean {
   const lockOrder: Record<string, number> = { "human": 3, "ai": 2 };
   const currentLevel = lockOrder[currentLock || ""] || 0;
@@ -438,6 +613,8 @@ function buildReasonCodes(opts: {
   geoOnly?: boolean;
   commonAliasUnconfirmed?: boolean;
   bizdevWithoutCommitment?: boolean;
+  coherenceGuardrail?: boolean;
+  closedProjectGuardrail?: boolean;
 }): string[] {
   const reasons: string[] = [];
   if (Array.isArray(opts.modelReasons)) reasons.push(...opts.modelReasons);
@@ -448,6 +625,8 @@ function buildReasonCodes(opts: {
   if (opts.geoOnly) reasons.push("geo_only");
   if (opts.commonAliasUnconfirmed) reasons.push("common_alias_unconfirmed");
   if (opts.bizdevWithoutCommitment) reasons.push("bizdev_without_commitment");
+  if (opts.coherenceGuardrail) reasons.push("adjacent_span_coherence");
+  if (opts.closedProjectGuardrail) reasons.push("closed_project_filtered");
   if (opts.modelError) reasons.push("model_error");
 
   return Array.from(new Set(reasons.filter(Boolean)));
@@ -773,8 +952,9 @@ Deno.serve(async (req: Request) => {
     });
   }
 
-  const context_package: ContextPackage | null = body.context_package || null;
+  let context_package: ContextPackage | null = body.context_package || null;
   const dry_run = body.dry_run === true;
+  const request_source = String(body.source || "").toLowerCase();
 
   if (!context_package) {
     return new Response(JSON.stringify({ error: "missing_context_package" }), {
@@ -791,12 +971,37 @@ Deno.serve(async (req: Request) => {
     });
   }
 
-  const homeownerOverrideStrongAnchor = homeownerOverrideActsAsStrongAnchor(context_package.meta);
-
   const db = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
   );
+
+  const candidateFilterResult = filterClosedProjectCandidates(context_package);
+  context_package = candidateFilterResult.filtered;
+  const contextStrongProjectIds = inferStrongProjectIdsFromCandidates(context_package.candidates || []);
+  if (candidateFilterResult.removed_count > 0) {
+    console.log(
+      `[ai-router] Closed-project hard filter removed ${candidateFilterResult.removed_count} candidates pre-inference`,
+    );
+  }
+
+  const homeownerOverrideStrongAnchor = homeownerOverrideActsAsStrongAnchor(context_package.meta);
+  const interaction_id = context_package.meta?.interaction_id || null;
+  const transcriptText = context_package.span?.transcript_text || "";
+
+  const { data: spanMeta } = await db
+    .from("conversation_spans")
+    .select("span_index, transcript_segment, interaction_id")
+    .eq("id", span_id)
+    .maybeSingle();
+
+  const span_index = Number(spanMeta?.span_index ?? context_package.meta?.span_index ?? -1);
+  const resolvedInteractionId = interaction_id || spanMeta?.interaction_id || null;
+  const span_chars = Math.max(
+    transcriptText.length,
+    String(spanMeta?.transcript_segment || "").length,
+  );
+  const priorAssignedProjectIds = await fetchPriorAssignedProjects(db, resolvedInteractionId, span_index);
 
   let result: AttributionResult;
   let raw_response: any = null;
@@ -811,6 +1016,9 @@ Deno.serve(async (req: Request) => {
   let bizdev_commitment_to_start = false;
   let bizdev_commitment_tags: string[] = [];
   let bizdev_without_commitment = false;
+  let adjacent_coherence_guardrail = false;
+  let adjacent_coherence_reason: string | null = null;
+  let closed_project_guardrail = false;
 
   try {
     const anthropic = new Anthropic({
@@ -838,7 +1046,7 @@ Deno.serve(async (req: Request) => {
     const parsed = parseLlmJson<any>(responseText).value;
 
     let project_id = parsed.project_id || null;
-    const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
+    let confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
     const anchors: Anchor[] = Array.isArray(parsed.anchors) ? parsed.anchors : [];
     const suggested_aliases: SuggestedAlias[] = Array.isArray(parsed.suggested_aliases) ? parsed.suggested_aliases : [];
     const journal_references: JournalReference[] = Array.isArray(parsed.journal_references)
@@ -923,6 +1131,103 @@ Deno.serve(async (req: Request) => {
       console.log(
         `[ai-router] BizDev commitment gate active: project assignment withheld (signals=${signalSummary || "none"})`,
       );
+    }
+
+    const contextStrongProjectIdsForInvariant = span_chars > 2000 ? contextStrongProjectIds : [];
+    const autoResegmentInvariant = evaluateAutoResegmentInvariant({
+      span_chars,
+      anchors: validatedAnchors.map((a) => ({
+        match_type: a.match_type,
+        candidate_project_id: a.candidate_project_id,
+      })),
+      additional_strong_project_ids: contextStrongProjectIdsForInvariant,
+    });
+    if (autoResegmentInvariant.triggered) {
+      const invariantReason = autoResegmentInvariant.reasons.join(",");
+      const reseedReason = `auto_resegment_invariant:${invariantReason}`;
+      const reseedDispatch = (dry_run || request_source === "admin-reseed")
+        ? {
+          dispatched: false,
+          status: null,
+          detail: dry_run ? "dry_run" : "source_admin_reseed_skip_dispatch",
+        }
+        : await triggerAutoReseed({
+          interaction_id: resolvedInteractionId,
+          reason: reseedReason,
+        });
+
+      console.warn(
+        `[ai-router] Auto-resegment invariant triggered for span ${span_id}: ${invariantReason} (dispatched=${reseedDispatch.dispatched})`,
+      );
+
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: "auto_resegment_required",
+          error_code: "auto_resegment_required",
+          span_id,
+          interaction_id: resolvedInteractionId,
+          span_index,
+          invariant: autoResegmentInvariant,
+          context_strong_project_ids: contextStrongProjectIdsForInvariant,
+          reseed_dispatched: reseedDispatch.dispatched,
+          reseed_status: reseedDispatch.status,
+          reseed_detail: reseedDispatch.detail,
+          dry_run,
+          function_version: FUNCTION_VERSION,
+          model_id: MODEL_ID,
+          prompt_version: PROMPT_VERSION,
+          tokens_used,
+          inference_ms,
+          ms: Date.now() - t0,
+        }),
+        {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    }
+
+    const coherence = evaluateAdjacentSpanCoherence({
+      span_index,
+      transcript_text: spanTranscript,
+      current_project_id: project_id,
+      prior_assigned_project_ids: priorAssignedProjectIds,
+      candidate_project_ids: (context_package.candidates || []).map((c) => c.project_id),
+    });
+    adjacent_coherence_guardrail = coherence.enforced;
+    adjacent_coherence_reason = coherence.reason;
+    if (coherence.enforced) {
+      if (coherence.override_project_id) {
+        project_id = coherence.override_project_id;
+        decision = "assign";
+        confidence = Math.max(confidence, THRESHOLD_AUTO_ASSIGN);
+        reasoning = `${reasoning} Adjacent-span coherence preserved prior project continuity (span ${span_index}).`;
+      } else if (coherence.downgrade_to_review) {
+        project_id = null;
+        decision = "review";
+        reasoning = `${reasoning} Adjacent-span coherence guard withheld project hop without switch signal.`;
+      }
+    }
+
+    if (project_id) {
+      const candidateRow = (context_package.candidates || []).find((c) => c.project_id === project_id);
+      let projectEligible = candidateRow ? isAttributionEligibleProject(candidateRow.status) : false;
+      if (!projectEligible) {
+        const { data: projectRow } = await db
+          .from("projects")
+          .select("status, project_kind")
+          .eq("id", project_id)
+          .maybeSingle();
+        projectEligible = !!projectRow && isAttributionEligibleProject(projectRow.status, projectRow.project_kind);
+      }
+      if (!projectEligible) {
+        closed_project_guardrail = true;
+        project_id = null;
+        decision = "review";
+        reasoning = `${reasoning} Closed-project hard filter withheld attribution for ineligible project status.`;
+        console.log("[ai-router] Closed-project hard filter downgraded assignment candidate");
+      }
     }
 
     result = {
@@ -1073,6 +1378,8 @@ Deno.serve(async (req: Request) => {
       !effectiveStrongAnchor ||
       common_alias_unconfirmed ||
       bizdev_without_commitment ||
+      adjacent_coherence_guardrail ||
+      closed_project_guardrail ||
       model_error;
 
     if (needsReviewQueue) {
@@ -1086,6 +1393,8 @@ Deno.serve(async (req: Request) => {
         geoOnly: !effectiveStrongAnchor && result.anchors.some((a) => a.match_type === "city_or_location"),
         commonAliasUnconfirmed: common_alias_unconfirmed,
         bizdevWithoutCommitment: bizdev_without_commitment,
+        coherenceGuardrail: adjacent_coherence_guardrail,
+        closedProjectGuardrail: closed_project_guardrail,
       });
 
       const context_payload = {
@@ -1115,6 +1424,15 @@ Deno.serve(async (req: Request) => {
           project_id: context_package.meta?.homeowner_override_project_id || null,
           conflict_project_id: context_package.meta?.homeowner_override_conflict_project_id || null,
           conflict_term: context_package.meta?.homeowner_override_conflict_term || null,
+        },
+        coherence_guardrail: {
+          active: adjacent_coherence_guardrail,
+          reason: adjacent_coherence_reason,
+          span_index,
+          prior_assigned_project_ids: priorAssignedProjectIds,
+        },
+        closed_project_guardrail: {
+          active: closed_project_guardrail,
         },
         model_id: MODEL_ID,
         prompt_version: PROMPT_VERSION,
@@ -1200,6 +1518,16 @@ Deno.serve(async (req: Request) => {
       guardrails: {
         common_alias_unconfirmed,
         flagged_alias_terms: common_alias_terms,
+        adjacent_coherence: {
+          active: adjacent_coherence_guardrail,
+          reason: adjacent_coherence_reason,
+          span_index,
+          prior_assigned_project_ids: priorAssignedProjectIds,
+        },
+        closed_project_filter: {
+          active: closed_project_guardrail,
+          pre_inference_candidates_removed: candidateFilterResult.removed_count,
+        },
         bizdev_classifier: {
           call_type: bizdev_call_type,
           confidence: bizdev_confidence,
