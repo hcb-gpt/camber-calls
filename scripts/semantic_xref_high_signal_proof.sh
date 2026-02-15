@@ -98,7 +98,10 @@ echo ""
 echo "--- Probe A: Windship misspelling semantic lookup ---"
 "${PSQL_BIN}" "${DATABASE_URL}" -X -v ON_ERROR_STOP=1 -P pager=off -c "
 WITH windship_seed AS (
-  SELECT embedding, 'windship_claim_embedding'::text AS seed_source
+  SELECT
+    embedding,
+    claim_text AS seed_query_text,
+    'windship_claim_embedding'::text AS seed_source
   FROM public.journal_claims
   WHERE active = true
     AND embedding IS NOT NULL
@@ -107,7 +110,10 @@ WITH windship_seed AS (
   LIMIT 1
 ),
 winship_fallback AS (
-  SELECT embedding, 'winship_claim_embedding_fallback'::text AS seed_source
+  SELECT
+    embedding,
+    claim_text AS seed_query_text,
+    'winship_claim_embedding_fallback'::text AS seed_source
   FROM public.journal_claims
   WHERE active = true
     AND embedding IS NOT NULL
@@ -129,7 +135,8 @@ probe AS (
     NULL,
     NULL,
     10,
-    1.0
+    1.0,
+    s.seed_query_text
   ) r
 )
 SELECT
@@ -147,7 +154,9 @@ echo ""
 echo "--- Probe B: Mystery white semantic lookup ---"
 "${PSQL_BIN}" "${DATABASE_URL}" -X -v ON_ERROR_STOP=1 -P pager=off -c "
 WITH seed AS (
-  SELECT embedding
+  SELECT
+    embedding,
+    claim_text AS seed_query_text
   FROM public.journal_claims
   WHERE active = true
     AND embedding IS NOT NULL
@@ -163,7 +172,8 @@ probe AS (
     NULL,
     NULL,
     10,
-    1.0
+    1.0,
+    s.seed_query_text
   ) r
 )
 SELECT
