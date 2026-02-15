@@ -63,8 +63,25 @@ rq as (
     rq.module,
     rq.created_at,
     rq.resolved_at,
-    rq.resolution_action
+    rq.resolution_action,
+    cs.interaction_id as span_interaction_id,
+    cs.is_superseded
   from public.review_queue rq
+  join params p on p.interaction_id = rq.interaction_id
+  left join public.conversation_spans cs on cs.id = rq.span_id
+),
+
+rq_latest as (
+  select
+    rq.id,
+    rq.span_id,
+    rq.status,
+    rq.reason_codes,
+    rq.module,
+    rq.created_at,
+    rq.resolved_at,
+    rq.resolution_action
+  from rq
   join spans s on s.span_id = rq.span_id
 ),
 
@@ -79,8 +96,34 @@ needs_review_spans as (
 review_gaps as (
   select n.span_id
   from needs_review_spans n
-  left join rq on rq.span_id = n.span_id
+  left join rq_latest rq on rq.span_id = n.span_id
   where rq.id is null
+),
+
+latest_spans_missing_attr as (
+  select s.span_id
+  from spans s
+  left join latest_attr a on a.span_id = s.span_id
+  where a.span_id is null
+),
+
+pending_on_superseded as (
+  select rq.id
+  from rq
+  where rq.status = 'pending'
+    and rq.span_id is not null
+    and (
+      rq.span_interaction_id is null
+      or rq.span_interaction_id <> (select interaction_id from params)
+      or rq.is_superseded = true
+    )
+),
+
+pending_null_span as (
+  select rq.id
+  from rq
+  where rq.status = 'pending'
+    and rq.span_id is null
 )
 
 select
@@ -88,11 +131,17 @@ select
   (select gen_max from max_gen) as latest_generation,
   (select count(*) from spans)::int as spans_latest_gen,
   (select count(*) from latest_attr)::int as latest_attr_rows,
-  (select count(*) from rq)::int as review_queue_rows_for_latest_gen,
+  (select count(*) from rq_latest)::int as review_queue_rows_for_latest_gen,
   (select count(*) from review_gaps)::int as review_gaps,
+  (select count(*) from latest_spans_missing_attr)::int as latest_active_spans_missing_attr,
+  (select count(*) from pending_on_superseded)::int as pending_on_superseded,
+  (select count(*) from pending_null_span)::int as pending_null_span,
   (select count(*) from public.journal_claims jc join params p2 on p2.interaction_id = jc.call_id where jc.active = true)::int as active_journal_claims,
   case
     when (select count(*) from spans) = 0 then 'FAIL_NO_ACTIVE_SPANS'
+    when (select count(*) from latest_spans_missing_attr) > 0 then 'FAIL_UNCOVERED_LATEST_SPANS'
+    when (select count(*) from pending_on_superseded) > 0 then 'FAIL_PENDING_SUPERSEDED'
+    when (select count(*) from pending_null_span) > 0 then 'FAIL_PENDING_NULL_SPAN'
     when (select count(*) from review_gaps) = 0 then 'PASS'
     else 'FAIL_REVIEW_GAP'
   end as verdict
@@ -201,4 +250,3 @@ join params p on p.interaction_id = jc.call_id
 where jc.active = true
 order by jc.claim_project_confidence desc nulls last, jc.attribution_confidence desc nulls last
 limit 200;
-
