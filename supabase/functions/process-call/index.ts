@@ -1,8 +1,8 @@
 /**
- * process-call Edge Function v4.3.4
+ * process-call Edge Function v4.3.5
  * Full v3.6 pipeline in Supabase - Ported from v4.0.22 context_assembly
  *
- * @version 4.3.4
+ * @version 4.3.5
  * @date 2026-02-15
  * @port context_assembly v4.0.22 - 6-source ranking, word boundaries, speaker stripping
  *
@@ -24,6 +24,11 @@
  *   inbound => owner=to_phone, other_party=from_phone
  *   outbound => owner=from_phone, other_party=to_phone
  *
+ * v4.3.5 CHANGES (empty-transcript terminalization):
+ * - Empty transcript interactions are terminalized (needs_review=false, terminal reason)
+ *   instead of creating pending null-span review_queue pressure.
+ * - Legacy pending null-span review_queue rows for empty transcript interactions are auto-dismissed.
+ *
  * v4.3.3 CHANGES (shadow replay support):
  * - Persist `is_shadow` on calls_raw + interactions.
  * - Normalize provenance source via ALLOWED_PROVENANCE_SOURCES (includes `shadow`).
@@ -42,7 +47,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { normalizePhoneForLookup } from "./phone_lookup.ts";
 import { resolveCallPartyPhones } from "./phone_direction.ts";
 
-const PROCESS_CALL_VERSION = "v4.3.4"; // direction-aware phone role mapping + shadow replay + auth hardening + lineage persistence + pipeline chain fix
+const PROCESS_CALL_VERSION = "v4.3.5"; // empty-transcript terminalization + null-span review_queue cleanup
 const GATE = { PASS: "PASS", SKIP: "SKIP", NEEDS_REVIEW: "NEEDS_REVIEW" };
 const ID_PATTERN = /^cll_[a-zA-Z0-9_]+$/;
 const ALLOWED_PROVENANCE_SOURCES = [
@@ -196,6 +201,15 @@ function m4(n: any) {
   return { decision: r.length > 0 ? GATE.NEEDS_REVIEW : GATE.PASS, reasons: r };
 }
 
+function isTerminalEmptyTranscript(gateReasons: string[], transcript: string | null | undefined): boolean {
+  const hasEmptyTranscriptGate = gateReasons.includes("G4_EMPTY_TRANSCRIPT");
+  const transcriptLen = (transcript || "").length;
+  const nonTerminalReasons = gateReasons.filter((reason) =>
+    reason !== "G4_EMPTY_TRANSCRIPT" && reason !== "G4_TIMESTAMP_MISSING"
+  );
+  return hasEmptyTranscriptGate && transcriptLen < 10 && nonTerminalReasons.length === 0;
+}
+
 Deno.serve(async (req: Request) => {
   const t0 = Date.now();
   const run_id = `run_${t0}_${Math.random().toString(36).slice(2, 8)}`;
@@ -325,6 +339,12 @@ Deno.serve(async (req: Request) => {
   if (raw_source && raw_source !== provenance_source) {
     warnings.push(`source_normalized:${raw_source}->${provenance_source}`);
   }
+  const normalizedPreview = m1(raw);
+  const previewGate = m4(normalizedPreview);
+  const previewTerminalEmptyTranscript = isTerminalEmptyTranscript(
+    previewGate.reasons,
+    normalizedPreview.transcript,
+  );
 
   try {
     // IDEMPOTENCY
@@ -340,10 +360,42 @@ Deno.serve(async (req: Request) => {
         (error.message?.includes("duplicate") ||
           error.message?.includes("23505"))
       ) {
+        if (previewTerminalEmptyTranscript) {
+          const { error: interactionUpdateErr } = await db
+            .from("interactions")
+            .update({
+              needs_review: false,
+              review_reasons: ["terminal_empty_transcript", ...previewGate.reasons],
+              transcript_chars: normalizedPreview.transcript?.length || 0,
+            })
+            .eq("interaction_id", iid);
+          if (interactionUpdateErr) {
+            warnings.push(`duplicate_terminalize_interaction_error: ${interactionUpdateErr.message}`);
+          }
+
+          const { error: terminalizeErr } = await db
+            .from("review_queue")
+            .update({
+              status: "dismissed",
+              resolved_at: new Date().toISOString(),
+              resolved_by: "process-call",
+              resolution_action: "auto_dismiss",
+              resolution_notes: "terminal_empty_transcript",
+            })
+            .eq("interaction_id", iid)
+            .eq("status", "pending")
+            .is("span_id", null);
+          if (terminalizeErr) {
+            warnings.push(`duplicate_terminalize_review_queue_error: ${terminalizeErr.message}`);
+          }
+        }
+
         await db.from("event_audit").insert({
           interaction_id: iid,
           gate_status: "SKIP",
-          gate_reasons: ["G1_DUPLICATE_EXACT"],
+          gate_reasons: previewTerminalEmptyTranscript
+            ? ["G1_DUPLICATE_EXACT", "G4_EMPTY_TRANSCRIPT_TERMINALIZED"]
+            : ["G1_DUPLICATE_EXACT"],
           source_system: `edge_${PROCESS_CALL_VERSION}`,
           source_run_id: run_id,
           pipeline_version: PROCESS_CALL_VERSION,
@@ -355,6 +407,8 @@ Deno.serve(async (req: Request) => {
             decision: "SKIP",
             reason: "duplicate",
             interaction_id: iid,
+            terminalized_empty_transcript: previewTerminalEmptyTranscript,
+            warnings,
             ms: Date.now() - t0,
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
@@ -384,7 +438,7 @@ Deno.serve(async (req: Request) => {
     if (ad) audit_id = ad.id;
 
     // M1: Normalize input
-    const n = m1(raw);
+    const n = normalizedPreview;
     const partyPhones = resolveCallPartyPhones(n);
     const persistedDirection = partyPhones.direction === "unknown" ? n.direction || null : partyPhones.direction;
     const lookupPhone = normalizePhoneForLookup(partyPhones.otherPartyPhone);
@@ -762,7 +816,8 @@ Deno.serve(async (req: Request) => {
     }
 
     // GATE
-    const g = m4(n);
+    const g = previewGate;
+    const terminalEmptyTranscript = isTerminalEmptyTranscript(g.reasons, n.transcript);
 
     // CALLS_RAW (primary storage - includes candidate info)
     const { data: cr } = await db.from("calls_raw").upsert({
@@ -822,6 +877,10 @@ Deno.serve(async (req: Request) => {
     // v4.2.0: Write candidate_projects so auto_assign_project can read them
     // ========================================
     if (g.decision === "PASS" || g.decision === "NEEDS_REVIEW") {
+      const interactionNeedsReview = terminalEmptyTranscript ? false : true;
+      const interactionReviewReasons = terminalEmptyTranscript
+        ? ["terminal_empty_transcript", ...g.reasons]
+        : [...g.reasons, "ai_candidate_only"];
       await db.from("interactions").upsert({
         interaction_id: iid,
         channel: "call",
@@ -831,12 +890,31 @@ Deno.serve(async (req: Request) => {
         owner_phone: partyPhones.ownerPhone,
         candidate_projects: candidateProjectsJson.length > 0 ? candidateProjectsJson : null,
         event_at_utc: n.event_at_utc || null,
-        needs_review: true, // Default true; auto_assign_project may override below
-        review_reasons: [...g.reasons, "ai_candidate_only"],
+        needs_review: interactionNeedsReview,
+        review_reasons: interactionReviewReasons,
         project_attribution_confidence: project_confidence,
         transcript_chars: n.transcript?.length || 0,
         is_shadow,
       }, { onConflict: "interaction_id" });
+
+      if (terminalEmptyTranscript) {
+        // Terminalize legacy null-span pending rows for this interaction.
+        const { error: terminalizeErr } = await db
+          .from("review_queue")
+          .update({
+            status: "dismissed",
+            resolved_at: new Date().toISOString(),
+            resolved_by: "process-call",
+            resolution_action: "auto_dismiss",
+            resolution_notes: "terminal_empty_transcript",
+          })
+          .eq("interaction_id", iid)
+          .eq("status", "pending")
+          .is("span_id", null);
+        if (terminalizeErr) {
+          warnings.push(`terminalize_empty_transcript_review_queue_error: ${terminalizeErr.message}`);
+        }
+      }
 
       // ========================================
       // v4.2.0: AUTO-ASSIGN PROJECT
@@ -871,7 +949,7 @@ Deno.serve(async (req: Request) => {
       // Fire-and-forget: segment-call failures do NOT block process-call response.
       // ========================================
       const transcriptLen = n.transcript?.length || 0;
-      if (g.decision === "PASS" && transcriptLen >= 10) {
+      if (!terminalEmptyTranscript && g.decision === "PASS" && transcriptLen >= 10) {
         const edgeSecretVal = Deno.env.get("EDGE_SHARED_SECRET");
         const segmentCallUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/segment-call`;
         if (edgeSecretVal) {

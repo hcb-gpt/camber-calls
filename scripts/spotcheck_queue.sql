@@ -124,6 +124,30 @@ pending_null_span as (
   from rq
   where rq.status = 'pending'
     and rq.span_id is null
+),
+
+interaction_state as (
+  select
+    i.interaction_id,
+    coalesce(i.needs_review, true) as needs_review,
+    coalesce(i.review_reasons, '{}'::text[]) as review_reasons,
+    coalesce(i.transcript_chars, 0) as transcript_chars
+  from public.interactions i
+  join params p on p.interaction_id = i.interaction_id
+),
+
+is_terminal_empty_transcript as (
+  select
+    case
+      when exists (
+        select 1
+        from interaction_state s
+        where s.needs_review = false
+          and s.transcript_chars < 10
+          and 'terminal_empty_transcript' = any(s.review_reasons)
+      ) then true
+      else false
+    end as ok
 )
 
 select
@@ -138,6 +162,11 @@ select
   (select count(*) from pending_null_span)::int as pending_null_span,
   (select count(*) from public.journal_claims jc join params p2 on p2.interaction_id = jc.call_id where jc.active = true)::int as active_journal_claims,
   case
+    when (select count(*) from spans) = 0
+      and (select ok from is_terminal_empty_transcript)
+      and (select count(*) from pending_on_superseded) = 0
+      and (select count(*) from pending_null_span) = 0
+      then 'PASS_EMPTY_TRANSCRIPT_TERMINAL'
     when (select count(*) from spans) = 0 then 'FAIL_NO_ACTIVE_SPANS'
     when (select count(*) from latest_spans_missing_attr) > 0 then 'FAIL_UNCOVERED_LATEST_SPANS'
     when (select count(*) from pending_on_superseded) > 0 then 'FAIL_PENDING_SUPERSEDED'
