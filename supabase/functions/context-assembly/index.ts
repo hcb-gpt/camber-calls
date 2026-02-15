@@ -2170,11 +2170,9 @@ Deno.serve(async (req: Request) => {
         src === "cross_contact_claim_match" ||
         src === "interactions_existing_project"
       );
-      const hasOnlyWeakSources = meta.sources.every((src) => WEAK_ALIAS_ONLY_SOURCES.has(src));
       const commonWordAliasDemoted = mysteryWhiteMaterialMentioned &&
         hasCommonWordAliasInName &&
-        !hasHighConfidenceCorroboration &&
-        (!meta.assigned || hasOnlyWeakSources);
+        !hasHighConfidenceCorroboration;
       const weakOnly = (hasAliasEvidence && !hasStrongMatch && !meta.assigned) || commonWordAliasDemoted;
 
       if (weakOnly) {
