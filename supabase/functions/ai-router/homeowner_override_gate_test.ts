@@ -1,8 +1,5 @@
 import { assertEquals } from "jsr:@std/assert";
-import {
-  evaluateHomeownerOverride,
-  homeownerOverrideActsAsStrongAnchor,
-} from "./homeowner_override_gate.ts";
+import { evaluateHomeownerOverride, homeownerOverrideActsAsStrongAnchor } from "./homeowner_override_gate.ts";
 
 Deno.test("homeowner override: active with no conflict metadata", () => {
   assertEquals(

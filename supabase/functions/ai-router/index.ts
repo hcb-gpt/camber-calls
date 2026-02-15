@@ -1056,9 +1056,13 @@ Deno.serve(async (req: Request) => {
         project_id = homeownerOverrideProjectId;
         confidence = Math.max(confidence, THRESHOLD_AUTO_ASSIGN, 0.92);
         reasoning =
-          `${reasoning} deterministic_homeowner_override_gate: forced assign to homeowner project ${homeownerOverrideProjectId} (prev_decision=${previousDecision}, prev_project=${previousProject || "null"}).`;
+          `${reasoning} deterministic_homeowner_override_gate: forced assign to homeowner project ${homeownerOverrideProjectId} (prev_decision=${previousDecision}, prev_project=${
+            previousProject || "null"
+          }).`;
         console.log(
-          `[ai-router] Deterministic homeowner gate forced assignment: project=${homeownerOverrideProjectId} prev_decision=${previousDecision} prev_project=${previousProject || "null"}`,
+          `[ai-router] Deterministic homeowner gate forced assignment: project=${homeownerOverrideProjectId} prev_decision=${previousDecision} prev_project=${
+            previousProject || "null"
+          }`,
         );
       }
     } else if (homeownerOverrideSkipReason === "multi_project_span") {
