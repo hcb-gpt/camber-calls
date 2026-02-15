@@ -16,6 +16,11 @@
  *   returns 409 + triggers admin-reseed resegment_and_reroute path.
  * - Adds adjacent-span coherence guard for spans 0-3: prevent project hops without
  *   transcript switch signal by overriding to coherent prior project (or downgrading review).
+ * v1.12.0 Changes (sanitization + deterministic homeowner fallback):
+ * - Sanitizes transcript text before prompt/JSON packaging and retries once with stricter sanitization.
+ * - Applies deterministic homeowner assignment fallback when LLM inference/parsing fails and
+ *   homeowner override metadata is authoritative.
+ * - Prevents fallback homeowner assignments from being routed into review_queue.
  *
  * v1.11.1 Changes (homeowner override strong-anchor equivalence):
  * - Treats context_package.meta.homeowner_override=true (without contradiction metadata)
@@ -73,6 +78,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 import { parseLlmJson } from "../_shared/llm_json.ts";
 import { applyCommonAliasCorroborationGuardrail, isCommonWordAlias } from "./alias_guardrails.ts";
+import { applyBethanyRoadWinshipGuardrail } from "./bethany_winship_guardrail.ts";
 import { applyBizDevCommitmentGate } from "./bizdev_guardrails.ts";
 import { homeownerOverrideActsAsStrongAnchor } from "./homeowner_override_gate.ts";
 import { evaluateAutoResegmentInvariant } from "./resegment_guardrails.ts";
@@ -227,6 +233,47 @@ interface ContextPackage {
   project_journal?: ProjectJournalState[];
   email_context?: EmailContextItem[];
   email_lookup_meta?: EmailLookupMeta | null;
+}
+
+type TranscriptSanitizeMode = "default" | "strict";
+
+function sanitizeTranscriptText(
+  text: string,
+  mode: TranscriptSanitizeMode,
+): { text: string; replaced: number } {
+  const raw = String(text || "");
+  let replaced = 0;
+  // deno-lint-ignore no-control-regex -- intentional: scrub control chars from prompt-bound transcript text
+  const pattern = mode === "strict" ? /[\x00-\x1F\x7F]/g : /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
+  const scrubbed = raw.replace(pattern, () => {
+    replaced += 1;
+    return " ";
+  });
+  const normalized = mode === "strict" ? scrubbed.replace(/\s+/g, " ").trim() : scrubbed;
+  return { text: normalized, replaced };
+}
+
+function withSanitizedTranscript(
+  contextPackage: ContextPackage,
+  mode: TranscriptSanitizeMode,
+): { context: ContextPackage; replaced: number } {
+  const sourceTranscript = contextPackage.span?.transcript_text || "";
+  const sanitized = sanitizeTranscriptText(sourceTranscript, mode);
+
+  if (sanitized.text === sourceTranscript) {
+    return { context: contextPackage, replaced: sanitized.replaced };
+  }
+
+  return {
+    context: {
+      ...contextPackage,
+      span: {
+        ...(contextPackage.span || {}),
+        transcript_text: sanitized.text,
+      },
+    },
+    replaced: sanitized.replaced,
+  };
 }
 
 // ============================================================
@@ -1021,31 +1068,72 @@ Deno.serve(async (req: Request) => {
   let adjacent_coherence_guardrail = false;
   let adjacent_coherence_reason: string | null = null;
   let closed_project_guardrail = false;
+  let strictSanitizationRetryUsed = false;
+  let transcriptControlCharsSanitized = 0;
+  let homeownerDeterministicFallbackApplied = false;
+  const homeownerOverrideProjectId = typeof context_package.meta?.homeowner_override_project_id === "string"
+    ? context_package.meta.homeowner_override_project_id.trim()
+    : "";
 
   try {
     const anthropic = new Anthropic({
       apiKey: Deno.env.get("ANTHROPIC_API_KEY")!,
     });
 
-    const inferenceStart = Date.now();
+    const runInference = async (contextPackageForPrompt: ContextPackage) => {
+      const inferenceStart = Date.now();
+      const response = await anthropic.messages.create({
+        model: MODEL_ID,
+        max_tokens: MAX_TOKENS,
+        messages: [
+          { role: "user", content: buildUserPrompt(contextPackageForPrompt) },
+        ],
+        system: SYSTEM_PROMPT,
+      });
+      const inferenceElapsedMs = Date.now() - inferenceStart;
+      const tokensUsed = (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0);
+      const textBlock = response.content.find((b: any) => b.type === "text");
+      const responseText = textBlock?.type === "text" ? textBlock.text : "";
+      const parsed = parseLlmJson<any>(responseText).value;
 
-    const response = await anthropic.messages.create({
-      model: MODEL_ID,
-      max_tokens: MAX_TOKENS,
-      messages: [
-        { role: "user", content: buildUserPrompt(context_package) },
-      ],
-      system: SYSTEM_PROMPT,
-    });
+      return {
+        parsed,
+        response,
+        inferenceElapsedMs,
+        tokensUsed,
+        transcriptText: contextPackageForPrompt.span?.transcript_text || "",
+      };
+    };
 
-    inference_ms = Date.now() - inferenceStart;
-    tokens_used = (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0);
-    raw_response = response;
+    const defaultContext = withSanitizedTranscript(context_package, "default");
+    transcriptControlCharsSanitized = defaultContext.replaced;
 
-    const textBlock = response.content.find((b: any) => b.type === "text");
-    const responseText = textBlock?.type === "text" ? textBlock.text : "";
+    let inferenceResult: {
+      parsed: any;
+      response: any;
+      inferenceElapsedMs: number;
+      tokensUsed: number;
+      transcriptText: string;
+    };
 
-    const parsed = parseLlmJson<any>(responseText).value;
+    try {
+      inferenceResult = await runInference(defaultContext.context);
+    } catch (primaryError: any) {
+      strictSanitizationRetryUsed = true;
+      console.warn(
+        `[ai-router] Retrying inference with strict transcript sanitization: ${
+          primaryError?.message || "unknown_error"
+        }`,
+      );
+      const strictContext = withSanitizedTranscript(context_package, "strict");
+      transcriptControlCharsSanitized = Math.max(transcriptControlCharsSanitized, strictContext.replaced);
+      inferenceResult = await runInference(strictContext.context);
+    }
+
+    inference_ms = inferenceResult.inferenceElapsedMs;
+    tokens_used = inferenceResult.tokensUsed;
+    raw_response = inferenceResult.response;
+    const parsed = inferenceResult.parsed;
 
     let project_id = parsed.project_id || null;
     let confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
@@ -1057,7 +1145,7 @@ Deno.serve(async (req: Request) => {
 
     let decision = parsed.decision as "assign" | "review" | "none";
     let reasoning = parsed.reasoning || "No reasoning provided";
-    const spanTranscript = context_package.span?.transcript_text || "";
+    const spanTranscript = inferenceResult.transcriptText;
     const { valid: hasValidAnchor, validatedAnchors, rejectedStaffAnchors } = validateAnchorQuotes(
       anchors,
       spanTranscript,
@@ -1100,6 +1188,24 @@ Deno.serve(async (req: Request) => {
         `[ai-router] Downgraded to review: common-word alias lacked corroboration for project ${project_id} (aliases=${
           common_alias_terms.join(",") || "unknown"
         })`,
+      );
+    }
+
+    const bethanyGuardrail = applyBethanyRoadWinshipGuardrail({
+      decision,
+      project_id,
+      confidence,
+      reasoning,
+      anchors: validatedAnchors,
+      candidates: context_package.candidates,
+    });
+    decision = bethanyGuardrail.decision;
+    project_id = bethanyGuardrail.project_id;
+    confidence = bethanyGuardrail.confidence;
+    reasoning = bethanyGuardrail.reasoning;
+    if (bethanyGuardrail.applied) {
+      console.log(
+        `[ai-router] Bethany guardrail forced assignment to Winship candidate ${bethanyGuardrail.chosen_project_id}`,
       );
     }
 
@@ -1250,17 +1356,31 @@ Deno.serve(async (req: Request) => {
       journal_references: journal_references.length > 0 ? journal_references : undefined,
     };
   } catch (e: any) {
-    console.error("AI Router inference error:", e.message);
-    model_error = true;
+    const errorText = String(e?.message || "unknown_error").replace(/\s+/g, " ").slice(0, 220);
+    console.error("AI Router inference error:", errorText);
 
-    result = {
-      span_id,
-      project_id: null,
-      confidence: 0,
-      decision: "review",
-      reasoning: `model_error: ${e.message}`,
-      anchors: [],
-    };
+    if (homeownerOverrideStrongAnchor && homeownerOverrideProjectId.length > 0) {
+      homeownerDeterministicFallbackApplied = true;
+      model_error = false;
+      result = {
+        span_id,
+        project_id: homeownerOverrideProjectId,
+        confidence: 0.92,
+        decision: "assign",
+        reasoning: `deterministic_homeowner_fallback_after_model_error: ${errorText}`,
+        anchors: [],
+      };
+    } else {
+      model_error = true;
+      result = {
+        span_id,
+        project_id: null,
+        confidence: 0,
+        decision: "review",
+        reasoning: `model_error: ${errorText}`,
+        anchors: [],
+      };
+    }
   }
 
   // ========================================
@@ -1313,10 +1433,15 @@ Deno.serve(async (req: Request) => {
       applied_project_id = null;
       console.log(`[ai-router] Lock preserved: current=${currentLock}, attempted=${newLock}`);
     } else {
-      const spanTranscript = context_package.span?.transcript_text || "";
+      const spanTranscript = withSanitizedTranscript(context_package, "default").context.span?.transcript_text || "";
       const { valid: hasValidAnchor } = validateAnchorQuotes(result.anchors, spanTranscript);
+      const allowDeterministicHomeownerAssign = homeownerDeterministicFallbackApplied && homeownerOverrideStrongAnchor;
 
-      if (result.decision === "assign" && result.confidence >= THRESHOLD_AUTO_ASSIGN && hasValidAnchor) {
+      if (
+        result.decision === "assign" &&
+        result.confidence >= THRESHOLD_AUTO_ASSIGN &&
+        (hasValidAnchor || allowDeterministicHomeownerAssign)
+      ) {
         applied = true;
         applied_project_id = result.project_id;
         gatekeeper_reason = "auto_assigned";
@@ -1339,8 +1464,12 @@ Deno.serve(async (req: Request) => {
     // ========================================
     const attribution_lock = applied ? "ai" : null;
     const needs_review = result.decision === "review" || result.decision === "none";
-    const attribution_source = deriveAttributionSource(result.anchors, model_error);
-    const evidence_tier = deriveEvidenceTier(result.anchors, result.confidence, model_error);
+    const attribution_source = homeownerDeterministicFallbackApplied
+      ? "homeowner_deterministic_fallback"
+      : deriveAttributionSource(result.anchors, model_error);
+    const evidence_tier = homeownerDeterministicFallbackApplied
+      ? 1
+      : deriveEvidenceTier(result.anchors, result.confidence, model_error);
 
     const { error: upsertErr } = await db.from("span_attributions").upsert({
       span_id,
@@ -1378,25 +1507,27 @@ Deno.serve(async (req: Request) => {
     // ========================================
     const interaction_id = context_package.meta?.interaction_id;
     const quoteVerified = result.anchors.length > 0;
+    const quoteRequirementSatisfied = quoteVerified || homeownerDeterministicFallbackApplied;
     const strongAnchorPresent = hasStrongAnchor(result.anchors);
-    const effectiveStrongAnchor = strongAnchorPresent || homeownerOverrideStrongAnchor;
+    const effectiveStrongAnchor = strongAnchorPresent || homeownerOverrideStrongAnchor ||
+      homeownerDeterministicFallbackApplied;
 
     const needsReviewQueue = result.decision !== "assign" ||
       needs_review === true ||
-      !quoteVerified ||
+      !quoteRequirementSatisfied ||
       !effectiveStrongAnchor ||
       common_alias_unconfirmed ||
       bizdev_without_commitment ||
       adjacent_coherence_guardrail ||
       closed_project_guardrail ||
-      model_error;
+      (model_error && !homeownerDeterministicFallbackApplied);
 
     if (needsReviewQueue) {
       const reason_codes = buildReasonCodes({
         modelReasons: null,
-        quoteVerified,
+        quoteVerified: quoteRequirementSatisfied,
         strongAnchor: effectiveStrongAnchor,
-        modelError: model_error,
+        modelError: model_error && !homeownerDeterministicFallbackApplied,
         ambiguousContact: (context_package.contact?.fanout_class === "floater" ||
           context_package.contact?.fanout_class === "drifter") || (context_package.contact?.floater_flag === true),
         geoOnly: !effectiveStrongAnchor && result.anchors.some((a) => a.match_type === "city_or_location"),
@@ -1409,7 +1540,8 @@ Deno.serve(async (req: Request) => {
       const context_payload = {
         span_id,
         interaction_id,
-        transcript_snippet: (context_package.span?.transcript_text || "").slice(0, 600),
+        transcript_snippet: sanitizeTranscriptText(context_package.span?.transcript_text || "", "default").text
+          .slice(0, 600),
         candidates: context_package.candidates?.map((c) => ({
           project_id: c.project_id,
           name: c.project_name,
@@ -1442,6 +1574,11 @@ Deno.serve(async (req: Request) => {
         },
         closed_project_guardrail: {
           active: closed_project_guardrail,
+        },
+        homeowner_deterministic_fallback: homeownerDeterministicFallbackApplied,
+        sanitization: {
+          control_chars_sanitized: transcriptControlCharsSanitized,
+          strict_retry_used: strictSanitizationRetryUsed,
         },
         model_id: MODEL_ID,
         prompt_version: PROMPT_VERSION,
@@ -1536,6 +1673,11 @@ Deno.serve(async (req: Request) => {
         closed_project_filter: {
           active: closed_project_guardrail,
           pre_inference_candidates_removed: candidateFilterResult.removed_count,
+        },
+        homeowner_deterministic_fallback_applied: homeownerDeterministicFallbackApplied,
+        sanitization: {
+          control_chars_sanitized: transcriptControlCharsSanitized,
+          strict_retry_used: strictSanitizationRetryUsed,
         },
         bizdev_classifier: {
           call_type: bizdev_call_type,
