@@ -4,6 +4,23 @@
 
 BEGIN;
 
+-- IMPORTANT:
+-- Rollback must temporarily disable the journal_claims speaker auto-resolution
+-- trigger; otherwise any rows restored to NULL will be immediately re-resolved.
+-- The DISABLE/ENABLE is transactional (safe if the transaction aborts).
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_trigger
+    WHERE tgname = 'trg_resolve_journal_claim_speakers'
+      AND tgrelid = 'public.journal_claims'::regclass
+  ) THEN
+    EXECUTE 'ALTER TABLE public.journal_claims DISABLE TRIGGER trg_resolve_journal_claim_speakers';
+  END IF;
+END
+$$;
+
 WITH target AS (
   SELECT *
   FROM public.speaker_resolution_audit
@@ -20,5 +37,17 @@ WHERE jc.id = t.journal_claim_row_id;
 DELETE FROM public.speaker_resolution_audit a
 WHERE a.id IN (SELECT id FROM target);
 
-COMMIT;
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM pg_trigger
+    WHERE tgname = 'trg_resolve_journal_claim_speakers'
+      AND tgrelid = 'public.journal_claims'::regclass
+  ) THEN
+    EXECUTE 'ALTER TABLE public.journal_claims ENABLE TRIGGER trg_resolve_journal_claim_speakers';
+  END IF;
+END
+$$;
 
+COMMIT;
