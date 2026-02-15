@@ -1,13 +1,19 @@
 /**
- * ai-router Edge Function v1.10.0
+ * ai-router Edge Function v1.11.0
  * LLM-based project attribution for conversation spans
  *
- * @version 1.10.0
+ * @version 1.11.0
  * @date 2026-02-15
  * @purpose Use Claude Haiku to attribute spans to projects with anchored evidence
  *
  * CORE PRINCIPLE: span_attributions is the single source of truth.
  * NO writes to interactions.project_id from this path.
+ *
+ * v1.11.0 Changes (bizdev/prospect commitment gate):
+ * - Added bizdev/prospect classifier with evidence tags from transcript terms
+ * - Added commitment-to-start gate: bizdev spans cannot retain project_id without
+ *   commitment evidence (contract/deposit/permit/PO/start-date language)
+ * - Added bizdev classifier details to review_queue context + API response guardrails
  *
  * v1.10.0 Changes (common-word alias corroboration guardrail):
  * - Added guardrail to downgrade assign->review when chosen project is supported
@@ -53,9 +59,10 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 import { parseLlmJson } from "../_shared/llm_json.ts";
 import { applyCommonAliasCorroborationGuardrail, isCommonWordAlias } from "./alias_guardrails.ts";
+import { applyBizDevCommitmentGate } from "./bizdev_guardrails.ts";
 
-const PROMPT_VERSION = "v1.10.0"; // v1.10.0: common-word alias corroboration guardrail
-const FUNCTION_VERSION = "v1.10.0";
+const PROMPT_VERSION = "v1.11.0"; // v1.11.0: bizdev/prospect commitment gate
+const FUNCTION_VERSION = "v1.11.0";
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
 
@@ -423,6 +430,7 @@ function buildReasonCodes(opts: {
   ambiguousContact?: boolean;
   geoOnly?: boolean;
   commonAliasUnconfirmed?: boolean;
+  bizdevWithoutCommitment?: boolean;
 }): string[] {
   const reasons: string[] = [];
   if (Array.isArray(opts.modelReasons)) reasons.push(...opts.modelReasons);
@@ -432,6 +440,7 @@ function buildReasonCodes(opts: {
   if (opts.ambiguousContact) reasons.push("ambiguous_contact");
   if (opts.geoOnly) reasons.push("geo_only");
   if (opts.commonAliasUnconfirmed) reasons.push("common_alias_unconfirmed");
+  if (opts.bizdevWithoutCommitment) reasons.push("bizdev_without_commitment");
   if (opts.modelError) reasons.push("model_error");
 
   return Array.from(new Set(reasons.filter(Boolean)));
@@ -787,6 +796,12 @@ Deno.serve(async (req: Request) => {
   let model_error = false;
   let common_alias_unconfirmed = false;
   let common_alias_terms: string[] = [];
+  let bizdev_call_type: "bizdev_prospect_intake" | "project_execution" = "project_execution";
+  let bizdev_confidence: "high" | "medium" | "low" = "low";
+  let bizdev_evidence_tags: string[] = [];
+  let bizdev_commitment_to_start = false;
+  let bizdev_commitment_tags: string[] = [];
+  let bizdev_without_commitment = false;
 
   try {
     const anthropic = new Anthropic({
@@ -813,7 +828,7 @@ Deno.serve(async (req: Request) => {
 
     const parsed = parseLlmJson<any>(responseText).value;
 
-    const project_id = parsed.project_id || null;
+    let project_id = parsed.project_id || null;
     const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
     const anchors: Anchor[] = Array.isArray(parsed.anchors) ? parsed.anchors : [];
     const suggested_aliases: SuggestedAlias[] = Array.isArray(parsed.suggested_aliases) ? parsed.suggested_aliases : [];
@@ -822,6 +837,7 @@ Deno.serve(async (req: Request) => {
       : [];
 
     let decision = parsed.decision as "assign" | "review" | "none";
+    let reasoning = parsed.reasoning || "No reasoning provided";
     const spanTranscript = context_package.span?.transcript_text || "";
     const { valid: hasValidAnchor, validatedAnchors, rejectedStaffAnchors } = validateAnchorQuotes(
       anchors,
@@ -871,12 +887,37 @@ Deno.serve(async (req: Request) => {
       decision = "none";
     }
 
+    const bizdevGate = applyBizDevCommitmentGate({
+      transcript: spanTranscript,
+      decision,
+      project_id,
+    });
+    decision = bizdevGate.decision;
+    project_id = bizdevGate.project_id;
+    bizdev_call_type = bizdevGate.classification.call_type;
+    bizdev_confidence = bizdevGate.classification.confidence;
+    bizdev_evidence_tags = bizdevGate.classification.evidence_tags;
+    bizdev_commitment_to_start = bizdevGate.classification.commitment_to_start;
+    bizdev_commitment_tags = bizdevGate.classification.commitment_tags;
+    bizdev_without_commitment = bizdevGate.reason === "bizdev_without_commitment";
+
+    if (bizdev_without_commitment) {
+      const signalSummary = bizdev_evidence_tags.slice(0, 4).join(", ");
+      const commitmentSummary = bizdev_commitment_tags.slice(0, 4).join(", ");
+      reasoning = `${reasoning} BizDev prospect gate held project assignment (${
+        signalSummary || "prospect signals detected"
+      }; commitment_terms=${commitmentSummary || "none"}).`;
+      console.log(
+        `[ai-router] BizDev commitment gate active: project assignment withheld (signals=${signalSummary || "none"})`,
+      );
+    }
+
     result = {
       span_id,
       project_id,
       confidence,
       decision,
-      reasoning: parsed.reasoning || "No reasoning provided",
+      reasoning,
       anchors: validatedAnchors,
       suggested_aliases: suggested_aliases.length > 0 ? suggested_aliases : undefined,
       journal_references: journal_references.length > 0 ? journal_references : undefined,
@@ -1017,6 +1058,7 @@ Deno.serve(async (req: Request) => {
       !quoteVerified ||
       !strongAnchorPresent ||
       common_alias_unconfirmed ||
+      bizdev_without_commitment ||
       model_error;
 
     if (needsReviewQueue) {
@@ -1029,6 +1071,7 @@ Deno.serve(async (req: Request) => {
           context_package.contact?.fanout_class === "drifter") || (context_package.contact?.floater_flag === true),
         geoOnly: !strongAnchorPresent && result.anchors.some((a) => a.match_type === "city_or_location"),
         commonAliasUnconfirmed: common_alias_unconfirmed,
+        bizdevWithoutCommitment: bizdev_without_commitment,
       });
 
       const context_payload = {
@@ -1044,6 +1087,14 @@ Deno.serve(async (req: Request) => {
         alias_guardrails: {
           common_alias_unconfirmed,
           flagged_alias_terms: common_alias_terms,
+        },
+        bizdev_classifier: {
+          call_type: bizdev_call_type,
+          confidence: bizdev_confidence,
+          evidence_tags: bizdev_evidence_tags,
+          commitment_to_start: bizdev_commitment_to_start,
+          commitment_tags: bizdev_commitment_tags,
+          gate_active: bizdev_without_commitment,
         },
         model_id: MODEL_ID,
         prompt_version: PROMPT_VERSION,
@@ -1129,6 +1180,14 @@ Deno.serve(async (req: Request) => {
       guardrails: {
         common_alias_unconfirmed,
         flagged_alias_terms: common_alias_terms,
+        bizdev_classifier: {
+          call_type: bizdev_call_type,
+          confidence: bizdev_confidence,
+          evidence_tags: bizdev_evidence_tags,
+          commitment_to_start: bizdev_commitment_to_start,
+          commitment_tags: bizdev_commitment_tags,
+          gate_active: bizdev_without_commitment,
+        },
       },
       post_hooks: {
         journal_extract_fired,
