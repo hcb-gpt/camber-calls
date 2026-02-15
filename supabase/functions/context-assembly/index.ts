@@ -124,7 +124,7 @@ const SOURCE_SCORE_CROSS_CONTACT_CLAIM_MATCH = 0.20; // Source 10: unscoped clai
 const SOURCE_SCORE_MATERIAL_BUDGET_TIER = 0.40; // Source 11: material→budget tier→project match
 const SOURCE_SCORE_STRUCTURAL_TYPE_SINGLE = 0.50; // Source 12: structural type match (unique match)
 const SOURCE_SCORE_STRUCTURAL_TYPE_MULTI = 0.30; // Source 12: structural type match (multiple matches)
-const SOURCE_SCORE_COMMON_WORD_ALIAS_DEMOTION = 0.45; // Common-word alias demotion (e.g., "mystery white")
+const SOURCE_SCORE_COMMON_WORD_ALIAS_DEMOTION = 0.65; // Common-word alias demotion (e.g., "mystery white")
 const FLOATER_AFFINITY_DISCOUNT = 0.5; // Floater modifier: halve affinity weights for sources 2-3
 const COMMON_WORD_ALIAS_TERMS = new Set(["white"]);
 const WEAK_ALIAS_ONLY_SOURCES = new Set([
@@ -2164,11 +2164,16 @@ Deno.serve(async (req: Request) => {
       );
       const projectNameTokens = tokenizeTextForOverlap(details.name).map((t) => t.toLowerCase());
       const hasCommonWordAliasInName = projectNameTokens.some((t) => COMMON_WORD_ALIAS_TERMS.has(t));
+      const hasHighConfidenceCorroboration = meta.sources.some((src) =>
+        src === "rpc_scan_transcript_for_projects" ||
+        src === "cross_contact_claim_match" ||
+        src === "interactions_existing_project"
+      );
       const hasOnlyWeakSources = meta.sources.every((src) => WEAK_ALIAS_ONLY_SOURCES.has(src));
       const commonWordAliasDemoted = mysteryWhiteMaterialMentioned &&
         hasCommonWordAliasInName &&
-        !meta.assigned &&
-        hasOnlyWeakSources;
+        !hasHighConfidenceCorroboration &&
+        (!meta.assigned || hasOnlyWeakSources);
       const weakOnly = (hasAliasEvidence && !hasStrongMatch && !meta.assigned) || commonWordAliasDemoted;
 
       if (weakOnly) {
