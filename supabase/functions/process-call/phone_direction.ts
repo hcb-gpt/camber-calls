@@ -44,22 +44,33 @@ export function resolveCallPartyPhones(
   const fromPhone = firstNonEmpty(input.from_phone_norm, input.from_phone);
   const toPhone = firstNonEmpty(input.to_phone_norm, input.to_phone);
 
-  const ownerPhone = firstNonEmpty(
-    input.owner_phone,
-    direction === "inbound" ? toPhone : undefined,
-    direction === "outbound" ? fromPhone : undefined,
-    fromPhone,
-    toPhone,
-  );
+  let ownerPhone: string | null = null;
+  let otherPartyPhone: string | null = null;
 
-  const otherPartyPhone = firstNonEmpty(
-    input.other_party_phone,
-    direction === "inbound" ? fromPhone : undefined,
-    direction === "outbound" ? toPhone : undefined,
-    toPhone,
-    fromPhone,
-    input.contact_phone,
-  );
+  if (direction === "inbound") {
+    // Direction-aligned fallback prevents owner/other swaps when only one side is populated.
+    ownerPhone = firstNonEmpty(input.owner_phone, toPhone);
+    otherPartyPhone = firstNonEmpty(
+      input.other_party_phone,
+      fromPhone,
+      input.contact_phone,
+    );
+  } else if (direction === "outbound") {
+    ownerPhone = firstNonEmpty(input.owner_phone, fromPhone);
+    otherPartyPhone = firstNonEmpty(
+      input.other_party_phone,
+      toPhone,
+      input.contact_phone,
+    );
+  } else {
+    ownerPhone = firstNonEmpty(input.owner_phone, fromPhone, toPhone);
+    otherPartyPhone = firstNonEmpty(
+      input.other_party_phone,
+      toPhone,
+      fromPhone,
+      input.contact_phone,
+    );
+  }
 
   return { direction, ownerPhone, otherPartyPhone };
 }
