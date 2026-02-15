@@ -1227,6 +1227,7 @@ Deno.serve(async (req: Request) => {
     let event_at_utc: string | null = null;
     let interaction_project_id: string | null = null;
     let contact_trade: string | null = null;
+    let contact_role: string | null = null;
     let contact_is_internal = false; // v2.0.0: for floater modifier
     let fanout_class = "unknown";
     let effective_fanout = 0;
@@ -1249,12 +1250,13 @@ Deno.serve(async (req: Request) => {
     if (contact_id) {
       const { data: contactRow } = await db
         .from("contacts")
-        .select("trade, is_internal, floats_between_projects")
+        .select("trade, role, is_internal, floats_between_projects")
         .eq("id", contact_id)
         .single();
 
       if (contactRow) {
         if (contactRow.trade) contact_trade = String(contactRow.trade);
+        if (contactRow.role) contact_role = String(contactRow.role);
         contact_is_internal = !!contactRow.is_internal;
       }
     }
@@ -1511,10 +1513,12 @@ Deno.serve(async (req: Request) => {
 
       if (pcRows?.length) {
         const homeownerProjectIds = new Set<string>();
+        const source1ProjectIds = new Set<string>();
         sources_used.push("project_contacts");
         for (const r of pcRows as Array<Record<string, unknown>>) {
           const projectId = typeof r.project_id === "string" ? r.project_id : null;
           if (projectId) {
+            source1ProjectIds.add(projectId);
             addCandidate(projectId, "project_contacts", 0, undefined, undefined, SOURCE_SCORE_PROJECT_CONTACT);
             const cur = candidatesById.get(projectId);
             if (cur) {
@@ -1549,6 +1553,17 @@ Deno.serve(async (req: Request) => {
         } else if (homeownerProjectIds.size > 1) {
           homeownerOverrideSkippedReason = "homeowner_link_not_unique";
           warnings.push("homeowner_override_not_unique");
+        } else if (
+          isHomeownerRoleLabel(contact_role) ||
+          isHomeownerRoleLabel(contact_trade)
+        ) {
+          if (source1ProjectIds.size === 1) {
+            homeownerOverrideProjectId = Array.from(source1ProjectIds)[0];
+            sources_used.push("homeowner_contact_role_fallback");
+          } else if (source1ProjectIds.size > 1) {
+            homeownerOverrideSkippedReason = "homeowner_contact_multi_project";
+            warnings.push("homeowner_override_contact_multi_project");
+          }
         }
       }
     }
