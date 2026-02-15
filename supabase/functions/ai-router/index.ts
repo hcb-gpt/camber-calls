@@ -1,13 +1,20 @@
 /**
- * ai-router Edge Function v1.9.0
+ * ai-router Edge Function v1.10.0
  * LLM-based project attribution for conversation spans
  *
- * @version 1.9.0
+ * @version 1.10.0
  * @date 2026-02-15
  * @purpose Use Claude Haiku to attribute spans to projects with anchored evidence
  *
  * CORE PRINCIPLE: span_attributions is the single source of truth.
  * NO writes to interactions.project_id from this path.
+ *
+ * v1.10.0 Changes (common-word alias corroboration guardrail):
+ * - Added guardrail to downgrade assign->review when chosen project is supported
+ *   only by common-word/material aliases (for example "white", "mystery white")
+ * - Prompt now explicitly forbids auto-assign on uncorroborated common aliases
+ * - Candidate prompt includes aliases that are treated as ambiguous/common-word
+ * - Review queue reason codes now include common_alias_unconfirmed when triggered
  *
  * v1.9.0 Changes (source_strength in Evidence line):
  * - Prompt now includes source_strength per candidate in the Evidence line
@@ -45,9 +52,10 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
 import { parseLlmJson } from "../_shared/llm_json.ts";
+import { applyCommonAliasCorroborationGuardrail, isCommonWordAlias } from "./alias_guardrails.ts";
 
-const PROMPT_VERSION = "v1.9.0"; // v1.9.0: Evidence line now includes source_strength
-const FUNCTION_VERSION = "v1.9.0";
+const PROMPT_VERSION = "v1.10.0"; // v1.10.0: common-word alias corroboration guardrail
+const FUNCTION_VERSION = "v1.10.0";
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
 
@@ -414,6 +422,7 @@ function buildReasonCodes(opts: {
   modelError?: boolean;
   ambiguousContact?: boolean;
   geoOnly?: boolean;
+  commonAliasUnconfirmed?: boolean;
 }): string[] {
   const reasons: string[] = [];
   if (Array.isArray(opts.modelReasons)) reasons.push(...opts.modelReasons);
@@ -422,6 +431,7 @@ function buildReasonCodes(opts: {
   if (!opts.strongAnchor) reasons.push("weak_anchor");
   if (opts.ambiguousContact) reasons.push("ambiguous_contact");
   if (opts.geoOnly) reasons.push("geo_only");
+  if (opts.commonAliasUnconfirmed) reasons.push("common_alias_unconfirmed");
   if (opts.modelError) reasons.push("model_error");
 
   return Array.from(new Set(reasons.filter(Boolean)));
@@ -509,6 +519,8 @@ RULES:
 4. If multiple projects are mentioned, choose the PRIMARY topic of discussion
 5. If uncertain, choose "review" with confidence 0.50-0.74
 6. If no clear project match exists in the transcript, choose "none" with confidence <0.50
+7. Common-word/material aliases (for example color/material terms like "white", "mystery white", "granite") are ambiguous and CANNOT be sole evidence for decision="assign"
+8. If a common-word alias appears, require corroboration in transcript from exact project name, address fragment, or client name before decision="assign"
 
 PROJECT JOURNAL CONTEXT (when available):
 Some candidate projects may include journal state — recent claims, decisions,
@@ -596,6 +608,7 @@ function buildUserPrompt(ctx: ContextPackage): string {
     const aliasMatchSummary = c.evidence.alias_matches.length > 0
       ? `Matches in transcript: ${c.evidence.alias_matches.map((m) => `"${m.term}" (${m.match_type})`).join(", ")}`
       : "No direct transcript matches";
+    const commonAliases = c.aliases.filter((alias) => isCommonWordAlias(alias)).slice(0, 5);
 
     const geoSummary = c.evidence.geo_signal
       ? `Geo: distance=${
@@ -624,6 +637,7 @@ function buildUserPrompt(ctx: ContextPackage): string {
    - Address: ${c.address || "N/A"}
    - Client: ${c.client_name || "N/A"}
    - Aliases: ${c.aliases.length > 0 ? c.aliases.slice(0, 5).join(", ") : "None"}
+   - Common-word aliases (need corroboration): ${commonAliases.length > 0 ? commonAliases.join(", ") : "None"}
    - Status: ${c.status || "N/A"}, Phase: ${c.phase || "N/A"}
    - Evidence: assigned=${c.evidence.assigned}, affinity=${c.evidence.affinity_weight.toFixed(2)}, source_strength=${
       (c.evidence.source_strength ?? 0).toFixed(2)
@@ -771,6 +785,8 @@ Deno.serve(async (req: Request) => {
   let tokens_used = 0;
   let inference_ms = 0;
   let model_error = false;
+  let common_alias_unconfirmed = false;
+  let common_alias_terms: string[] = [];
 
   try {
     const anthropic = new Anthropic({
@@ -832,6 +848,22 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    const aliasGuardrail = applyCommonAliasCorroborationGuardrail({
+      decision,
+      project_id,
+      anchors: validatedAnchors,
+    });
+    decision = aliasGuardrail.decision;
+    common_alias_unconfirmed = aliasGuardrail.common_alias_unconfirmed;
+    common_alias_terms = aliasGuardrail.flagged_alias_terms;
+    if (aliasGuardrail.downgraded) {
+      console.log(
+        `[ai-router] Downgraded to review: common-word alias lacked corroboration for project ${project_id} (aliases=${
+          common_alias_terms.join(",") || "unknown"
+        })`,
+      );
+    }
+
     if (decision === "assign" && confidence < THRESHOLD_AUTO_ASSIGN) {
       decision = "review";
     }
@@ -861,6 +893,30 @@ Deno.serve(async (req: Request) => {
       reasoning: `model_error: ${e.message}`,
       anchors: [],
     };
+  }
+
+  // ========================================
+  // BLOCKLIST ENFORCEMENT (belt-and-suspenders)
+  // ========================================
+  if (result.project_id) {
+    const { data: blockRow } = await db
+      .from("project_attribution_blocklist")
+      .select("block_mode, reason")
+      .eq("project_id", result.project_id)
+      .eq("active", true)
+      .eq("block_mode", "hard_block")
+      .maybeSingle();
+
+    if (blockRow) {
+      console.log(`[ai-router] BLOCKLIST HIT: project_id=${result.project_id} blocked (${blockRow.reason})`);
+      result = {
+        ...result,
+        project_id: null,
+        confidence: 0,
+        decision: "none",
+        reasoning: `blocked_project: ${blockRow.reason}. Original decision overridden by blocklist.`,
+      };
+    }
   }
 
   // ========================================
@@ -960,6 +1016,7 @@ Deno.serve(async (req: Request) => {
       needs_review === true ||
       !quoteVerified ||
       !strongAnchorPresent ||
+      common_alias_unconfirmed ||
       model_error;
 
     if (needsReviewQueue) {
@@ -971,6 +1028,7 @@ Deno.serve(async (req: Request) => {
         ambiguousContact: (context_package.contact?.fanout_class === "floater" ||
           context_package.contact?.fanout_class === "drifter") || (context_package.contact?.floater_flag === true),
         geoOnly: !strongAnchorPresent && result.anchors.some((a) => a.match_type === "city_or_location"),
+        commonAliasUnconfirmed: common_alias_unconfirmed,
       });
 
       const context_payload = {
@@ -983,6 +1041,10 @@ Deno.serve(async (req: Request) => {
           evidence_tags: c.evidence?.sources || [],
         })) || [],
         anchors: result.anchors,
+        alias_guardrails: {
+          common_alias_unconfirmed,
+          flagged_alias_terms: common_alias_terms,
+        },
         model_id: MODEL_ID,
         prompt_version: PROMPT_VERSION,
         created_at_utc: new Date().toISOString(),
@@ -1063,6 +1125,10 @@ Deno.serve(async (req: Request) => {
         applied,
         applied_project_id,
         reason: gatekeeper_reason,
+      },
+      guardrails: {
+        common_alias_unconfirmed,
+        flagged_alias_terms: common_alias_terms,
       },
       post_hooks: {
         journal_extract_fired,

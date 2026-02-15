@@ -81,6 +81,7 @@
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { computeClaimCrossref } from "./claim_crossref.ts";
 
 const ASSEMBLY_VERSION = "v2.0.0"; // v2.0.0: 4 new candidate sources + floater modifier
 const SELECTION_RULES_VERSION = "v1.0.0";
@@ -228,6 +229,9 @@ interface CandidateEvidence {
   geo_signal?: GeoSignal;
   source_scores?: Record<string, number>;
   source_strength?: number;
+  claim_crossref_score?: number;
+  claim_crossref_topics?: string[];
+  claim_crossref_snippets?: string[];
   weak_only?: boolean; // true if ALL alias evidence is weak (first-name-only, short token)
 }
 
@@ -1207,7 +1211,23 @@ Deno.serve(async (req: Request) => {
       callbackSpans = findCallbackPhraseSpans(transcriptClean, transcriptLower);
 
       // Fetch all projects + aliases for matching
-      const { data: projects } = await db.from("projects").select("id, name, aliases, city, address");
+      const { data: allProjects } = await db.from("projects").select("id, name, aliases, city, address");
+
+      // ── BLOCKLIST ENFORCEMENT (P0: Sittler fix) ──────────────────────
+      // Fetch hard-blocked project IDs and remove them from candidate pool
+      const { data: blockedRows } = await db
+        .from("project_attribution_blocklist")
+        .select("project_id")
+        .eq("active", true)
+        .eq("block_mode", "hard_block");
+      const blockedProjectIds = new Set((blockedRows || []).map((r: { project_id: string }) => r.project_id));
+      const projects = (allProjects || []).filter(
+        (p: { id: string }) => !blockedProjectIds.has(p.id)
+      );
+      if (blockedProjectIds.size > 0) {
+        console.log(`[context-assembly] Blocklist active: ${blockedProjectIds.size} projects filtered from candidates`);
+      }
+      // ── END BLOCKLIST ENFORCEMENT ────────────────────────────────────
 
       let aliasRows: Array<{ project_id: string; alias: string }> | null = null;
       try {
@@ -1224,6 +1244,7 @@ Deno.serve(async (req: Request) => {
       const aliasByProject = new Map<string, string[]>();
       for (const r of (aliasRows || [])) {
         if (!r.project_id || !r.alias) continue;
+        if (blockedProjectIds.has(r.project_id)) continue; // Skip blocked project aliases
         if (!aliasByProject.has(r.project_id)) aliasByProject.set(r.project_id, []);
         aliasByProject.get(r.project_id)!.push(r.alias);
       }
@@ -1765,41 +1786,45 @@ Deno.serve(async (req: Request) => {
 
           const { data: crossClaimRows, error: crossClaimErr } = await db
             .from("journal_claims")
-            .select("claim_project_id_norm")
+            .select("claim_project_id")
             .eq("active", true)
-            .not("claim_project_id_norm", "is", null)
+            .not("claim_project_id", "is", null)
             .or(likePatterns.map((p) => `claim_text.ilike.${p}`).join(","))
             .limit(100);
 
           if (!crossClaimErr && crossClaimRows?.length) {
             const hitsByProject = new Map<string, number>();
             for (const row of crossClaimRows) {
-              if (!row.claim_project_id_norm) continue;
+              if (!row.claim_project_id) continue;
               hitsByProject.set(
-                row.claim_project_id_norm,
-                (hitsByProject.get(row.claim_project_id_norm) || 0) + 1,
+                row.claim_project_id,
+                (hitsByProject.get(row.claim_project_id) || 0) + 1,
               );
             }
 
-            const sortedProjects = Array.from(hitsByProject.entries())
-              .sort((a, b) => b[1] - a[1])
-              .slice(0, 5);
+            const sortedProjectsAll = Array.from(hitsByProject.entries())
+              .sort((a, b) => b[1] - a[1]);
 
-            if (sortedProjects.length > 0) {
-              const projectIds = sortedProjects.map(([pid]) => pid);
+            if (sortedProjectsAll.length > 0) {
+              const projectIds = sortedProjectsAll.map(([pid]) => pid);
               const { data: activeProjects } = await db
                 .from("projects")
                 .select("id")
                 .in("id", projectIds)
-                .eq("status", "active");
+                .in("status", VALID_PROJECT_STATUSES)
+                .eq("project_kind", VALID_PROJECT_KIND);
 
               const activeIds = new Set((activeProjects || []).map((p) => p.id));
+              const sortedProjects = sortedProjectsAll
+                .filter(([pid]) => activeIds.has(pid))
+                .slice(0, 5);
 
-              sources_used.push("cross_contact_claim_match");
-              for (const [pid, hits] of sortedProjects) {
-                if (!activeIds.has(pid)) continue;
-                const score = SOURCE_SCORE_CROSS_CONTACT_CLAIM_MATCH * Math.min(hits / 5, 1.0);
-                addCandidate(pid, "cross_contact_claim_match", 0, undefined, undefined, score);
+              if (sortedProjects.length > 0) {
+                sources_used.push("cross_contact_claim_match");
+                for (const [pid, hits] of sortedProjects) {
+                  const score = SOURCE_SCORE_CROSS_CONTACT_CLAIM_MATCH * Math.min(hits / 5, 1.0);
+                  addCandidate(pid, "cross_contact_claim_match", 0, undefined, undefined, score);
+                }
               }
             }
           }
@@ -2123,45 +2148,53 @@ Deno.serve(async (req: Request) => {
     }
 
     // Sort by evidence strength
-    // Priority: assigned > weak_only > alias_matches > source_strength > affinity_weight > geo
+    // Priority: assigned > weak_only > alias_matches > source_strength > claim_crossref > affinity_weight > geo
     // v2.1.0: source_strength (transcript evidence quality) now ranks ABOVE affinity_weight
-    // (call-history frequency). Fixes Permar-class bug where high-affinity projects
-    // with weak transcript evidence outranked low-affinity projects with strong evidence.
-    candidates.sort((a, b) => {
-      if (a.evidence.assigned !== b.evidence.assigned) return a.evidence.assigned ? -1 : 1;
-      // Strong evidence beats weak evidence
-      const aWeak = a.evidence.weak_only === true;
-      const bWeak = b.evidence.weak_only === true;
-      if (aWeak !== bWeak) return aWeak ? 1 : -1;
-      if (b.evidence.alias_matches.length !== a.evidence.alias_matches.length) {
-        return b.evidence.alias_matches.length - a.evidence.alias_matches.length;
-      }
-      // source_strength (transcript evidence quality) before affinity_weight (call frequency)
-      const aSourceStrength = a.evidence.source_strength || 0;
-      const bSourceStrength = b.evidence.source_strength || 0;
-      if (bSourceStrength !== aSourceStrength) {
-        return bSourceStrength - aSourceStrength;
-      }
-      if (b.evidence.affinity_weight !== a.evidence.affinity_weight) {
-        return b.evidence.affinity_weight - a.evidence.affinity_weight;
-      }
-      const aGeoScore = a.evidence.geo_signal?.score || 0;
-      const bGeoScore = b.evidence.geo_signal?.score || 0;
-      if (bGeoScore !== aGeoScore) return bGeoScore - aGeoScore;
-      const aGeoOnly = a.evidence.sources.length === 1 && a.evidence.sources[0] === "geo_proximity";
-      const bGeoOnly = b.evidence.sources.length === 1 && b.evidence.sources[0] === "geo_proximity";
-      if (aGeoOnly !== bGeoOnly) return aGeoOnly ? 1 : -1;
-      if (a.evidence.geo_distance_km !== undefined && b.evidence.geo_distance_km !== undefined) {
-        return a.evidence.geo_distance_km - b.evidence.geo_distance_km;
-      }
-      return 0;
-    });
+    // v2.2.0: claim_crossref (journal semantic overlap) now ranks after source_strength.
+    const sortCandidates = (list: Candidate[]) =>
+      list.sort((a, b) => {
+        if (a.evidence.assigned !== b.evidence.assigned) return a.evidence.assigned ? -1 : 1;
+        // Strong evidence beats weak evidence
+        const aWeak = a.evidence.weak_only === true;
+        const bWeak = b.evidence.weak_only === true;
+        if (aWeak !== bWeak) return aWeak ? 1 : -1;
+        if (b.evidence.alias_matches.length !== a.evidence.alias_matches.length) {
+          return b.evidence.alias_matches.length - a.evidence.alias_matches.length;
+        }
+        // source_strength (transcript evidence quality) before affinity_weight (call frequency)
+        const aSourceStrength = a.evidence.source_strength || 0;
+        const bSourceStrength = b.evidence.source_strength || 0;
+        if (bSourceStrength !== aSourceStrength) {
+          return bSourceStrength - aSourceStrength;
+        }
+        const aCrossref = a.evidence.claim_crossref_score || 0;
+        const bCrossref = b.evidence.claim_crossref_score || 0;
+        if (bCrossref !== aCrossref) {
+          return bCrossref - aCrossref;
+        }
+        if (b.evidence.affinity_weight !== a.evidence.affinity_weight) {
+          return b.evidence.affinity_weight - a.evidence.affinity_weight;
+        }
+        const aGeoScore = a.evidence.geo_signal?.score || 0;
+        const bGeoScore = b.evidence.geo_signal?.score || 0;
+        if (bGeoScore !== aGeoScore) return bGeoScore - aGeoScore;
+        const aGeoOnly = a.evidence.sources.length === 1 && a.evidence.sources[0] === "geo_proximity";
+        const bGeoOnly = b.evidence.sources.length === 1 && b.evidence.sources[0] === "geo_proximity";
+        if (aGeoOnly !== bGeoOnly) return aGeoOnly ? 1 : -1;
+        if (a.evidence.geo_distance_km !== undefined && b.evidence.geo_distance_km !== undefined) {
+          return a.evidence.geo_distance_km - b.evidence.geo_distance_km;
+        }
+        return 0;
+      });
+    sortCandidates(candidates);
 
     const effectiveMaxCandidates = isInternalFloater ? MAX_CANDIDATES_FLOATER : MAX_CANDIDATES;
-    if (candidates.length > effectiveMaxCandidates) {
-      truncations.push(`candidates_capped_at_${effectiveMaxCandidates}`);
+    const crossrefPoolSize = Math.min(candidates.length, effectiveMaxCandidates + 6);
+    if (candidates.length > crossrefPoolSize) {
+      truncations.push(`crossref_pool_capped_at_${crossrefPoolSize}`);
     }
-    const finalCandidates = candidates.slice(0, effectiveMaxCandidates);
+    const candidatePool = candidates.slice(0, crossrefPoolSize);
+    let finalCandidates = candidatePool.slice(0, effectiveMaxCandidates);
 
     // ========================================
     // SMART TRUNCATION OF TRANSCRIPT
@@ -2184,7 +2217,7 @@ Deno.serve(async (req: Request) => {
     // Non-fatal: if journal tables are empty or query fails, we skip.
     // ========================================
     const project_journal: ProjectJournalState[] = [];
-    const candidateProjectIds = finalCandidates.map((c) => c.project_id).filter(Boolean);
+    const candidateProjectIds = candidatePool.map((c) => c.project_id).filter(Boolean);
 
     if (candidateProjectIds.length > 0) {
       try {
@@ -2322,6 +2355,60 @@ Deno.serve(async (req: Request) => {
     }
 
     // ========================================
+    // SOURCE 13: CLAIM_CROSSREF_RERANK (v2.2.0)
+    // Semantic journal/transcript overlap on candidate pool.
+    // Re-ranks candidates before final cap and emits compact evidence pointers.
+    // ========================================
+    if (candidatePool.length > 0 && project_journal.length > 0 && finalTranscript) {
+      const allClaims = project_journal.flatMap((pj) =>
+        (pj.recent_claims || []).map((claim) => ({
+          project_id: pj.project_id,
+          claim_text: claim.claim_text,
+          claim_type: claim.claim_type,
+        }))
+      );
+
+      if (allClaims.length > 0) {
+        const crossrefResults = computeClaimCrossref(
+          finalTranscript,
+          candidatePool.map((c) => ({
+            project_id: c.project_id,
+            project_name: c.project_name,
+          })),
+          allClaims,
+        );
+
+        const byProject = new Map(crossrefResults.map((r) => [r.project_id, r]));
+        let anyCrossrefSignal = false;
+        for (const candidate of candidatePool) {
+          const result = byProject.get(candidate.project_id);
+          if (!result) continue;
+          const score = Number(result.claim_crossref_score || 0);
+          if (score > 0) anyCrossrefSignal = true;
+          candidate.evidence.claim_crossref_score = score;
+          candidate.evidence.claim_crossref_topics = (result.matching_topics || []).slice(0, 5);
+          candidate.evidence.claim_crossref_snippets = (result.matching_claims || [])
+            .slice(0, 3)
+            .map((c) => String(c.claim_text || "").replace(/\s+/g, " ").trim().slice(0, 100))
+            .filter(Boolean);
+        }
+
+        if (anyCrossrefSignal) {
+          sources_used.push("claim_crossref_rerank");
+          sortCandidates(candidatePool);
+          finalCandidates = candidatePool.slice(0, effectiveMaxCandidates);
+        }
+      }
+    }
+
+    if (candidatePool.length > effectiveMaxCandidates) {
+      truncations.push(`candidates_capped_at_${effectiveMaxCandidates}`);
+    }
+
+    const finalCandidateIdSet = new Set(finalCandidates.map((c) => c.project_id));
+    const finalProjectJournal = project_journal.filter((pj) => finalCandidateIdSet.has(pj.project_id));
+
+    // ========================================
     // BUILD CONTEXT PACKAGE
     // ========================================
     const context_package: ContextPackage = {
@@ -2352,7 +2439,7 @@ Deno.serve(async (req: Request) => {
       },
       candidates: finalCandidates,
       place_mentions,
-      project_journal,
+      project_journal: finalProjectJournal,
       email_context,
       email_lookup_meta,
       continuity_links,
