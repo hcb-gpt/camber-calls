@@ -127,6 +127,105 @@ const SOURCE_SCORE_STRUCTURAL_TYPE_MULTI = 0.30; // Source 12: structural type m
 const SOURCE_SCORE_COMMON_WORD_ALIAS_DEMOTION = 0.65; // Common-word alias demotion (e.g., "mystery white")
 const FLOATER_AFFINITY_DISCOUNT = 0.5; // Floater modifier: halve affinity weights for sources 2-3
 const COMMON_WORD_ALIAS_TERMS = new Set(["white"]);
+const CROSS_CONTACT_MAX_SEARCH_TERMS = 20;
+const CROSS_CONTACT_MAX_LIKE_PATTERNS = 24;
+const CROSS_CONTACT_MIN_SEARCH_TERMS = 2;
+const CROSS_CONTACT_EVIDENCE_TERM_LIMIT = 5;
+const CROSS_CONTACT_LOW_SIGNAL_COLORS = new Set([
+  "white",
+  "black",
+  "gray",
+  "grey",
+  "beige",
+  "cream",
+  "brown",
+  "blue",
+  "green",
+  "red",
+  "gold",
+  "silver",
+  "tan",
+]);
+const CROSS_CONTACT_LOW_SIGNAL_DESCRIPTORS = new Set([
+  "mystery",
+  "classic",
+  "pure",
+  "standard",
+  "basic",
+  "regular",
+  "normal",
+  "general",
+  "default",
+  "common",
+  "simple",
+]);
+const CROSS_CONTACT_LOW_SIGNAL_MATERIALS = new Set([
+  "tile",
+  "paint",
+  "stone",
+  "marble",
+  "granite",
+  "quartz",
+  "wood",
+  "vinyl",
+  "glass",
+]);
+const CROSS_CONTACT_LOW_SIGNAL_DISAMBIGUATORS = new Set([
+  "residence",
+  "house",
+  "home",
+  "site",
+  "job",
+  "project",
+  "property",
+  "build",
+  "location",
+]);
+const CROSS_CONTACT_FIXTURE_TERMS = new Set([
+  "fixture",
+  "fixtures",
+  "window",
+  "windows",
+  "door",
+  "doors",
+  "cabinet",
+  "cabinets",
+  "vanity",
+  "vanities",
+  "sink",
+  "sinks",
+  "toilet",
+  "toilets",
+  "shower",
+  "showers",
+  "countertop",
+  "countertops",
+  "island",
+  "islands",
+]);
+const CROSS_CONTACT_STREET_SUFFIXES = new Set([
+  "st",
+  "street",
+  "ave",
+  "avenue",
+  "blvd",
+  "boulevard",
+  "rd",
+  "road",
+  "dr",
+  "drive",
+  "ln",
+  "lane",
+  "ct",
+  "court",
+  "cir",
+  "circle",
+  "pl",
+  "place",
+  "way",
+  "pkwy",
+  "parkway",
+]);
 
 // Structural keywords → foundation_type mapping
 const STRUCTURAL_KEYWORD_MAP: Record<string, string> = {
@@ -234,6 +333,7 @@ interface CandidateEvidence {
   claim_crossref_score?: number;
   claim_crossref_topics?: string[];
   claim_crossref_snippets?: string[];
+  cross_contact_claim_match_terms?: string[];
   weak_only?: boolean; // true if ALL alias evidence is weak (first-name-only, short token)
   common_word_alias_demoted?: boolean;
 }
@@ -415,6 +515,177 @@ function tokenOverlapRatio(transcriptTokens: string[], termTokens: string[]): nu
     }
   }
   return overlap / needleSet.size;
+}
+
+function sanitizeCrossContactTerm(raw: string): string {
+  return (raw || "")
+    .toLowerCase()
+    .replace(/[%(),]/g, " ")
+    .replace(/[^a-z0-9$ ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isLowSignalCrossContactToken(token: string): boolean {
+  return CROSS_CONTACT_LOW_SIGNAL_COLORS.has(token) ||
+    CROSS_CONTACT_LOW_SIGNAL_DESCRIPTORS.has(token) ||
+    CROSS_CONTACT_LOW_SIGNAL_MATERIALS.has(token) ||
+    CROSS_CONTACT_LOW_SIGNAL_DISAMBIGUATORS.has(token);
+}
+
+function isAddressLikeCrossContactTerm(term: string): boolean {
+  const tokens = term.split(/\s+/).filter(Boolean);
+  if (tokens.length < 2) return false;
+  return /\d/.test(tokens[0]) && CROSS_CONTACT_STREET_SUFFIXES.has(tokens[tokens.length - 1]);
+}
+
+function addCrossContactTerm(termScores: Map<string, number>, rawTerm: string, score: number): void {
+  const term = sanitizeCrossContactTerm(rawTerm);
+  if (!term) return;
+  const tokens = term.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return;
+
+  const hasDigits = /\d/.test(term);
+  const isDollar = term.startsWith("$");
+  const addressLike = isAddressLikeCrossContactTerm(term);
+
+  if (tokens.length === 1 && !hasDigits && !isDollar) {
+    const token = tokens[0];
+    if (token.length < 5) return;
+    if (isLowSignalCrossContactToken(token)) return;
+  } else if (!hasDigits && !isDollar && !addressLike) {
+    const allLowSignal = tokens.every((token) => isLowSignalCrossContactToken(token));
+    if (allLowSignal) return;
+  }
+
+  const current = termScores.get(term) || 0;
+  if (score > current) termScores.set(term, score);
+}
+
+function extractCapitalizedCrossContactTerms(text: string): string[] {
+  const words = text.split(/\s+/);
+  const terms = new Set<string>();
+  for (let i = 0; i < words.length; i++) {
+    const current = words[i].replace(/^[^A-Za-z0-9$]+|[^A-Za-z0-9$]+$/g, "");
+    if (!current) continue;
+
+    const prev = i > 0 ? words[i - 1] : "";
+    const sentenceStart = i === 0 || /[.!?]$/.test(prev);
+    const next = i + 1 < words.length ? words[i + 1].replace(/^[^A-Za-z]+|[^A-Za-z]+$/g, "") : "";
+    const nextCap = /^[A-Z][a-z]{2,}$/.test(next);
+
+    if (/^[A-Z][a-z]{2,}$/.test(current)) {
+      if (!sentenceStart || nextCap) {
+        terms.add(current.toLowerCase());
+      }
+      if (nextCap) {
+        terms.add(`${current.toLowerCase()} ${next.toLowerCase()}`);
+        const nextNext = i + 2 < words.length ? words[i + 2].replace(/^[^A-Za-z]+|[^A-Za-z]+$/g, "") : "";
+        if (/^[A-Z][a-z]{2,}$/.test(nextNext)) {
+          terms.add(`${current.toLowerCase()} ${next.toLowerCase()} ${nextNext.toLowerCase()}`);
+        }
+      }
+      continue;
+    }
+
+    if (/^[A-Z]{3,8}$/.test(current)) {
+      terms.add(current.toLowerCase());
+    }
+  }
+  return Array.from(terms);
+}
+
+function crossContactFuzzyTokenVariants(token: string): string[] {
+  const normalized = sanitizeCrossContactTerm(token);
+  const variants = new Set<string>([normalized]);
+  if (!/^[a-z]+$/.test(normalized) || normalized.length < 6) {
+    return Array.from(variants);
+  }
+
+  if (normalized.startsWith("wind")) {
+    variants.add(`win${normalized.slice(4)}`);
+  } else if (normalized.startsWith("win")) {
+    variants.add(`wind${normalized.slice(3)}`);
+  }
+
+  if (normalized.includes("dsh")) {
+    variants.add(normalized.replace(/dsh/g, "sh"));
+  }
+  if (normalized.includes("ndsh")) {
+    variants.add(normalized.replace(/ndsh/g, "nsh"));
+  }
+
+  return Array.from(variants);
+}
+
+function extractHighSignalCrossContactTerms(transcript: string): string[] {
+  const termScores = new Map<string, number>();
+
+  const addressRegex =
+    /\b\d{2,6}\s+[A-Za-z0-9'.-]+(?:\s+[A-Za-z0-9'.-]+){0,3}\s+(?:st|street|ave|avenue|blvd|boulevard|rd|road|dr|drive|ln|lane|ct|court|cir|circle|pl|place|way|pkwy|parkway)\b/gi;
+  let match: RegExpExecArray | null;
+  while ((match = addressRegex.exec(transcript)) !== null) {
+    addCrossContactTerm(termScores, match[0], 100);
+  }
+
+  const dollarRegex =
+    /\$\s?\d[\d,]*(?:\.\d+)?(?:\s*(?:k|m|mm|thousand|million))?|\b\d[\d,]*(?:\.\d+)?\s*(?:dollars?|bucks?)\b/gi;
+  while ((match = dollarRegex.exec(transcript)) !== null) {
+    addCrossContactTerm(termScores, match[0].replace(/\s+/g, ""), 95);
+  }
+
+  const qtyFixtureRegex =
+    /\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:fixture|fixtures|window|windows|door|doors|cabinet|cabinets|vanity|vanities|sink|sinks|toilet|toilets|shower|showers|countertop|countertops|island|islands)\b/gi;
+  while ((match = qtyFixtureRegex.exec(transcript)) !== null) {
+    addCrossContactTerm(termScores, match[0], 90);
+  }
+
+  for (const properTerm of extractCapitalizedCrossContactTerms(transcript)) {
+    addCrossContactTerm(termScores, properTerm, properTerm.includes(" ") ? 88 : 84);
+  }
+
+  const modelRegex = /\b[a-zA-Z]*\d+[a-zA-Z0-9-]*\b/g;
+  while ((match = modelRegex.exec(transcript)) !== null) {
+    addCrossContactTerm(termScores, match[0], 82);
+  }
+
+  for (const token of tokenizeTextForOverlap(transcript)) {
+    const normalized = sanitizeCrossContactTerm(token);
+    if (!normalized || normalized.length < 6) continue;
+    if (isLowSignalCrossContactToken(normalized)) continue;
+    addCrossContactTerm(termScores, normalized, 72);
+    if (CROSS_CONTACT_FIXTURE_TERMS.has(normalized)) {
+      addCrossContactTerm(termScores, normalized, 85);
+    }
+  }
+
+  return Array.from(termScores.entries())
+    .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)
+    .map(([term]) => term)
+    .slice(0, CROSS_CONTACT_MAX_SEARCH_TERMS);
+}
+
+function buildCrossContactSearchTerms(highSignalTerms: string[]): string[] {
+  const searchTerms: string[] = [];
+  const seen = new Set<string>();
+  const pushTerm = (raw: string) => {
+    const term = sanitizeCrossContactTerm(raw);
+    if (!term || seen.has(term)) return;
+    seen.add(term);
+    searchTerms.push(term);
+  };
+
+  for (const term of highSignalTerms) {
+    pushTerm(term);
+    if (!term.includes(" ")) {
+      for (const fuzzyVariant of crossContactFuzzyTokenVariants(term)) {
+        pushTerm(fuzzyVariant);
+      }
+    }
+    if (searchTerms.length >= CROSS_CONTACT_MAX_LIKE_PATTERNS) break;
+  }
+
+  return searchTerms.slice(0, CROSS_CONTACT_MAX_LIKE_PATTERNS);
 }
 
 /** Normalize alias terms (dedupe, min length) */
@@ -1046,6 +1317,7 @@ Deno.serve(async (req: Request) => {
       alias_matches: AliasMatch[];
       source_scores: Record<string, number>;
       source_strength: number;
+      cross_contact_claim_match_terms?: string[];
       geo_distance_km?: number;
       geo_signal?: GeoSignal;
     }>();
@@ -1224,10 +1496,10 @@ Deno.serve(async (req: Request) => {
     const projectMentionSpans: string[] = [];
     const place_mentions: PlaceMention[] = [];
     let transcriptTokens: string[] = [];
+    const transcriptClean = transcript_text ? stripSpeakerLabels(transcript_text) : "";
 
     // SOURCE 4-7: Transcript-based sources
     if (transcript_text) {
-      const transcriptClean = stripSpeakerLabels(transcript_text);
       const transcriptLower = transcriptClean.toLowerCase();
       transcriptTokens = tokenizeTextForOverlap(transcriptClean);
       callbackSpans = findCallbackPhraseSpans(transcriptClean, transcriptLower);
@@ -1795,14 +2067,16 @@ Deno.serve(async (req: Request) => {
     // Unlike the contact-scoped claim match above, this queries ALL active claims
     // across all contacts. Key for resolving floater calls.
     // ========================================
-    if (transcript_text && transcriptTokens.length > 0) {
+    if (transcriptClean && transcriptTokens.length > 0) {
       try {
-        const keywordsForSearch = transcriptTokens
-          .filter((t) => t.length >= 5)
-          .slice(0, 20);
+        const highSignalTerms = extractHighSignalCrossContactTerms(transcriptClean);
+        const evidenceTerms = highSignalTerms.slice(0, CROSS_CONTACT_EVIDENCE_TERM_LIMIT);
+        const searchTerms = buildCrossContactSearchTerms(highSignalTerms);
 
-        if (keywordsForSearch.length >= 3) {
-          const likePatterns = keywordsForSearch.map((k) => `%${k}%`);
+        if (searchTerms.length >= CROSS_CONTACT_MIN_SEARCH_TERMS) {
+          const likePatterns = searchTerms
+            .map((term) => `%${term}%`)
+            .filter((pattern) => pattern.length > 3);
 
           const { data: crossClaimRows, error: crossClaimErr } = await db
             .from("journal_claims")
@@ -1844,10 +2118,16 @@ Deno.serve(async (req: Request) => {
                 for (const [pid, hits] of sortedProjects) {
                   const score = SOURCE_SCORE_CROSS_CONTACT_CLAIM_MATCH * Math.min(hits / 5, 1.0);
                   addCandidate(pid, "cross_contact_claim_match", 0, undefined, undefined, score);
+                  const cur = candidatesById.get(pid);
+                  if (cur && evidenceTerms.length > 0) {
+                    cur.cross_contact_claim_match_terms = evidenceTerms;
+                  }
                 }
               }
             }
           }
+        } else {
+          warnings.push("cross_contact_claim_match_low_signal_terms");
         }
       } catch {
         warnings.push("cross_contact_claim_match_skipped");
@@ -2196,6 +2476,10 @@ Deno.serve(async (req: Request) => {
           source_strength: sourceStrength,
           geo_distance_km: meta.geo_distance_km,
           geo_signal: meta.geo_signal,
+          cross_contact_claim_match_terms: meta.cross_contact_claim_match_terms?.slice(
+            0,
+            CROSS_CONTACT_EVIDENCE_TERM_LIMIT,
+          ),
           weak_only: weakOnly || undefined,
           common_word_alias_demoted: commonWordAliasDemoted || undefined,
         },
