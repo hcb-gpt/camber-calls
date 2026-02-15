@@ -131,6 +131,7 @@ const CROSS_CONTACT_MAX_SEARCH_TERMS = 20;
 const CROSS_CONTACT_MAX_LIKE_PATTERNS = 24;
 const CROSS_CONTACT_MIN_SEARCH_TERMS = 2;
 const CROSS_CONTACT_EVIDENCE_TERM_LIMIT = 5;
+const CLAIM_CONTENT_EVIDENCE_TERM_LIMIT = 5;
 const CROSS_CONTACT_LOW_SIGNAL_COLORS = new Set([
   "white",
   "black",
@@ -333,6 +334,7 @@ interface CandidateEvidence {
   claim_crossref_score?: number;
   claim_crossref_topics?: string[];
   claim_crossref_snippets?: string[];
+  claim_content_match_terms?: string[];
   cross_contact_claim_match_terms?: string[];
   weak_only?: boolean; // true if ALL alias evidence is weak (first-name-only, short token)
   common_word_alias_demoted?: boolean;
@@ -504,17 +506,17 @@ function tokenizeTextForOverlap(text: string): string[] {
     .filter(Boolean);
 }
 
-function tokenOverlapRatio(transcriptTokens: string[], termTokens: string[]): number {
-  const needleSet = new Set(termTokens.map((t) => t.toLowerCase()).filter(Boolean));
-  if (needleSet.size === 0) return 0;
-  const transcriptSet = new Set(transcriptTokens.map((t) => t.toLowerCase()));
-  let overlap = 0;
-  for (const t of needleSet) {
-    if (transcriptSet.has(t)) {
-      overlap += 1;
+function overlappingTokenTerms(leftTokens: string[], rightTokens: string[]): string[] {
+  const leftSet = new Set(leftTokens.map((t) => t.toLowerCase()).filter(Boolean));
+  const overlap: string[] = [];
+  const seen = new Set<string>();
+  for (const tok of rightTokens.map((t) => t.toLowerCase()).filter(Boolean)) {
+    if (!seen.has(tok) && leftSet.has(tok)) {
+      overlap.push(tok);
+      seen.add(tok);
     }
   }
-  return overlap / needleSet.size;
+  return overlap;
 }
 
 function sanitizeCrossContactTerm(raw: string): string {
@@ -1317,6 +1319,7 @@ Deno.serve(async (req: Request) => {
       alias_matches: AliasMatch[];
       source_scores: Record<string, number>;
       source_strength: number;
+      claim_content_match_terms?: string[];
       cross_contact_claim_match_terms?: string[];
       geo_distance_km?: number;
       geo_signal?: GeoSignal;
@@ -1888,6 +1891,10 @@ Deno.serve(async (req: Request) => {
 
     // SOURCE 8: Journal claim content overlap (transcript against active claims)
     if (transcript_text && transcriptTokens.length > 0) {
+      const transcriptHighSignalTokens = transcriptTokens.filter((t) => !isLowSignalCrossContactToken(t));
+      if (transcriptHighSignalTokens.length === 0) {
+        warnings.push("claim_content_match_low_signal_terms");
+      }
       const claimProjectIds = new Set<string>();
       for (const pid of candidatesById.keys()) {
         claimProjectIds.add(pid);
@@ -1896,7 +1903,7 @@ Deno.serve(async (req: Request) => {
         claimProjectIds.add(interaction_project_id);
       }
 
-      if (claimProjectIds.size > 0) {
+      if (claimProjectIds.size > 0 && transcriptHighSignalTokens.length > 0) {
         try {
           const { data: claimRows, error: claimErr } = await db
             .from("journal_claims")
@@ -1928,7 +1935,7 @@ Deno.serve(async (req: Request) => {
 
             const bestClaimMatchByProject = new Map<
               string,
-              { score: number; snippets: string[] }
+              { score: number; snippets: string[]; terms: string[] }
             >();
 
             for (const row of claimRows) {
@@ -1945,10 +1952,15 @@ Deno.serve(async (req: Request) => {
 
               if (!isMatchedScope) continue;
 
-              const overlap = tokenOverlapRatio(transcriptTokens, tokenizeTextForOverlap(row.claim_text));
+              const claimHighSignalTokens = tokenizeTextForOverlap(row.claim_text)
+                .map((t) => t.toLowerCase())
+                .filter((t) => !isLowSignalCrossContactToken(t));
+              const overlapTerms = overlappingTokenTerms(transcriptHighSignalTokens, claimHighSignalTokens);
+              const overlapDenominator = new Set(claimHighSignalTokens).size;
+              const overlap = overlapDenominator > 0 ? overlapTerms.length / overlapDenominator : 0;
               if (overlap <= 0) continue;
 
-              const existing = bestClaimMatchByProject.get(row.project_id) || { score: 0, snippets: [] };
+              const existing = bestClaimMatchByProject.get(row.project_id) || { score: 0, snippets: [], terms: [] };
               existing.score = Math.max(
                 existing.score,
                 clamp(overlap * 2.2, 0, SOURCE_SCORE_CLAIM_CONTENT_MATCH_PER_SIGNAL),
@@ -1956,6 +1968,11 @@ Deno.serve(async (req: Request) => {
               if (existing.snippets.length < 2) {
                 const trimmed = String(row.claim_text).slice(0, 120);
                 existing.snippets.push(trimmed);
+              }
+              for (const term of overlapTerms) {
+                if (!existing.terms.includes(term) && existing.terms.length < CLAIM_CONTENT_EVIDENCE_TERM_LIMIT) {
+                  existing.terms.push(term);
+                }
               }
               bestClaimMatchByProject.set(row.project_id, existing);
             }
@@ -1980,6 +1997,9 @@ Deno.serve(async (req: Request) => {
                       match_type: "claim_content_match",
                       snippet,
                     });
+                  }
+                  if (match.terms.length > 0) {
+                    cur.claim_content_match_terms = match.terms.slice(0, CLAIM_CONTENT_EVIDENCE_TERM_LIMIT);
                   }
                 }
               }
@@ -2476,6 +2496,7 @@ Deno.serve(async (req: Request) => {
           source_strength: sourceStrength,
           geo_distance_km: meta.geo_distance_km,
           geo_signal: meta.geo_signal,
+          claim_content_match_terms: meta.claim_content_match_terms?.slice(0, CLAIM_CONTENT_EVIDENCE_TERM_LIMIT),
           cross_contact_claim_match_terms: meta.cross_contact_claim_match_terms?.slice(
             0,
             CROSS_CONTACT_EVIDENCE_TERM_LIMIT,
