@@ -49,6 +49,17 @@ supabase functions serve process-call --env-file .env.local
 supabase functions deploy process-call --no-verify-jwt
 ```
 
+## Read-Only SQL Access
+
+For DATA/DEV sessions, use:
+
+```bash
+cd /Users/chadbarlow/gh/hcb-gpt/camber-calls
+scripts/query.sh "select now();"
+```
+
+Details: `docs/data_sql_access.md`
+
 ## CI/CD
 
 Push to `main` triggers automatic deployment via GitHub Actions.
@@ -70,5 +81,6 @@ Edge function versions tracked in code comments and `router_version` field writt
 
 ## Related
 
-- **Pipedream Workflow:** Minimal relay at `https://eopz0oyin0j45bv.m.pipedream.net`
+- **Pipeline Entry Point:** `https://rjhdwidddtfetbwqolof.supabase.co/functions/v1/process-call`
 - **Supabase Project:** `rjhdwidddtfetbwqolof`
+- **Replay/Shadow:** TODO — define direct Edge-native replacement workflow

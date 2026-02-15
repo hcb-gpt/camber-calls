@@ -1,0 +1,2 @@
+# verify_jwt = false: auth handled internally via X-Edge-Secret or JWT+allowlist
+verify_jwt = false

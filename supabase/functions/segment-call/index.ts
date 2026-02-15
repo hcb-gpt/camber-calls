@@ -1,5 +1,5 @@
 /**
- * segment-call Edge Function v2.1.0
+ * segment-call Edge Function v2.5.1
  * Multi-span producer: calls segment-llm, writes N conversation_spans, then chains each span to
  * context-assembly → ai-router.
  *
@@ -9,22 +9,13 @@
  * - Downstream auth uses X-Edge-Secret (never service-role bearer).
  *
  * Auth (internal gate; verify_jwt=false):
- * - X-Edge-Secret + provenance allowlist, OR
+ * - X-Edge-Secret == EDGE_SHARED_SECRET, OR
  * - JWT + ALLOWED_EMAILS verified via auth.getUser() (debug path)
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const SEGMENT_CALL_VERSION = "v2.4.0";
-
-const ALLOWED_PROVENANCE_SOURCES = [
-  "process-call",
-  "zapier",
-  "pipedream",
-  "n8n",
-  "edge",
-  "test",
-];
+const SEGMENT_CALL_VERSION = "v2.5.1";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SEGMENT_LLM_URL = `${SUPABASE_URL}/functions/v1/segment-llm`;
@@ -32,6 +23,7 @@ const CONTEXT_ASSEMBLY_URL = `${SUPABASE_URL}/functions/v1/context-assembly`;
 const AI_ROUTER_URL = `${SUPABASE_URL}/functions/v1/ai-router`;
 const STRIKING_DETECT_URL = `${SUPABASE_URL}/functions/v1/striking-detect`;
 const JOURNAL_EXTRACT_URL = `${SUPABASE_URL}/functions/v1/journal-extract`;
+const GENERATE_SUMMARY_URL = `${SUPABASE_URL}/functions/v1/generate-summary`;
 
 type SegmentFromLLM = {
   span_index: number;
@@ -56,6 +48,27 @@ type SpanChainStatus = {
 
 const jsonHeaders = { "Content-Type": "application/json" };
 
+async function logDiagnostic(
+  message: string,
+  metadata: Record<string, unknown>,
+  logLevel = "error",
+): Promise<void> {
+  try {
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!serviceRoleKey) return;
+    const sb = createClient(SUPABASE_URL, serviceRoleKey);
+    await sb.from("diagnostic_logs").insert({
+      function_name: "segment-call",
+      function_version: SEGMENT_CALL_VERSION,
+      log_level: logLevel,
+      message,
+      metadata,
+    });
+  } catch (e) {
+    console.warn(`[segment-call] diagnostic_logs insert failed: ${(e as Error)?.message || e}`);
+  }
+}
+
 Deno.serve(async (req: Request) => {
   const t0 = Date.now();
 
@@ -77,6 +90,7 @@ Deno.serve(async (req: Request) => {
   try {
     body = await req.json();
   } catch {
+    await logDiagnostic("INPUT_INVALID", { reason: "invalid_json_body" }, "warning");
     return new Response(
       JSON.stringify({
         ok: false,
@@ -88,11 +102,8 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  const provenanceSource = body.source || "unknown";
-
   const hasValidEdgeSecret = expectedSecret &&
-    edgeSecretHeader === expectedSecret &&
-    ALLOWED_PROVENANCE_SOURCES.includes(provenanceSource);
+    edgeSecretHeader === expectedSecret;
 
   let hasValidJwt = false;
   if (!hasValidEdgeSecret && authHeader?.startsWith("Bearer ")) {
@@ -112,12 +123,18 @@ Deno.serve(async (req: Request) => {
   }
 
   if (!hasValidEdgeSecret && !hasValidJwt) {
+    await logDiagnostic("AUTH_FAILED", {
+      reason: "edge_secret_or_allowed_jwt_required",
+      edge_secret_present: Boolean(edgeSecretHeader),
+      auth_header_present: Boolean(authHeader),
+      allowed_jwt: hasValidJwt,
+    });
     return new Response(
       JSON.stringify({
         ok: false,
         error: "unauthorized",
         error_code: "auth_failed",
-        hint: "Requires X-Edge-Secret with allowlisted source OR JWT with allowed email",
+        hint: "Requires X-Edge-Secret matching EDGE_SHARED_SECRET OR JWT with allowed email",
         version: SEGMENT_CALL_VERSION,
       }),
       { status: 401, headers: jsonHeaders },
@@ -133,6 +150,7 @@ Deno.serve(async (req: Request) => {
   } = body;
 
   if (!interaction_id) {
+    await logDiagnostic("INPUT_INVALID", { reason: "missing_interaction_id" }, "warning");
     return new Response(
       JSON.stringify({
         ok: false,
@@ -146,6 +164,9 @@ Deno.serve(async (req: Request) => {
 
   const edgeSecret = Deno.env.get("EDGE_SHARED_SECRET");
   if (!edgeSecret) {
+    await logDiagnostic("AUTH_FAILED", {
+      reason: "edge_shared_secret_missing",
+    });
     return new Response(
       JSON.stringify({
         ok: false,
@@ -179,6 +200,10 @@ Deno.serve(async (req: Request) => {
       .single();
 
     if (fetchErr || !callsRaw?.transcript) {
+      await logDiagnostic("INPUT_INVALID", {
+        reason: "transcript_not_found",
+        interaction_id,
+      }, "warning");
       return new Response(
         JSON.stringify({
           ok: false,
@@ -204,6 +229,11 @@ Deno.serve(async (req: Request) => {
     .eq("is_superseded", false);
 
   if (spansErr) {
+    await logDiagnostic("DB_WRITE_FAILED", {
+      reason: "conversation_spans_query_failed",
+      interaction_id,
+      detail: spansErr.message,
+    });
     return new Response(
       JSON.stringify({
         ok: false,
@@ -225,6 +255,11 @@ Deno.serve(async (req: Request) => {
       .limit(1);
 
     if (attribErr) {
+      await logDiagnostic("DB_WRITE_FAILED", {
+        reason: "span_attributions_query_failed",
+        interaction_id,
+        detail: attribErr.message,
+      });
       return new Response(
         JSON.stringify({
           ok: false,
@@ -540,9 +575,21 @@ Deno.serve(async (req: Request) => {
           }),
         }).catch((e: any) => {
           console.error(`[segment-call] striking-detect fire-and-forget error: ${e?.message}`);
+          void logDiagnostic("DOWNSTREAM_CALL_FAILED", {
+            hook: "striking-detect",
+            interaction_id,
+            span_id: span.id,
+            error: e?.message || "unknown",
+          });
         });
         status.striking_detect_fired = true;
       } catch {
+        await logDiagnostic("DOWNSTREAM_CALL_FAILED", {
+          hook: "striking-detect",
+          interaction_id,
+          span_id: span.id,
+          error: "dispatch_exception",
+        });
         // Non-fatal
       }
 
@@ -565,9 +612,23 @@ Deno.serve(async (req: Request) => {
             }),
           }).catch((e: any) => {
             console.error(`[segment-call] journal-extract fire-and-forget error: ${e?.message}`);
+            void logDiagnostic("DOWNSTREAM_CALL_FAILED", {
+              hook: "journal-extract",
+              interaction_id,
+              span_id: span.id,
+              project_id: appliedProjectId,
+              error: e?.message || "unknown",
+            });
           });
           status.journal_extract_fired = true;
         } catch {
+          await logDiagnostic("DOWNSTREAM_CALL_FAILED", {
+            hook: "journal-extract",
+            interaction_id,
+            span_id: span.id,
+            project_id: appliedProjectId,
+            error: "dispatch_exception",
+          });
           // Non-fatal
         }
       }
@@ -588,6 +649,21 @@ Deno.serve(async (req: Request) => {
   );
 
   if (!allSuccess) {
+    await logDiagnostic("DOWNSTREAM_CALL_FAILED", {
+      reason: "chain_failed",
+      interaction_id,
+      failed_count: chainStatuses.filter((s) => Boolean(s.error_code)).length,
+      sample_failures: chainStatuses
+        .filter((s) => Boolean(s.error_code))
+        .slice(0, 5)
+        .map((s) => ({
+          span_id: s.span_id,
+          span_index: s.span_index,
+          context_assembly_status: s.context_assembly_status,
+          ai_router_status: s.ai_router_status,
+          error_code: s.error_code,
+        })),
+    });
     return new Response(
       JSON.stringify({
         ok: false,
@@ -613,6 +689,42 @@ Deno.serve(async (req: Request) => {
     );
   }
 
+  // ============================================================
+  // v2.5.0: CALL-LEVEL SUMMARY HOOK (fire-and-forget)
+  // Trigger once after all spans finish context-assembly + ai-router.
+  // ============================================================
+  let generateSummaryFired = false;
+  if (!dry_run) {
+    try {
+      fetch(GENERATE_SUMMARY_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Edge-Secret": edgeSecret,
+        },
+        body: JSON.stringify({
+          interaction_id,
+          source: "segment-call",
+        }),
+      }).catch((e: any) => {
+        console.error(`[segment-call] generate-summary fire-and-forget error: ${e?.message}`);
+        void logDiagnostic("DOWNSTREAM_CALL_FAILED", {
+          hook: "generate-summary",
+          interaction_id,
+          error: e?.message || "unknown",
+        });
+      });
+      generateSummaryFired = true;
+    } catch {
+      await logDiagnostic("DOWNSTREAM_CALL_FAILED", {
+        hook: "generate-summary",
+        interaction_id,
+        error: "dispatch_exception",
+      });
+      // Non-fatal
+    }
+  }
+
   return new Response(
     JSON.stringify({
       ok: true,
@@ -628,6 +740,9 @@ Deno.serve(async (req: Request) => {
         attempted: true,
         auth_mode: "X-Edge-Secret",
         statuses: chainStatuses,
+      },
+      post_hooks: {
+        generate_summary_fired: generateSummaryFired,
       },
       dry_run,
       ms: Date.now() - t0,

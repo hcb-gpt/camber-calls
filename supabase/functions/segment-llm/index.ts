@@ -6,7 +6,7 @@
  * @date 2026-01-31
  * @purpose Segment transcripts into N spans for multi-project attribution
  *
- * Auth: X-Edge-Secret + provenance allowlist (verify_jwt: false)
+ * Auth: X-Edge-Secret == EDGE_SHARED_SECRET (verify_jwt: false)
  * Called from: segment-call only
  *
  * STOPLINES (from CLAUDE.md):
@@ -15,6 +15,7 @@
  * - Never drops transcript content
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { parseLlmJson } from "../_shared/llm_json.ts";
 
 const SEGMENT_LLM_VERSION = "segment-llm_v1.2.0";
 
@@ -49,11 +50,6 @@ function structuredLog(
     console.log(JSON.stringify(log));
   }
 }
-
-// ============================================================
-// AUTH CONFIGURATION
-// ============================================================
-const ALLOWED_PROVENANCE_SOURCES = ["segment-call", "admin-reseed", "edge", "test"];
 
 // ============================================================
 // GUARDRAIL DEFAULTS
@@ -131,7 +127,7 @@ Deno.serve(async (req: Request) => {
   }
 
   // ============================================================
-  // AUTH GATE: X-Edge-Secret + provenance allowlist
+  // AUTH GATE: X-Edge-Secret
   // ============================================================
   const edgeSecretHeader = req.headers.get("X-Edge-Secret");
   const expectedSecret = Deno.env.get("EDGE_SHARED_SECRET");
@@ -148,10 +144,9 @@ Deno.serve(async (req: Request) => {
 
   const provenanceSource = body.source || "unknown";
 
-  // Strict auth: X-Edge-Secret + valid provenance
+  // Strict auth: matching shared edge secret
   const hasValidAuth = expectedSecret &&
-    edgeSecretHeader === expectedSecret &&
-    ALLOWED_PROVENANCE_SOURCES.includes(provenanceSource);
+    edgeSecretHeader === expectedSecret;
 
   if (!hasValidAuth) {
     console.error(
@@ -162,7 +157,7 @@ Deno.serve(async (req: Request) => {
         ok: false,
         error: "unauthorized",
         error_code: "auth_failed",
-        hint: "Requires X-Edge-Secret with valid provenance source",
+        hint: "Requires X-Edge-Secret matching EDGE_SHARED_SECRET",
         version: SEGMENT_LLM_VERSION,
       }),
       { status: 401, headers: { "Content-Type": "application/json" } },
@@ -311,8 +306,6 @@ Deno.serve(async (req: Request) => {
   let rawContent = "";
   try {
     rawContent = llmResponse.choices?.[0]?.message?.content || "";
-    // Strip markdown code fences if present
-    rawContent = rawContent.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
   } catch {
     console.error("[segment-llm] Failed to extract LLM text");
     return fallbackResponse(transcriptLength, ["llm_parse_error_extract"], t0);
@@ -320,7 +313,7 @@ Deno.serve(async (req: Request) => {
 
   let parsed: { segments?: Segment[] };
   try {
-    parsed = JSON.parse(rawContent);
+    parsed = parseLlmJson<{ segments?: Segment[] }>(rawContent).value;
   } catch (_parseErr) {
     console.error(`[segment-llm] JSON parse failed: ${rawContent.slice(0, 200)}`);
     return fallbackResponse(transcriptLength, ["llm_parse_error_json"], t0);
@@ -507,7 +500,7 @@ TRANSCRIPT:
           .replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
 
         try {
-          const retryParsed = JSON.parse(retryContent);
+          const retryParsed = parseLlmJson<{ segments?: Segment[] }>(retryContent).value;
           if (Array.isArray(retryParsed.segments) && retryParsed.segments.length > 0) {
             // Re-run guardrails on retry result (simplified version)
             let retrySegments = retryParsed.segments;
