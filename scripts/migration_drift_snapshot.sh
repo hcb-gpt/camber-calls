@@ -111,7 +111,6 @@ if [[ "${SUGGEST_REPAIR}" == "true" && "${remote_only_count}" -gt 0 ]]; then
   echo 'ENCODED_DB_URL="$(python3 - <<'\''PY'\''\nimport os, urllib.parse\nprint(urllib.parse.quote(os.environ[\"DATABASE_URL\"], safe=\"\"))\nPY\n)"'
   while IFS= read -r v; do
     [[ -z "${v}" ]] && continue
-    echo "supabase migration repair ${v} --status reverted --db-url \"${ENCODED_DB_URL}\""
+    echo "supabase migration repair ${v} --status reverted --db-url \"\${ENCODED_DB_URL}\""
   done < "${remote_only_file}"
 fi
-
