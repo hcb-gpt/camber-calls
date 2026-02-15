@@ -580,9 +580,7 @@ function extractCapitalizedCrossContactTerms(text: string): string[] {
       }
       if (nextCap) {
         terms.add(`${current.toLowerCase()} ${next.toLowerCase()}`);
-        const nextNext = i + 2 < words.length
-          ? words[i + 2].replace(/^[^A-Za-z]+|[^A-Za-z]+$/g, "")
-          : "";
+        const nextNext = i + 2 < words.length ? words[i + 2].replace(/^[^A-Za-z]+|[^A-Za-z]+$/g, "") : "";
         if (/^[A-Z][a-z]{2,}$/.test(nextNext)) {
           terms.add(`${current.toLowerCase()} ${next.toLowerCase()} ${nextNext.toLowerCase()}`);
         }
