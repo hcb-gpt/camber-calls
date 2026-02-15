@@ -1,5 +1,5 @@
 /**
- * segment-call Edge Function v2.5.1
+ * segment-call Edge Function v2.5.2
  * Multi-span producer: calls segment-llm, writes N conversation_spans, then chains each span to
  * context-assembly → ai-router.
  *
@@ -15,7 +15,8 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const SEGMENT_CALL_VERSION = "v2.5.1";
+const SEGMENT_CALL_VERSION = "v2.5.2";
+const MAX_SEGMENT_CHARS_HARD_LIMIT = 3000;
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SEGMENT_LLM_URL = `${SUPABASE_URL}/functions/v1/segment-llm`;
@@ -47,6 +48,87 @@ type SpanChainStatus = {
 };
 
 const jsonHeaders = { "Content-Type": "application/json" };
+
+type TranscriptSanitizeResult = {
+  text: string;
+  replaced: number;
+};
+
+function sanitizeTranscriptForPipeline(text: string): TranscriptSanitizeResult {
+  let replaced = 0;
+  // deno-lint-ignore no-control-regex -- intentional: scrub control chars before JSON packaging/prompting
+  const sanitized = String(text || "").replace(/[\x00-\x1F\x7F]/g, () => {
+    replaced += 1;
+    return " ";
+  });
+  return { text: sanitized, replaced };
+}
+
+function deterministicSegmentsForLength(
+  transcriptLength: number,
+  maxSegmentChars: number,
+  boundaryReason: string,
+): SegmentFromLLM[] {
+  if (transcriptLength <= 0) {
+    return [{
+      span_index: 0,
+      char_start: 0,
+      char_end: 0,
+      boundary_reason: boundaryReason,
+      confidence: 1,
+      boundary_quote: null,
+    }];
+  }
+
+  const chunkCount = Math.max(1, Math.ceil(transcriptLength / Math.max(1, maxSegmentChars)));
+  const segments: SegmentFromLLM[] = [];
+  for (let i = 0; i < chunkCount; i++) {
+    const charStart = Math.floor((transcriptLength * i) / chunkCount);
+    const charEnd = Math.floor((transcriptLength * (i + 1)) / chunkCount);
+    segments.push({
+      span_index: i,
+      char_start: charStart,
+      char_end: charEnd,
+      boundary_reason: boundaryReason,
+      confidence: 0.5,
+      boundary_quote: null,
+    });
+  }
+  return segments;
+}
+
+function enforceMaxSegmentChars(
+  inputSegments: SegmentFromLLM[],
+  maxSegmentChars: number,
+  warnings: string[],
+): SegmentFromLLM[] {
+  const rebuilt: SegmentFromLLM[] = [];
+
+  for (const seg of inputSegments) {
+    const segLen = Math.max(0, seg.char_end - seg.char_start);
+    if (segLen <= maxSegmentChars || segLen === 0) {
+      rebuilt.push(seg);
+      continue;
+    }
+
+    const chunkCount = Math.ceil(segLen / maxSegmentChars);
+    warnings.push(`segment_call_split_oversize_${seg.span_index}_into_${chunkCount}`);
+    for (let i = 0; i < chunkCount; i++) {
+      const charStart = seg.char_start + Math.floor((segLen * i) / chunkCount);
+      const charEnd = seg.char_start + Math.floor((segLen * (i + 1)) / chunkCount);
+      rebuilt.push({
+        span_index: 0,
+        char_start: charStart,
+        char_end: charEnd,
+        boundary_reason: `${seg.boundary_reason}_segment_call_split`,
+        confidence: seg.confidence,
+        boundary_quote: i === 0 ? seg.boundary_quote : null,
+      });
+    }
+  }
+
+  return rebuilt.map((seg, idx) => ({ ...seg, span_index: idx }));
+}
 
 async function logDiagnostic(
   message: string,
@@ -219,6 +301,10 @@ Deno.serve(async (req: Request) => {
     spanTranscript = callsRaw.transcript;
   }
 
+  const transcriptSanitize = sanitizeTranscriptForPipeline(spanTranscript || "");
+  spanTranscript = transcriptSanitize.text;
+  const transcriptControlCharsSanitized = transcriptSanitize.replaced;
+
   // ============================================================
   // 2) RESEED RULE (409 IF ANY ATTRIBUTIONS EXIST ON ACTIVE SPANS)
   // ============================================================
@@ -292,6 +378,9 @@ Deno.serve(async (req: Request) => {
   let segments: SegmentFromLLM[] = [];
   let segmenterVersion = "fallback_trivial_v1";
   const segmenterWarnings: string[] = [];
+  if (transcriptControlCharsSanitized > 0) {
+    segmenterWarnings.push(`transcript_control_chars_sanitized_${transcriptControlCharsSanitized}`);
+  }
 
   try {
     const llmResp = await fetch(SEGMENT_LLM_URL, {
@@ -307,19 +396,17 @@ Deno.serve(async (req: Request) => {
         source: "segment-call",
         max_segments,
         min_segment_chars,
+        max_segment_chars: MAX_SEGMENT_CHARS_HARD_LIMIT,
       }),
     });
 
     if (!llmResp.ok) {
       segmenterWarnings.push(`segment_llm_http_${llmResp.status}`);
-      segments = [{
-        span_index: 0,
-        char_start: 0,
-        char_end: spanTranscript.length,
-        boundary_reason: "fallback_segment_llm_http_error",
-        confidence: 1.0,
-        boundary_quote: null,
-      }];
+      segments = deterministicSegmentsForLength(
+        spanTranscript.length,
+        MAX_SEGMENT_CHARS_HARD_LIMIT,
+        "fallback_segment_llm_http_error",
+      );
     } else {
       const llmData = await llmResp.json();
       if (llmData?.ok && Array.isArray(llmData.segments) && llmData.segments.length > 0) {
@@ -328,27 +415,22 @@ Deno.serve(async (req: Request) => {
         if (Array.isArray(llmData.warnings)) segmenterWarnings.push(...llmData.warnings);
       } else {
         segmenterWarnings.push("segment_llm_invalid_response");
-        segments = [{
-          span_index: 0,
-          char_start: 0,
-          char_end: spanTranscript.length,
-          boundary_reason: "fallback_segment_llm_invalid",
-          confidence: 1.0,
-          boundary_quote: null,
-        }];
+        segments = deterministicSegmentsForLength(
+          spanTranscript.length,
+          MAX_SEGMENT_CHARS_HARD_LIMIT,
+          "fallback_segment_llm_invalid",
+        );
       }
     }
   } catch (e: any) {
     segmenterWarnings.push(`segment_llm_fetch_error:${e?.message || "unknown"}`);
-    segments = [{
-      span_index: 0,
-      char_start: 0,
-      char_end: spanTranscript.length,
-      boundary_reason: "fallback_segment_llm_fetch_error",
-      confidence: 1.0,
-      boundary_quote: null,
-    }];
+    segments = deterministicSegmentsForLength(
+      spanTranscript.length,
+      MAX_SEGMENT_CHARS_HARD_LIMIT,
+      "fallback_segment_llm_fetch_error",
+    );
   }
+  segments = enforceMaxSegmentChars(segments, MAX_SEGMENT_CHARS_HARD_LIMIT, segmenterWarnings);
 
   // ============================================================
   // 4) REBUILD SPANS (SAFE: NO ATTRIBUTIONS ON ACTIVE SPANS)
