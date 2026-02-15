@@ -58,11 +58,11 @@ BEGIN
       pa.alias AS ac_alias, pa.alias_type AS ac_alias_type,
       pa.confidence AS ac_confidence, LOWER(pa.alias) AS ac_alias_lower,
       (pa.alias_type = 'client_last_name' AND LENGTH(pa.alias) <= 5) AS ac_is_common,
-      (pa.alias_type IN ('street_name', 'street_name_short')) AS ac_is_street,
-      (pa.alias_type = 'county') AS ac_is_county
+      (pa.alias_type IN ('street_name', 'street_name_short')) AS ac_is_street
     FROM project_aliases pa
     JOIN projects p ON pa.project_id = p.id
     WHERE LENGTH(pa.alias) >= min_alias_length
+      AND pa.alias_type IS DISTINCT FROM 'county'
       AND p.status IN ('active', 'warranty', 'pre-construction')
   ),
   raw_words AS (
@@ -109,9 +109,8 @@ BEGIN
   exact_matches AS (
     SELECT ac.ac_project_id, ac.ac_project_name,
       ac.ac_alias AS em_matched_term, ac.ac_alias AS em_matched_alias,
-      'exact'::TEXT AS em_match_type,
-      (CASE WHEN ac.ac_is_county THEN 0.35 ELSE 1.0 END)::DOUBLE PRECISION AS em_score,
-      ac.ac_is_common, ac.ac_alias_lower, ac.ac_is_street, ac.ac_is_county
+      'exact'::TEXT AS em_match_type, 1.0::DOUBLE PRECISION AS em_score,
+      ac.ac_is_common, ac.ac_alias_lower, ac.ac_is_street
     FROM alias_candidates ac
     WHERE v_transcript_lower ~ ('\y' || ac.ac_alias_lower || '\y')
   ),
@@ -123,7 +122,7 @@ BEGIN
       (CASE WHEN tw.tw_variant_type = 'original' THEN 1.0 ELSE 0.95 END
         * (0.5 + (similarity(tw.tw_word, ac.ac_alias_lower) - similarity_threshold) * (0.4 / 0.7))
       )::DOUBLE PRECISION AS em_score,
-      ac.ac_is_common, ac.ac_alias_lower, tw.tw_start, ac.ac_is_street, ac.ac_is_county
+      ac.ac_is_common, ac.ac_alias_lower, tw.tw_start, ac.ac_is_street
     FROM transcript_words tw CROSS JOIN alias_candidates ac
     WHERE ac.ac_alias_lower !~ '\s'
       AND LENGTH(ac.ac_alias_lower) >= 5 AND LENGTH(tw.tw_word) >= 5
@@ -132,33 +131,31 @@ BEGIN
       AND NOT (tw.tw_original = ANY(v_false_cognate_words))
       AND NOT (tw.tw_word = ANY(v_false_cognate_words))
       AND NOT ac.ac_is_street
-      AND NOT ac.ac_is_county
   ),
   fuzzy_multi AS (
     SELECT ac.ac_project_id, ac.ac_project_name,
       ac.ac_alias AS em_matched_term, ac.ac_alias AS em_matched_alias,
       'fuzzy'::TEXT AS em_match_type,
       (0.5 + (word_similarity(ac.ac_alias_lower, v_transcript_lower) - similarity_threshold) * (0.4 / 0.7))::DOUBLE PRECISION AS em_score,
-      ac.ac_is_common, ac.ac_alias_lower, 0 AS tw_start, ac.ac_is_street, ac.ac_is_county
+      ac.ac_is_common, ac.ac_alias_lower, 0 AS tw_start, ac.ac_is_street
     FROM alias_candidates ac
     WHERE ac.ac_alias_lower ~ '\s'
       AND word_similarity(ac.ac_alias_lower, v_transcript_lower) >= 0.5
       AND NOT (v_transcript_lower ~ ('\y' || ac.ac_alias_lower || '\y'))
       AND NOT ac.ac_is_street
-      AND NOT ac.ac_is_county
   ),
   all_matches AS (
     SELECT ac_project_id, ac_project_name, em_matched_term, em_matched_alias,
-      em_match_type, em_score, ac_is_common, ac_alias_lower, ac_is_street, ac_is_county,
+      em_match_type, em_score, ac_is_common, ac_alias_lower, ac_is_street,
       strpos(v_transcript_lower, ac_alias_lower) AS am_pos
     FROM exact_matches
     UNION ALL
     SELECT ac_project_id, ac_project_name, em_matched_term, em_matched_alias,
-      em_match_type, em_score, ac_is_common, ac_alias_lower, ac_is_street, ac_is_county, tw_start AS am_pos
+      em_match_type, em_score, ac_is_common, ac_alias_lower, ac_is_street, tw_start AS am_pos
     FROM fuzzy_single
     UNION ALL
     SELECT ac_project_id, ac_project_name, em_matched_term, em_matched_alias,
-      em_match_type, em_score, ac_is_common, ac_alias_lower, ac_is_street, ac_is_county,
+      em_match_type, em_score, ac_is_common, ac_alias_lower, ac_is_street,
       GREATEST(1, strpos(v_transcript_lower, ac_alias_lower)) AS am_pos
     FROM fuzzy_multi
   ),
