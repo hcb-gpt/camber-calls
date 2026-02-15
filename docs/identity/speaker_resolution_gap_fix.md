@@ -35,6 +35,7 @@ All of the above is implemented in SQL only (no edge-function code changes requi
 - **No direction → no guess.** If `calls_raw.direction` is missing or not in an inbound/outbound family, v2 returns no match.
 - **Non-2-speaker calls are skipped.** Speaker resolution for multi-party calls needs a separate design (manual review / diarization-to-name alignment).
 - **Assumption:** earliest Deepgram speaker (word-timing if available; else first transcript line) ≈ answerer for 2-party calls.
+- **Owner-side resolution depends on contact hygiene.** In current production data, `calls_raw.owner_name` is frequently empty on eligible calls, so the v2 name fallback rarely fires. If `lookup_contact_by_phone(owner_phone)` fails (missing internal phones in `contacts`), owner diarization labels will remain unresolved.
 
 ## 5. Dry-Run Measurement Queries
 
