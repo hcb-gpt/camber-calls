@@ -1,8 +1,8 @@
 /**
- * context-assembly Edge Function v2.1.0
+ * context-assembly Edge Function v2.1.1
  * Assembles LLM-ready context_package from span_id (SPAN-FIRST)
  *
- * @version 2.1.0
+ * @version 2.1.1
  * @date 2026-02-15
  * @purpose Provide rich context for AI Router project attribution
  * @port 6-source candidate collection from process-call v3.9.6
@@ -15,6 +15,13 @@
  * - Fixes Permar-class bug where high-affinity projects with weak transcript evidence
  *   outranked low-affinity projects with strong evidence (e.g., source_strength +1.22)
  * - Sort order: assigned > weak_only > alias_matches > source_strength > affinity > geo
+ *
+ * v2.1.1 Changes (P0 Homeowner Override Gate):
+ * - If a unique homeowner project link exists in project_contacts, deterministically
+ *   constrain candidates to that project.
+ * - Escape hatch: do not force override when transcript shows explicit contradictory
+ *   project anchors (name/strong alias) for another project.
+ * - Emits meta.homeowner_override* fields for downstream traceability.
  *
  * v2.0.0 Changes (4 New Candidate Sources + Floater Modifier):
  * - NEW Source 9: OTHER_PARTY_TRADE_MATCH — parse speaker names, match contacts, find trade→projects
@@ -82,8 +89,9 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { computeClaimCrossref } from "./claim_crossref.ts";
+import { findHomeownerOverrideConflict, isHomeownerRoleLabel } from "./homeowner_override.ts";
 
-const ASSEMBLY_VERSION = "v2.0.0"; // v2.0.0: 4 new candidate sources + floater modifier
+const ASSEMBLY_VERSION = "v2.1.1"; // v2.1.1: P0 homeowner override + contradiction escape hatch
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_CANDIDATES_FLOATER = 12; // Expanded for internal floater contacts
@@ -125,6 +133,7 @@ const SOURCE_SCORE_MATERIAL_BUDGET_TIER = 0.40; // Source 11: material→budget 
 const SOURCE_SCORE_STRUCTURAL_TYPE_SINGLE = 0.50; // Source 12: structural type match (unique match)
 const SOURCE_SCORE_STRUCTURAL_TYPE_MULTI = 0.30; // Source 12: structural type match (multiple matches)
 const SOURCE_SCORE_COMMON_WORD_ALIAS_DEMOTION = 0.65; // Common-word alias demotion (e.g., "mystery white")
+const SOURCE_SCORE_HOMEOWNER_OVERRIDE = 1.25; // Deterministic owner-contact constraint signal
 const FLOATER_AFFINITY_DISCOUNT = 0.5; // Floater modifier: halve affinity weights for sources 2-3
 const COMMON_WORD_ALIAS_TERMS = new Set(["white"]);
 const CROSS_CONTACT_MAX_SEARCH_TERMS = 20;
@@ -494,6 +503,11 @@ interface ContextPackage {
     truncations: string[];
     warnings: string[];
     sources_used: string[];
+    homeowner_override: boolean;
+    homeowner_override_project_id: string | null;
+    homeowner_override_conflict_project_id: string | null;
+    homeowner_override_conflict_term: string | null;
+    homeowner_override_skipped_reason: string | null;
   };
   span: {
     start_ms: number | null;
@@ -1394,6 +1408,11 @@ Deno.serve(async (req: Request) => {
     );
 
     let materialStructuralSignalScore = 0;
+    let homeownerOverrideProjectId: string | null = null;
+    let homeownerOverrideApplied = false;
+    let homeownerOverrideConflictProjectId: string | null = null;
+    let homeownerOverrideConflictTerm: string | null = null;
+    let homeownerOverrideSkippedReason: string | null = null;
 
     // ========================================
     // 7-SOURCE CANDIDATE COLLECTION
@@ -1487,22 +1506,24 @@ Deno.serve(async (req: Request) => {
     if (contact_id) {
       const { data: pcRows } = await db
         .from("project_contacts")
-        .select("project_id, trade")
+        .select("*")
         .eq("contact_id", contact_id);
 
       if (pcRows?.length) {
+        const homeownerProjectIds = new Set<string>();
         sources_used.push("project_contacts");
-        for (const r of pcRows) {
-          if (r.project_id) {
-            addCandidate(r.project_id, "project_contacts", 0, undefined, undefined, SOURCE_SCORE_PROJECT_CONTACT);
-            const cur = candidatesById.get(r.project_id);
+        for (const r of pcRows as Array<Record<string, unknown>>) {
+          const projectId = typeof r.project_id === "string" ? r.project_id : null;
+          if (projectId) {
+            addCandidate(projectId, "project_contacts", 0, undefined, undefined, SOURCE_SCORE_PROJECT_CONTACT);
+            const cur = candidatesById.get(projectId);
             if (cur) {
               cur.assigned = true;
-              const rowTrade = normalizeTradeLabel(r.trade);
+              const rowTrade = normalizeTradeLabel(typeof r.trade === "string" ? r.trade : null);
               const contactTrade = normalizeTradeLabel(contact_trade);
               if (rowTrade && contactTrade && rowTrade === contactTrade) {
                 addCandidate(
-                  r.project_id,
+                  projectId,
                   "other_party_trade_match",
                   0,
                   undefined,
@@ -1511,7 +1532,23 @@ Deno.serve(async (req: Request) => {
                 );
               }
             }
+
+            const homeownerLabelCandidates = [
+              r.contact_role,
+              r.role,
+              r.trade,
+            ];
+            if (homeownerLabelCandidates.some((value) => isHomeownerRoleLabel(value))) {
+              homeownerProjectIds.add(projectId);
+            }
           }
+        }
+
+        if (homeownerProjectIds.size === 1) {
+          homeownerOverrideProjectId = Array.from(homeownerProjectIds)[0];
+        } else if (homeownerProjectIds.size > 1) {
+          homeownerOverrideSkippedReason = "homeowner_link_not_unique";
+          warnings.push("homeowner_override_not_unique");
         }
       }
     }
@@ -2500,6 +2537,55 @@ Deno.serve(async (req: Request) => {
     }
 
     // ========================================
+    // P0 HOMEOWNER OVERRIDE GATE (deterministic)
+    // - If SOURCE 1 produced a unique homeowner-linked project, force it.
+    // - Escape hatch: skip force when transcript has explicit contradictory
+    //   project anchors for a different project.
+    // ========================================
+    if (homeownerOverrideProjectId) {
+      const homeownerCandidate = candidatesById.get(homeownerOverrideProjectId);
+      if (!homeownerCandidate) {
+        homeownerOverrideSkippedReason = homeownerOverrideSkippedReason || "homeowner_candidate_missing";
+        warnings.push("homeowner_override_candidate_missing");
+      } else {
+        const contradiction = findHomeownerOverrideConflict(
+          homeownerOverrideProjectId,
+          Array.from(candidatesById.entries()).map(([project_id, meta]) => ({
+            project_id,
+            alias_matches: meta.alias_matches,
+          })),
+        );
+
+        if (contradiction) {
+          homeownerOverrideConflictProjectId = contradiction.project_id;
+          homeownerOverrideConflictTerm = contradiction.term;
+          homeownerOverrideSkippedReason = "explicit_contradictory_anchor";
+          warnings.push(`homeowner_override_skipped_conflict:${contradiction.project_id}`);
+        } else {
+          const removedIds = Array.from(candidatesById.keys()).filter((pid) => pid !== homeownerOverrideProjectId);
+          for (const pid of removedIds) {
+            candidatesById.delete(pid);
+          }
+          addCandidate(
+            homeownerOverrideProjectId,
+            "homeowner_override",
+            0,
+            undefined,
+            undefined,
+            SOURCE_SCORE_HOMEOWNER_OVERRIDE,
+          );
+          const forced = candidatesById.get(homeownerOverrideProjectId);
+          if (forced) forced.assigned = true;
+          homeownerOverrideApplied = true;
+          sources_used.push("homeowner_override");
+          if (removedIds.length > 0) {
+            warnings.push(`homeowner_override_forced:${removedIds.length}`);
+          }
+        }
+      }
+    }
+
+    // ========================================
     // ENRICH CANDIDATES WITH PROJECT DETAILS
     // ========================================
     const candidateIds = Array.from(candidatesById.keys());
@@ -2900,6 +2986,11 @@ Deno.serve(async (req: Request) => {
         truncations,
         warnings,
         sources_used,
+        homeowner_override: homeownerOverrideApplied,
+        homeowner_override_project_id: homeownerOverrideProjectId,
+        homeowner_override_conflict_project_id: homeownerOverrideConflictProjectId,
+        homeowner_override_conflict_term: homeownerOverrideConflictTerm,
+        homeowner_override_skipped_reason: homeownerOverrideSkippedReason,
       },
       span: {
         start_ms,
