@@ -149,6 +149,28 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ ...result, ms: Date.now() - t0 }, status);
   }
 
+  // Keep contamination-control state in sync for claims tied to this resolved span.
+  if (result.span_id && isValidUUID(String(result.span_id))) {
+    const { error: claimConfirmErr } = await db
+      .from("journal_claims")
+      .update({
+        claim_project_id: chosen_project_id,
+        claim_project_id_norm: chosen_project_id,
+        attribution_decision: "assign",
+        claim_confirmation_state: "confirmed",
+        confirmed_at: new Date().toISOString(),
+        confirmed_by: "review_resolve",
+      })
+      .eq("source_span_id", String(result.span_id))
+      .eq("active", true);
+
+    if (claimConfirmErr) {
+      console.error(
+        `[review-resolve] claim confirmation sync warning for span ${result.span_id}: ${claimConfirmErr.message}`,
+      );
+    }
+  }
+
   // ========================================
   // 5. LOG + RESPONSE
   // ========================================
