@@ -32,7 +32,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { authErrorResponse, requireEdgeSecret } from "../_shared/auth.ts";
 
-const VERSION = "1.3.0"; // Version tracking for admin-reseed endpoint
+const VERSION = "1.3.1"; // Version tracking for admin-reseed endpoint
 const ALLOWED_SOURCES = ["admin-reseed", "system"];
 
 // ============================================================
@@ -618,6 +618,8 @@ Deno.serve(async (req: Request) => {
         id: crypto.randomUUID(),
         interaction_id,
         span_index: seg.span_index,
+        char_start: seg.char_start,
+        char_end: seg.char_end,
         transcript_segment: segmentText,
         word_count: wordCount,
         segmenter_version: segmenterVersion,

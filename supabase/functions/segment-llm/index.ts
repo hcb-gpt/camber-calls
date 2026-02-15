@@ -17,7 +17,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { parseLlmJson } from "../_shared/llm_json.ts";
 
-const SEGMENT_LLM_VERSION = "segment-llm_v1.2.0";
+const SEGMENT_LLM_VERSION = "segment-llm_v1.3.0";
 
 // ============================================================
 // STRUCTURED LOGGING (per GPT-DEV-6 spec)
@@ -56,6 +56,9 @@ function structuredLog(
 // ============================================================
 const DEFAULT_MAX_SEGMENTS = 10;
 const DEFAULT_MIN_SEGMENT_CHARS = 200;
+const DEFAULT_MAX_SEGMENT_CHARS = 3000;
+const DEFAULT_TARGET_SEGMENT_CHARS = 1800;
+const PROJECT_ANCHOR_TERMS = ["woodberry", "sparta"];
 
 // ============================================================
 // TYPES
@@ -174,7 +177,14 @@ Deno.serve(async (req: Request) => {
     transcript,
     max_segments = DEFAULT_MAX_SEGMENTS,
     min_segment_chars = DEFAULT_MIN_SEGMENT_CHARS,
+    max_segment_chars = DEFAULT_MAX_SEGMENT_CHARS,
   } = body;
+
+  const parsedMaxSegmentChars = Number(max_segment_chars);
+  const maxSegmentChars = Number.isFinite(parsedMaxSegmentChars) &&
+      parsedMaxSegmentChars >= min_segment_chars * 2
+    ? Math.floor(parsedMaxSegmentChars)
+    : DEFAULT_MAX_SEGMENT_CHARS;
 
   if (!interaction_id) {
     return new Response(
@@ -208,7 +218,7 @@ Deno.serve(async (req: Request) => {
   structuredLog("INFO", "segment_llm_request", requestId, interaction_id, {
     transcript_chars: transcriptLength,
     caller,
-    params: { max_segments, min_segment_chars },
+    params: { max_segments, min_segment_chars, max_segment_chars: maxSegmentChars },
   });
 
   console.log(
@@ -550,8 +560,11 @@ TRANSCRIPT:
     console.log(`[segment-llm] Still single span after retry - using deterministic fallback split`);
     warnings.push("deterministic_fallback_applied");
 
-    // Split transcript into 2-4 equal segments based on length
-    const numFallbackSegments = transcriptLength < 5000 ? 2 : transcriptLength < 10000 ? 3 : 4;
+    // Split transcript into deterministic equal segments to keep long calls bounded.
+    const numFallbackSegments = Math.max(
+      2,
+      Math.min(max_segments, Math.ceil(transcriptLength / DEFAULT_TARGET_SEGMENT_CHARS)),
+    );
     const segmentSize = Math.floor(transcriptLength / numFallbackSegments);
 
     segments = [];
@@ -573,6 +586,26 @@ TRANSCRIPT:
     warnings.push(`fallback_split_${numFallbackSegments}_segments`);
   }
 
+  // ============================================================
+  // OVERSIZE GUARDRAIL: Split oversized segments in multi-span output
+  // ============================================================
+  if (segments.some((seg) => (seg.char_end - seg.char_start) > maxSegmentChars)) {
+    const beforeCount = segments.length;
+    segments = splitOversizedSegments(
+      segments,
+      transcript,
+      min_segment_chars,
+      maxSegmentChars,
+      warnings,
+    );
+    if (segments.length > beforeCount) {
+      warnings.push(`oversize_guardrail_segments_added_${segments.length - beforeCount}`);
+    }
+  }
+
+  // Preserve boundary evidence for known anchor terms when present.
+  segments = ensureAnchorBoundaryEvidence(segments, transcript, warnings);
+
   // Truncate boundary_quote to 50 chars
   segments = segments.map((seg) => ({
     ...seg,
@@ -588,6 +621,7 @@ TRANSCRIPT:
     duration_ms: durationMs,
     retry_attempted: retriedOnce,
     deterministic_fallback: warnings.includes("deterministic_fallback_applied"),
+    max_segment_chars: maxSegmentChars,
   });
 
   return new Response(
@@ -630,4 +664,234 @@ function fallbackResponse(
     } as SegmentLLMOutput),
     { status: 200, headers: { "Content-Type": "application/json" } },
   );
+}
+
+function splitOversizedSegments(
+  segments: Segment[],
+  transcript: string,
+  minSegmentChars: number,
+  maxSegmentChars: number,
+  warnings: string[],
+): Segment[] {
+  const result: Segment[] = [];
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const segLen = seg.char_end - seg.char_start;
+    if (segLen <= maxSegmentChars) {
+      result.push(seg);
+      continue;
+    }
+
+    const split = splitOneSegmentBySize(
+      seg,
+      transcript,
+      minSegmentChars,
+      maxSegmentChars,
+    );
+
+    if (split.length > 1) {
+      warnings.push(`oversize_segment_split_${i}_into_${split.length}`);
+    } else {
+      warnings.push(`oversize_segment_unsplit_${i}`);
+    }
+    result.push(...split);
+  }
+
+  return result.map((seg, idx) => ({ ...seg, span_index: idx }));
+}
+
+function splitOneSegmentBySize(
+  segment: Segment,
+  transcript: string,
+  minSegmentChars: number,
+  maxSegmentChars: number,
+): Segment[] {
+  const segmentLen = segment.char_end - segment.char_start;
+  if (segmentLen <= maxSegmentChars) return [segment];
+
+  const maxPossibleChunks = Math.max(1, Math.floor(segmentLen / Math.max(1, minSegmentChars)));
+  const desiredChunks = Math.max(
+    2,
+    Math.ceil(segmentLen / maxSegmentChars),
+    Math.ceil(segmentLen / DEFAULT_TARGET_SEGMENT_CHARS),
+  );
+  const chunkCount = Math.min(desiredChunks, maxPossibleChunks);
+  if (chunkCount <= 1) return [segment];
+
+  const splitPoints: number[] = [];
+  let cursor = segment.char_start;
+
+  // Split near known project anchors first (if feasible), then by natural boundaries.
+  const anchorPositions = collectAnchorPositions(transcript, segment.char_start, segment.char_end);
+  let nextAnchorIdx = 0;
+
+  for (let chunkIdx = 1; chunkIdx < chunkCount; chunkIdx++) {
+    const remainingChunksAfterSplit = chunkCount - chunkIdx;
+    const remainingLen = segment.char_end - cursor;
+    const target = cursor + Math.floor(remainingLen / (remainingChunksAfterSplit + 1));
+
+    let splitPoint: number | null = null;
+    for (let j = nextAnchorIdx; j < anchorPositions.length; j++) {
+      const anchor = anchorPositions[j];
+      if (anchor <= cursor + minSegmentChars) continue;
+      splitPoint = findNaturalSplitPoint(
+        transcript,
+        cursor,
+        segment.char_end,
+        anchor,
+        minSegmentChars,
+        remainingChunksAfterSplit,
+        maxSegmentChars,
+      );
+      nextAnchorIdx = j + 1;
+      break;
+    }
+
+    if (splitPoint === null) {
+      splitPoint = findNaturalSplitPoint(
+        transcript,
+        cursor,
+        segment.char_end,
+        target,
+        minSegmentChars,
+        remainingChunksAfterSplit,
+        maxSegmentChars,
+      );
+    }
+
+    if (
+      splitPoint === null || splitPoint <= cursor ||
+      splitPoint >= segment.char_end
+    ) {
+      break;
+    }
+
+    splitPoints.push(splitPoint);
+    cursor = splitPoint;
+  }
+
+  if (splitPoints.length === 0) return [segment];
+
+  const boundaries = [segment.char_start, ...splitPoints, segment.char_end];
+  const rebuilt: Segment[] = [];
+  for (let i = 0; i < boundaries.length - 1; i++) {
+    const start = boundaries[i];
+    const end = boundaries[i + 1];
+    rebuilt.push({
+      span_index: i,
+      char_start: start,
+      char_end: end,
+      boundary_reason: i === 0 ? segment.boundary_reason : "oversize_guardrail_split",
+      confidence: i === 0 ? segment.confidence : Math.max(0.55, segment.confidence - 0.15),
+      boundary_quote: i === 0 ? segment.boundary_quote : quoteAroundIndex(transcript, start),
+    });
+  }
+
+  return rebuilt;
+}
+
+function findNaturalSplitPoint(
+  transcript: string,
+  start: number,
+  end: number,
+  target: number,
+  minSegmentChars: number,
+  remainingChunksAfterSplit: number,
+  maxSegmentChars: number,
+): number | null {
+  const minSplit = start + minSegmentChars;
+  const maxSplitByRemaining = end - (remainingChunksAfterSplit * minSegmentChars);
+  const maxSplitBySize = start + maxSegmentChars;
+  const maxSplit = Math.min(maxSplitByRemaining, maxSplitBySize);
+  if (minSplit >= maxSplit) return null;
+
+  const searchMin = Math.max(minSplit, target - 280);
+  const searchMax = Math.min(maxSplit, target + 280);
+
+  // Prefer clear conversational boundaries near the target.
+  for (let i = searchMin; i <= searchMax; i++) {
+    const prev = transcript[i - 1] || "";
+    const curr = transcript[i] || "";
+    if ((prev === "\n" && curr !== "\n") || (":.!?;,".includes(prev) && /\s/.test(curr))) {
+      return i;
+    }
+  }
+
+  // Fallback to whitespace closest to target.
+  let bestWhitespace = -1;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (let i = minSplit; i <= maxSplit; i++) {
+    if (!/\s/.test(transcript[i] || "")) continue;
+    const dist = Math.abs(i - target);
+    if (dist < bestDistance) {
+      bestDistance = dist;
+      bestWhitespace = i;
+    }
+  }
+  if (bestWhitespace >= minSplit && bestWhitespace <= maxSplit) return bestWhitespace;
+
+  return Math.max(minSplit, Math.min(target, maxSplit));
+}
+
+function collectAnchorPositions(transcript: string, start: number, end: number): number[] {
+  const lower = transcript.toLowerCase();
+  const positions = new Set<number>();
+  for (const term of PROJECT_ANCHOR_TERMS) {
+    let idx = lower.indexOf(term, start);
+    while (idx !== -1 && idx < end) {
+      positions.add(idx);
+      idx = lower.indexOf(term, idx + term.length);
+    }
+  }
+  return Array.from(positions).sort((a, b) => a - b);
+}
+
+function quoteAroundIndex(transcript: string, index: number): string | null {
+  const lo = Math.max(0, index - 40);
+  const hi = Math.min(transcript.length, index + 40);
+  const snippet = transcript.slice(lo, hi).replace(/\s+/g, " ").trim();
+  return snippet.length > 0 ? snippet.slice(0, 50) : null;
+}
+
+function ensureAnchorBoundaryEvidence(
+  segments: Segment[],
+  transcript: string,
+  warnings: string[],
+): Segment[] {
+  const transcriptLower = transcript.toLowerCase();
+  const termsPresent = PROJECT_ANCHOR_TERMS.filter((term) => transcriptLower.includes(term));
+  if (termsPresent.length === 0) return segments;
+
+  const covered = new Set<string>();
+  for (const seg of segments) {
+    const quote = (seg.boundary_quote || "").toLowerCase();
+    for (const term of termsPresent) {
+      if (quote.includes(term)) covered.add(term);
+    }
+  }
+
+  for (const term of termsPresent) {
+    if (covered.has(term)) continue;
+
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const text = transcriptLower.slice(seg.char_start, seg.char_end);
+      const localIdx = text.indexOf(term);
+      if (localIdx === -1) continue;
+
+      const globalIdx = seg.char_start + localIdx;
+      const anchorQuote = quoteAroundIndex(transcript, globalIdx);
+      if (!anchorQuote) continue;
+
+      segments[i] = {
+        ...seg,
+        boundary_quote: anchorQuote,
+      };
+      covered.add(term);
+      warnings.push(`boundary_quote_anchor_${term}`);
+      break;
+    }
+  }
+
+  return segments;
 }

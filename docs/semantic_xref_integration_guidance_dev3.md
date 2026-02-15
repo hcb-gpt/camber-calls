@@ -11,9 +11,10 @@ Scope: integrate semantic claim crossref into `edge.context-assembly` without re
 ## Integration Pattern
 
 1. Build a query embedding from transcript text in `context-assembly`.
-2. Call `public.xref_search_journal_claims(query_embedding, scope_contact_id, scope_phone, result_limit, max_distance)`.
+2. Call `public.xref_search_journal_claims(query_embedding, scope_contact_id, scope_phone, result_limit, max_distance, query_hint_text)`.
 3. Blend semantic score as a bounded additive signal, not an override.
 4. Keep common-word/material alias guardrails in place before top-k truncation.
+5. Always pass `query_hint_text` from the transcript/claim snippet so low-specificity material/color guard can constrain cross-project elevation deterministically.
 
 ## Safety Rules
 
