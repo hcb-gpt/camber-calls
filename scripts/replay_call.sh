@@ -7,7 +7,7 @@
 # Options:
 #   --reseed          Run reseed (rechunk) only
 #   --reroute         Run reroute only
-#   --reseed --reroute  Run both (default)
+#   --reseed --reroute  Run both via reseed_and_close_loop (default)
 #   --only-chunk      Alias for --reseed
 #   --only-reroute    Alias for --reroute
 #   --verbose         Print detailed logs (quiet by default)
@@ -82,7 +82,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Default: both reseed and reroute
+# Default: both reseed and reroute (uses reseed_and_close_loop path)
 if [[ "$DO_RESEED" == "false" && "$DO_REROUTE" == "false" ]]; then
   DO_RESEED=true
   DO_REROUTE=true
@@ -174,7 +174,7 @@ IDEMPOTENCY_KEY="replay-$(date -u +%Y%m%dT%H%M%S)-$$"
 if [[ "$DO_RESEED" == "true" || "$DO_REROUTE" == "true" ]]; then
   # Determine mode
   if [[ "$DO_RESEED" == "true" && "$DO_REROUTE" == "true" ]]; then
-    MODE="resegment_and_reroute"
+    MODE="reseed_and_close_loop"
   elif [[ "$DO_RESEED" == "true" ]]; then
     MODE="resegment_only"
   else

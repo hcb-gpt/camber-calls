@@ -29,6 +29,11 @@
  *   inbound => owner=to_phone, other_party=from_phone
  *   outbound => owner=from_phone, other_party=to_phone
  *
+ * v4.3.5 CHANGES (empty-transcript terminalization):
+ * - Empty transcript interactions are terminalized (needs_review=false, terminal reason)
+ *   instead of creating pending null-span review_queue pressure.
+ * - Legacy pending null-span review_queue rows for empty transcript interactions are auto-dismissed.
+ *
  * v4.3.3 CHANGES (shadow replay support):
  * - Persist `is_shadow` on calls_raw + interactions.
  * - Normalize provenance source via ALLOWED_PROVENANCE_SOURCES (includes `shadow`).
@@ -47,7 +52,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { normalizePhoneForLookup } from "./phone_lookup.ts";
 import { resolveCallPartyPhones } from "./phone_direction.ts";
 
-const PROCESS_CALL_VERSION = "v4.3.5"; // normalized-phone owner mapping + quality warnings + direction-aware role mapping + shadow replay + auth hardening + lineage persistence + pipeline chain fix
+const PROCESS_CALL_VERSION = "v4.3.5"; // normalized-phone owner mapping + quality warnings + empty-transcript terminalization + auth/lineage chain hardening
 const GATE = { PASS: "PASS", SKIP: "SKIP", NEEDS_REVIEW: "NEEDS_REVIEW" };
 const ID_PATTERN = /^cll_[a-zA-Z0-9_]+$/;
 const ALLOWED_PROVENANCE_SOURCES = [
@@ -229,6 +234,15 @@ function m4(n: any) {
   if ((n.transcript || "").length < 10) r.push("G4_EMPTY_TRANSCRIPT");
   if (!n.event_at_utc && !n.call_start_utc) r.push("G4_TIMESTAMP_MISSING");
   return { decision: r.length > 0 ? GATE.NEEDS_REVIEW : GATE.PASS, reasons: r };
+}
+
+function isTerminalEmptyTranscript(gateReasons: string[], transcript: string | null | undefined): boolean {
+  const hasEmptyTranscriptGate = gateReasons.includes("G4_EMPTY_TRANSCRIPT");
+  const transcriptLen = (transcript || "").length;
+  const nonTerminalReasons = gateReasons.filter((reason) =>
+    reason !== "G4_EMPTY_TRANSCRIPT" && reason !== "G4_TIMESTAMP_MISSING"
+  );
+  return hasEmptyTranscriptGate && transcriptLen < 10 && nonTerminalReasons.length === 0;
 }
 
 Deno.serve(async (req: Request) => {
@@ -806,6 +820,7 @@ Deno.serve(async (req: Request) => {
 
     // GATE
     const g = m4(n);
+    const terminalEmptyTranscript = isTerminalEmptyTranscript(g.reasons, n.transcript);
 
     // CALLS_RAW (primary storage - includes candidate info)
     const { data: cr } = await db.from("calls_raw").upsert({
@@ -865,6 +880,10 @@ Deno.serve(async (req: Request) => {
     // v4.2.0: Write candidate_projects so auto_assign_project can read them
     // ========================================
     if (g.decision === "PASS" || g.decision === "NEEDS_REVIEW") {
+      const interactionNeedsReview = terminalEmptyTranscript ? false : true;
+      const interactionReviewReasons = terminalEmptyTranscript
+        ? ["terminal_empty_transcript", ...g.reasons]
+        : [...g.reasons, "ai_candidate_only"];
       await db.from("interactions").upsert({
         interaction_id: iid,
         channel: "call",
@@ -874,12 +893,31 @@ Deno.serve(async (req: Request) => {
         owner_phone: partyPhones.ownerPhone,
         candidate_projects: candidateProjectsJson.length > 0 ? candidateProjectsJson : null,
         event_at_utc: n.event_at_utc || null,
-        needs_review: true, // Default true; auto_assign_project may override below
-        review_reasons: [...g.reasons, "ai_candidate_only"],
+        needs_review: interactionNeedsReview,
+        review_reasons: interactionReviewReasons,
         project_attribution_confidence: project_confidence,
         transcript_chars: n.transcript?.length || 0,
         is_shadow,
       }, { onConflict: "interaction_id" });
+
+      if (terminalEmptyTranscript) {
+        // Terminalize legacy null-span pending rows for this interaction.
+        const { error: terminalizeErr } = await db
+          .from("review_queue")
+          .update({
+            status: "dismissed",
+            resolved_at: new Date().toISOString(),
+            resolved_by: "process-call",
+            resolution_action: "auto_dismiss",
+            resolution_notes: "terminal_empty_transcript",
+          })
+          .eq("interaction_id", iid)
+          .eq("status", "pending")
+          .is("span_id", null);
+        if (terminalizeErr) {
+          warnings.push(`terminalize_empty_transcript_review_queue_error: ${terminalizeErr.message}`);
+        }
+      }
 
       // ========================================
       // v4.2.0: AUTO-ASSIGN PROJECT
@@ -914,7 +952,7 @@ Deno.serve(async (req: Request) => {
       // Fire-and-forget: segment-call failures do NOT block process-call response.
       // ========================================
       const transcriptLen = n.transcript?.length || 0;
-      if (g.decision === "PASS" && transcriptLen >= 10) {
+      if (!terminalEmptyTranscript && g.decision === "PASS" && transcriptLen >= 10) {
         const edgeSecretVal = Deno.env.get("EDGE_SHARED_SECRET");
         const segmentCallUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/segment-call`;
         if (edgeSecretVal) {
