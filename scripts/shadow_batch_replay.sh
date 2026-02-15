@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/claim_guard.sh"
+
 # shadow_batch_replay.sh
 # STRAT TURN 72: GPT-DEV-3 shadow batch skeleton
 #
@@ -17,6 +21,8 @@ set -euo pipefail
 #   SUPABASE_URL                  e.g. https://<ref>.supabase.co
 #   SUPABASE_SERVICE_ROLE_KEY     service role key
 #   EDGE_SHARED_SECRET            edge function auth
+#   ORIGIN_SESSION                owning session id (for claim guard)
+#   CLAIM_RECEIPT                 active claim receipt (claim__...)
 #
 # Env vars (optional):
 #   DATABASE_URL                  postgres connection (for psql fallback)
@@ -46,6 +52,7 @@ fi
 : "${SUPABASE_URL:?SUPABASE_URL is required}"
 : "${SUPABASE_SERVICE_ROLE_KEY:?SUPABASE_SERVICE_ROLE_KEY is required}"
 : "${EDGE_SHARED_SECRET:?EDGE_SHARED_SECRET is required}"
+require_claim_context "shadow_batch_replay.sh" || exit 2
 
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 SKIP_IF_PASS="${SKIP_IF_PASS:-1}"
@@ -54,6 +61,15 @@ PROOF_ROOT="${PROOF_ROOT:-/tmp/proofs/shadow_batch}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_DIR="${PROOF_ROOT}/${RUN_ID}"
 mkdir -p "${RUN_DIR}"
+write_claim_artifact "${RUN_DIR}" "shadow_batch_replay.sh" "reseed_batch"
+cat > "${RUN_DIR}/run_context.txt" <<EOF
+timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+ids_file=${IDS_FILE}
+max_attempts=${MAX_ATTEMPTS}
+skip_if_pass=${SKIP_IF_PASS}
+origin_session=${ORIGIN_SESSION}
+claim_receipt=${CLAIM_RECEIPT}
+EOF
 
 CSV_OUT="${RUN_DIR}/shadow_batch_summary.csv"
 echo "interaction_id,status,gen_max,spans_active,attributions,review_items,review_gap,override_reseeds,http_status,attempts,latency_ms" > "${CSV_OUT}"
@@ -126,6 +142,8 @@ call_admin_reseed() {
       -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
       -H "X-Edge-Secret: ${EDGE_SHARED_SECRET}" \
       -H "X-Source: admin-reseed" \
+      -H "X-Origin-Session: ${ORIGIN_SESSION}" \
+      -H "X-Claim-Receipt: ${CLAIM_RECEIPT}" \
       -H "Content-Type: application/json" \
       --data "$body" || echo "000")"
 
@@ -244,6 +262,8 @@ echo "=============================================="
 echo "SHADOW BATCH SUMMARY"
 echo "=============================================="
 echo "Run ID:    ${RUN_ID}"
+echo "Session:   ${ORIGIN_SESSION}"
+echo "Claim:     ${CLAIM_RECEIPT}"
 echo "Total:     ${total}"
 echo "Passed:    ${passed}"
 echo "Failed:    ${failed}"
