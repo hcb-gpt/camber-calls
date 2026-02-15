@@ -37,9 +37,10 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
+import { parseLlmJson } from "../_shared/llm_json.ts";
 
 const PROMPT_VERSION = "v1.8.0"; // Prompt unchanged from v1.8.0
-const FUNCTION_VERSION = "v1.8.1";
+const FUNCTION_VERSION = "v1.8.3";
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
 
@@ -275,6 +276,31 @@ const _WEAK_ANCHOR_TYPES = [
 
 function hasStrongAnchor(anchors: Anchor[]): boolean {
   return anchors.some((a) => STRONG_ANCHOR_TYPES.includes(a.match_type));
+}
+
+/**
+ * Derive attribution_source from anchor composition.
+ * Values: llm_strong_anchor, llm_weak_anchor, llm_no_anchor, model_error
+ */
+function deriveAttributionSource(anchors: Anchor[], modelError: boolean): string {
+  if (modelError) return "model_error";
+  if (!anchors || anchors.length === 0) return "llm_no_anchor";
+  if (hasStrongAnchor(anchors)) return "llm_strong_anchor";
+  return "llm_weak_anchor";
+}
+
+/**
+ * Derive evidence_tier from anchor strength + confidence.
+ * Tier 1 = strong anchor + high confidence (>= 0.75)
+ * Tier 2 = any anchor + medium confidence (>= 0.50)
+ * Tier 3 = weak/no anchor or low confidence (< 0.50)
+ */
+function deriveEvidenceTier(anchors: Anchor[], confidence: number, modelError: boolean): number {
+  if (modelError) return 3;
+  const strong = hasStrongAnchor(anchors);
+  if (strong && confidence >= 0.75) return 1;
+  if (anchors.length > 0 && confidence >= 0.50) return 2;
+  return 3;
 }
 
 function canOverwriteLock(currentLock: string | null, newLock: string | null): boolean {
@@ -676,13 +702,7 @@ Deno.serve(async (req: Request) => {
     const textBlock = response.content.find((b: any) => b.type === "text");
     const responseText = textBlock?.type === "text" ? textBlock.text : "";
 
-    let jsonStr = responseText;
-    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      jsonStr = jsonMatch[0];
-    }
-
-    const parsed = JSON.parse(jsonStr);
+    const parsed = parseLlmJson<any>(responseText).value;
 
     const project_id = parsed.project_id || null;
     const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
@@ -802,6 +822,8 @@ Deno.serve(async (req: Request) => {
     // ========================================
     const attribution_lock = applied ? "ai" : null;
     const needs_review = result.decision === "review" || result.decision === "none";
+    const attribution_source = deriveAttributionSource(result.anchors, model_error);
+    const evidence_tier = deriveEvidenceTier(result.anchors, result.confidence, model_error);
 
     const { error: upsertErr } = await db.from("span_attributions").upsert({
       span_id,
@@ -821,6 +843,8 @@ Deno.serve(async (req: Request) => {
       applied_project_id,
       applied_at_utc: applied ? new Date().toISOString() : null,
       needs_review,
+      attribution_source,
+      evidence_tier,
       attributed_by: `ai-router-${FUNCTION_VERSION}`,
       attributed_at: new Date().toISOString(),
     }, {
