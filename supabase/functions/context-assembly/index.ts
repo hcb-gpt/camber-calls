@@ -127,15 +127,6 @@ const SOURCE_SCORE_STRUCTURAL_TYPE_MULTI = 0.30; // Source 12: structural type m
 const SOURCE_SCORE_COMMON_WORD_ALIAS_DEMOTION = 0.65; // Common-word alias demotion (e.g., "mystery white")
 const FLOATER_AFFINITY_DISCOUNT = 0.5; // Floater modifier: halve affinity weights for sources 2-3
 const COMMON_WORD_ALIAS_TERMS = new Set(["white"]);
-const WEAK_ALIAS_ONLY_SOURCES = new Set([
-  "transcript_scan",
-  "claim_content_match",
-  "material_structural_mentions",
-  "material_budget_tier_match",
-  "floater_anti_signal",
-  "correspondent_project_affinity",
-  "geo_proximity",
-]);
 
 // Structural keywords → foundation_type mapping
 const STRUCTURAL_KEYWORD_MAP: Record<string, string> = {
