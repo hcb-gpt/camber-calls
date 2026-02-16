@@ -9,6 +9,15 @@
  *
  * CORE PRINCIPLE: span_id is the unit of truth. Calls are containers only.
  *
+ * v2.3.0 Changes (Graduated Fanout Scoring):
+ * - REPLACED: binary floater_flag gate with graduated 5-tier fanout scoring
+ * - NEW: FANOUT_AFFINITY_MODIFIER — per-class multiplier on affinity weights (Sources 2-3)
+ * - NEW: FANOUT_ANTI_SIGNAL — graduated penalty/boost replacing flat -0.28 for all floaters
+ * - NEW: FANOUT_MAX_CANDIDATES — graduated candidate pool size by fanout_class
+ * - NEW: Graduated continuity tier gate (floater=TIER_1 only, drifter=TIER_1+2, rest=all)
+ * - PRESERVED: floater_flag for backwards compat in context_package output
+ * - PRESERVED: isInternalFloater for journal unscoping behavior
+ *
  * v2.1.0 Changes (Sort Order Fix — source_strength over affinity_weight):
  * - Candidate sort now prioritizes source_strength (transcript evidence quality)
  *   ABOVE affinity_weight (call-history frequency)
@@ -90,11 +99,43 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { computeClaimCrossref } from "./claim_crossref.ts";
 import { findHomeownerOverrideConflict, isHomeownerRoleLabel } from "./homeowner_override.ts";
+import { rrfPipeline } from "./rrf_fusion.ts";
+import type { ChannelResult, ChannelRanks } from "./rrf_fusion.ts";
+import { queryFtsFacts } from "./fts_retrieval.ts";
+import { queryTrigramFacts } from "./trigram_retrieval.ts";
 
-const ASSEMBLY_VERSION = "v2.1.1"; // v2.1.1: P0 homeowner override + contradiction escape hatch
+const ASSEMBLY_VERSION = "v2.3.0"; // v2.3.0: Graduated fanout scoring (replaces binary floater gate)
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_CANDIDATES_FLOATER = 12; // Expanded for internal floater contacts
+
+// v2.3.0: Graduated fanout scoring — replaces binary floater gate
+// Maps fanout_class to an affinity multiplier applied to Sources 2-3
+const FANOUT_AFFINITY_MODIFIER: Record<string, number> = {
+  anchored: 1.3,        // Strong identity signal (1 project) — BOOST
+  semi_anchored: 1.0,   // Moderate signal (2 projects) — neutral
+  drifter: 0.6,         // Weak signal (3-4 projects)
+  floater: 0.3,         // Anti-signal (5+ projects)
+  unknown: 0.8,         // Default
+};
+
+// v2.3.0: Graduated anti-signal penalty applied to ALL candidates per fanout class
+const FANOUT_ANTI_SIGNAL: Record<string, number> = {
+  anchored: 0.15,       // Positive boost
+  semi_anchored: 0.0,   // Neutral
+  drifter: -0.15,       // Mild penalty
+  floater: -0.28,       // Same as legacy SOURCE_SCORE_FLOATER_ANTI_SIGNAL
+  unknown: -0.05,       // Slight penalty
+};
+
+// v2.3.0: Graduated candidate pool size per fanout class
+const FANOUT_MAX_CANDIDATES: Record<string, number> = {
+  anchored: 6,
+  semi_anchored: 8,
+  drifter: 10,
+  floater: 12,
+  unknown: 8,
+};
 const MAX_TRANSCRIPT_CHARS = 8000;
 const MAX_ALIAS_TERMS_PER_PROJECT = 25;
 const GMAIL_LOOKUP_DEFAULT_LOOKBACK_DAYS = 30;
@@ -411,6 +452,10 @@ interface CandidateEvidence {
   material_budget_tier_terms?: string[];
   weak_only?: boolean; // true if ALL alias evidence is weak (first-name-only, short token)
   common_word_alias_demoted?: boolean;
+  // v2.2.0: RRF multi-channel fusion fields (M2-D/M2-E contract)
+  rrf_score?: number;
+  rrf_channel_ranks?: ChannelRanks;
+  evidence_tier_label?: string; // smoking_gun | strong | moderate | weak | anti
 }
 
 interface Candidate {
@@ -472,6 +517,8 @@ interface ProjectFactRow {
   fact_payload: any;
   evidence_event_id: string | null;
   interaction_id: string | null;
+  rrf_score?: number; // v2.2.0: RRF fusion score when multi-channel retrieval is active
+  rrf_ranks?: ChannelRanks; // v2.2.0: per-channel rank positions
 }
 
 interface ProjectFactsPack {
@@ -524,6 +571,7 @@ interface ContextPackage {
     homeowner_override_conflict_project_id: string | null;
     homeowner_override_conflict_term: string | null;
     homeowner_override_skipped_reason: string | null;
+    retrieval_channels?: string[]; // v2.2.0: active retrieval channels (structured, fts, trgm, vector)
   };
   span: {
     start_ms: number | null;
@@ -599,11 +647,26 @@ function parseBoolEnv(key: string, defaultValue = false): boolean {
 }
 
 const WORLD_MODEL_FACTS_ENABLED = parseBoolEnv("WORLD_MODEL_FACTS_ENABLED", false);
+const RETRIEVAL_FTS_MAX_RESULTS = 20;
+const SOURCE_SCORE_FTS_FACTS = 0.35; // FTS fact match: moderate-high signal (exact lexical match)
+const RETRIEVAL_TRGM_MAX_RESULTS = 20;
+const SOURCE_SCORE_TRGM_FACTS = 0.30; // Trigram fact match: moderate signal
 const WORLD_MODEL_FACTS_MAX_PER_PROJECT = clamp(
   Number.parseInt(Deno.env.get("WORLD_MODEL_FACTS_MAX_PER_PROJECT") || "20", 10) || 20,
   0,
   50,
 );
+
+// v2.2.0: Multi-channel retrieval feature flags
+const RETRIEVAL_FTS_ENABLED = parseBoolEnv("RETRIEVAL_FTS_ENABLED", false);
+const RETRIEVAL_TRGM_ENABLED = parseBoolEnv("RETRIEVAL_TRGM_ENABLED", false);
+const RETRIEVAL_VECTOR_ENABLED = parseBoolEnv("RETRIEVAL_VECTOR_ENABLED", false);
+const RRF_TOP_N = clamp(
+  Number.parseInt(Deno.env.get("RRF_TOP_N") || "20", 10) || 20,
+  1,
+  50,
+);
+const RRF_K = 60; // Standard RRF smoothing constant
 
 function tokenizeTextForOverlap(text: string): string[] {
   return (text || "")
@@ -1599,8 +1662,9 @@ Deno.serve(async (req: Request) => {
     }
 
     // SOURCE 2: correspondent_project_affinity
-    // v2.0.0 Floater modifier: halve affinity weights for internal floaters
+    // v2.3.0: Graduated fanout modifier replaces binary floater discount
     const isInternalFloater = floater_flag && contact_is_internal;
+    const fanoutAffinityMod = FANOUT_AFFINITY_MODIFIER[fanout_class] ?? FANOUT_AFFINITY_MODIFIER.unknown;
     if (contact_id) {
       const { data: affRows } = await db
         .from("correspondent_project_affinity")
@@ -1612,10 +1676,8 @@ Deno.serve(async (req: Request) => {
         for (const r of affRows) {
           if (r.project_id) {
             let affinityWeight = Number(r.weight || 0);
-            // v2.0.0 Floater modifier: discount affinity for internal floaters
-            if (isInternalFloater) {
-              affinityWeight *= FLOATER_AFFINITY_DISCOUNT;
-            }
+            // v2.3.0: Apply graduated fanout affinity modifier for ALL contacts
+            affinityWeight *= fanoutAffinityMod;
             addCandidate(
               r.project_id,
               "correspondent_project_affinity",
@@ -2046,16 +2108,18 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    if (floater_flag && candidatesById.size > 0) {
-      sources_used.push("floater_anti_signal");
+    // v2.3.0: Graduated fanout anti-signal replaces binary floater_flag gate
+    const fanoutAntiSignal = FANOUT_ANTI_SIGNAL[fanout_class] ?? FANOUT_ANTI_SIGNAL.unknown;
+    if (fanoutAntiSignal !== 0 && candidatesById.size > 0) {
+      sources_used.push("fanout_anti_signal");
       for (const [pid] of candidatesById) {
         addCandidate(
           pid,
-          "floater_anti_signal",
+          "fanout_anti_signal",
           0,
           undefined,
           undefined,
-          SOURCE_SCORE_FLOATER_ANTI_SIGNAL,
+          fanoutAntiSignal,
         );
       }
     }
@@ -2511,7 +2575,6 @@ Deno.serve(async (req: Request) => {
             const gapMinutes = Math.max(0, Math.round((eventMs - priorMs) / 60000));
             if (gapMinutes > CONTINUITY_LOOKBACK_HOURS * 60) continue;
 
-            const isFloaterSensitive = floater_flag || gapMinutes > CONTINUITY_FLOATER_GAP_HOURS * 60;
             const hasProjectMention = projectMentionSpans.length > 0;
             const hasCallback = callbackSpans.length > 0;
 
@@ -2526,8 +2589,16 @@ Deno.serve(async (req: Request) => {
               reason = "project_mention";
             }
 
-            // Floater rule: require Tier1
-            if (isFloaterSensitive && tier !== "TIER_1") continue;
+            // v2.3.0: Graduated continuity tier gate by fanout_class
+            // floater: TIER_1 only (same as legacy)
+            // drifter: TIER_1 + TIER_2 (callback phrases allowed)
+            // anchored/semi_anchored/unknown: all tiers
+            const isLargeGap = gapMinutes > CONTINUITY_FLOATER_GAP_HOURS * 60;
+            if (fanout_class === "floater" || isLargeGap) {
+              if (tier !== "TIER_1") continue;
+            } else if (fanout_class === "drifter") {
+              if (tier === "TIER_3") continue;
+            }
 
             const spans: string[] = [];
             if (tier === "TIER_1") spans.push(...projectMentionSpans.slice(0, 5));
@@ -2565,6 +2636,93 @@ Deno.serve(async (req: Request) => {
         }
       } catch (_contErr) {
         warnings.push("continuity_bundle_failed");
+      }
+    }
+
+    // ========================================
+    // SOURCE 15: FTS on project_facts (M2-A; feature-flagged)
+    // Queries project_facts using Postgres full-text search (plainto_tsquery)
+    // against the search_text generated column. Surfaces candidate projects whose
+    // facts lexically match the transcript.
+    //
+    // Hard constraints:
+    // - as_of_at <= t_call AND observed_at <= t_call
+    // - Same-call exclusion (drop facts from this interaction)
+    // ========================================
+    if (RETRIEVAL_FTS_ENABLED && transcript_text && event_at_utc) {
+      try {
+        // Build evidence event ID set for same-call exclusion
+        const { data: ftsEvidenceRows } = await db
+          .from("evidence_events")
+          .select("evidence_event_id")
+          .eq("source_type", "call")
+          .eq("source_id", interaction_id);
+        const ftsEvidenceIds = new Set(
+          (ftsEvidenceRows || []).map((r: any) => String(r.evidence_event_id || "")).filter(Boolean),
+        );
+
+        const ftsResults = await queryFtsFacts(db, {
+          span_text: transcript_text,
+          candidate_project_ids: [], // Unscoped: discover new candidates
+          t_call: event_at_utc,
+          current_interaction_id: interaction_id!,
+          current_evidence_event_ids: ftsEvidenceIds,
+          limit: RETRIEVAL_FTS_MAX_RESULTS,
+        });
+
+        if (ftsResults.length > 0) {
+          sources_used.push("fts_facts");
+          for (const result of ftsResults) {
+            // Scale sourceScore by fts_rank * base score
+            const scaledScore = Math.min(result.fts_rank, 1.0) * SOURCE_SCORE_FTS_FACTS;
+            addCandidate(result.project_id, "fts_facts", 0, undefined, undefined, scaledScore);
+          }
+        }
+      } catch (_ftsErr) {
+        warnings.push("fts_facts_skipped");
+      }
+    }
+
+    // ========================================
+    // SOURCE 16: TRIGRAM FUZZY MATCHING on project_facts (M2-B; feature-flagged)
+    // Queries project_facts using pg_trgm similarity against span transcript.
+    // Surfaces candidate projects whose facts fuzzy-match the transcript.
+    //
+    // Hard constraints:
+    // - as_of_at <= t_call AND observed_at <= t_call
+    // - Same-call exclusion (drop facts from this interaction)
+    // ========================================
+    if (RETRIEVAL_TRGM_ENABLED && transcript_text && event_at_utc) {
+      try {
+        // Build evidence event ID set for same-call exclusion
+        const { data: evidenceRows } = await db
+          .from("evidence_events")
+          .select("evidence_event_id")
+          .eq("source_type", "call")
+          .eq("source_id", interaction_id);
+        const trgmEvidenceIds = new Set(
+          (evidenceRows || []).map((r: any) => String(r.evidence_event_id || "")).filter(Boolean),
+        );
+
+        const trgmResults = await queryTrigramFacts(db, {
+          span_text: transcript_text,
+          candidate_project_ids: [], // Unscoped: discover new candidates
+          t_call: event_at_utc,
+          current_interaction_id: interaction_id!,
+          current_evidence_event_ids: trgmEvidenceIds,
+          limit: RETRIEVAL_TRGM_MAX_RESULTS,
+        });
+
+        if (trgmResults.length > 0) {
+          sources_used.push("trgm_facts");
+          for (const result of trgmResults) {
+            // Scale sourceScore by trgm_score (0..1) * base score
+            const scaledScore = result.trgm_score * SOURCE_SCORE_TRGM_FACTS;
+            addCandidate(result.project_id, "trgm_facts", 0, undefined, undefined, scaledScore);
+          }
+        }
+      } catch (_trgmErr) {
+        warnings.push("trgm_facts_skipped");
       }
     }
 
@@ -2800,7 +2958,8 @@ Deno.serve(async (req: Request) => {
       });
     sortCandidates(candidates);
 
-    const effectiveMaxCandidates = isInternalFloater ? MAX_CANDIDATES_FLOATER : MAX_CANDIDATES;
+    // v2.3.0: Graduated candidate pool size by fanout_class
+    const effectiveMaxCandidates = FANOUT_MAX_CANDIDATES[fanout_class] ?? FANOUT_MAX_CANDIDATES.unknown;
     const crossrefPoolSize = Math.min(candidates.length, effectiveMaxCandidates + 6);
     if (candidates.length > crossrefPoolSize) {
       truncations.push(`crossref_pool_capped_at_${crossrefPoolSize}`);
@@ -3022,17 +3181,29 @@ Deno.serve(async (req: Request) => {
     const finalProjectJournal = project_journal.filter((pj) => finalCandidateIdSet.has(pj.project_id));
 
     // ========================================
-    // SOURCE 14: PROJECT_FACTS (World model) (v2.2.0; feature-flagged)
-    // Time-aware, provenance-backed facts per candidate project.
+    // SOURCE 14: PROJECT_FACTS — Multi-channel retrieval with RRF fusion (v2.2.0)
     //
-    // Hard constraints:
-    // - Default to KNOWN_AS_OF (as_of_at <= t_call AND observed_at <= t_call)
-    // - Same-call exclusion (drop any facts sourced from this interaction)
+    // Channels (each feature-flagged independently):
+    //   - structured: existing recency-ordered query (on when WORLD_MODEL_FACTS_ENABLED)
+    //   - fts: full-text search via search_project_facts_fts RPC
+    //   - trgm: trigram fuzzy match via search_project_facts_trgm RPC
+    //   - vector: embedding similarity via match_project_facts_vector RPC
+    //
+    // Hard constraints applied to ALL channels:
+    //   - KNOWN_AS_OF: as_of_at <= t_call AND observed_at <= t_call
+    //   - Same-call exclusion: drop facts from this interaction_id or evidence_event_id
+    //
+    // When multiple channels are active, results are fused via RRF (k=60)
+    // and top-N facts per project are selected. rrf_score is attached to each fact.
     // ========================================
     let project_facts: ProjectFactsPack[] | undefined;
-    if (WORLD_MODEL_FACTS_ENABLED && finalCandidates.length > 0 && event_at_utc) {
+    const anyRetrievalEnabled = WORLD_MODEL_FACTS_ENABLED || RETRIEVAL_FTS_ENABLED ||
+      RETRIEVAL_TRGM_ENABLED || RETRIEVAL_VECTOR_ENABLED;
+    const activeChannels: string[] = [];
+
+    if (anyRetrievalEnabled && finalCandidates.length > 0 && event_at_utc) {
       try {
-        // Best-effort: gather evidence_event_id(s) for the current call so we can exclude them too.
+        // Gather evidence_event_id(s) for same-call exclusion.
         const { data: evidenceRows } = await db
           .from("evidence_events")
           .select("evidence_event_id")
@@ -3045,51 +3216,276 @@ Deno.serve(async (req: Request) => {
         const candidateProjectIds = finalCandidates.map((c) => c.project_id);
         const maxRows = WORLD_MODEL_FACTS_MAX_PER_PROJECT * candidateProjectIds.length * 3;
 
-        const { data: factRows, error: factsErr } = await db
-          .from("project_facts")
-          .select("project_id, as_of_at, observed_at, fact_kind, fact_payload, evidence_event_id, interaction_id")
-          .in("project_id", candidateProjectIds)
-          .lte("as_of_at", event_at_utc)
-          .lte("observed_at", event_at_utc)
-          .order("as_of_at", { ascending: false })
-          .order("observed_at", { ascending: false })
-          .limit(maxRows);
+        // Helper: convert a raw DB row to ProjectFactRow, applying same-call exclusion.
+        const toFactRow = (row: any): ProjectFactRow | null => {
+          const rowInteractionId = row.interaction_id ? String(row.interaction_id) : null;
+          const rowEvidenceEventId = row.evidence_event_id ? String(row.evidence_event_id) : null;
+          if (rowInteractionId && rowInteractionId === interaction_id) return null;
+          if (rowEvidenceEventId && currentEvidenceEventIds.has(rowEvidenceEventId)) return null;
+          return {
+            project_id: String(row.project_id),
+            as_of_at: String(row.as_of_at),
+            observed_at: String(row.observed_at),
+            fact_kind: String(row.fact_kind),
+            fact_payload: row.fact_payload,
+            evidence_event_id: rowEvidenceEventId,
+            interaction_id: rowInteractionId,
+          };
+        };
 
-        if (factsErr) {
-          warnings.push("project_facts_fetch_failed");
-        } else if (factRows && factRows.length > 0) {
-          const byProject = new Map<string, ProjectFactRow[]>();
-          for (const row of factRows as any[]) {
-            const rowInteractionId = row.interaction_id ? String(row.interaction_id) : null;
-            const rowEvidenceEventId = row.evidence_event_id ? String(row.evidence_event_id) : null;
+        // Stable fact_id: prefer DB id, else composite key.
+        const factId = (row: any): string =>
+          row.id ? String(row.id) : `${row.project_id}:${row.fact_kind}:${row.as_of_at}`;
 
-            // Mandatory same-call exclusion (interaction_id OR evidence_event_id match).
-            if (rowInteractionId && rowInteractionId === interaction_id) continue;
-            if (rowEvidenceEventId && currentEvidenceEventIds.has(rowEvidenceEventId)) continue;
+        // Build search query from transcript for FTS + trigram + vector channels
+        const searchTerms = (finalTranscript || "")
+          .replace(/[^a-zA-Z0-9\s]/g, " ")
+          .split(/\s+/)
+          .filter((t) => t.length >= 3)
+          .slice(0, 30);
+        const searchQuery = searchTerms.join(" ");
 
-            const pid = String(row.project_id);
-            if (!byProject.has(pid)) byProject.set(pid, []);
-            byProject.get(pid)!.push({
+        // ---------- Run active channels in parallel ----------
+        const channelPromises: Promise<ChannelResult | null>[] = [];
+
+        // CHANNEL: structured (existing recency query)
+        if (WORLD_MODEL_FACTS_ENABLED) {
+          channelPromises.push(
+            (async (): Promise<ChannelResult | null> => {
+              const { data: factRows, error: factsErr } = await db
+                .from("project_facts")
+                .select(
+                  "id, project_id, as_of_at, observed_at, fact_kind, fact_payload, evidence_event_id, interaction_id",
+                )
+                .in("project_id", candidateProjectIds)
+                .lte("as_of_at", event_at_utc!)
+                .lte("observed_at", event_at_utc!)
+                .order("as_of_at", { ascending: false })
+                .order("observed_at", { ascending: false })
+                .limit(maxRows);
+              if (factsErr || !factRows?.length) {
+                if (factsErr) warnings.push("project_facts_structured_failed");
+                return null;
+              }
+              const facts: ChannelResult["facts"] = [];
+              for (const row of factRows as any[]) {
+                const fact = toFactRow(row);
+                if (fact) facts.push({ fact_id: factId(row), project_id: fact.project_id, fact });
+              }
+              return facts.length > 0 ? { channel: "structured", facts } : null;
+            })(),
+          );
+        }
+
+        // CHANNEL: FTS (full-text search via fts_retrieval module)
+        if (RETRIEVAL_FTS_ENABLED && finalTranscript && finalTranscript.length > 0) {
+          channelPromises.push(
+            (async (): Promise<ChannelResult | null> => {
+              try {
+                const ftsResults = await queryFtsFacts(db, {
+                  span_text: finalTranscript,
+                  candidate_project_ids: candidateProjectIds,
+                  t_call: event_at_utc!,
+                  current_interaction_id: interaction_id!,
+                  current_evidence_event_ids: currentEvidenceEventIds,
+                  limit: maxRows,
+                });
+                if (!ftsResults.length) return null;
+                const facts: ChannelResult["facts"] = [];
+                for (const r of ftsResults) {
+                  facts.push({
+                    fact_id: r.fact_id || `${r.project_id}:${r.fact_kind}:${r.as_of_at}`,
+                    project_id: r.project_id,
+                    fact: {
+                      project_id: r.project_id,
+                      as_of_at: r.as_of_at,
+                      observed_at: r.observed_at,
+                      fact_kind: r.fact_kind,
+                      fact_payload: r.fact_payload,
+                      evidence_event_id: r.evidence_event_id,
+                      interaction_id: r.interaction_id,
+                    },
+                  });
+                }
+                return facts.length > 0 ? { channel: "fts", facts } : null;
+              } catch (_e) {
+                warnings.push("project_facts_fts_exception");
+                return null;
+              }
+            })(),
+          );
+        }
+
+        // CHANNEL: trigram (pg_trgm similarity via trigram_retrieval module)
+        if (RETRIEVAL_TRGM_ENABLED && finalTranscript && finalTranscript.length > 0) {
+          channelPromises.push(
+            (async (): Promise<ChannelResult | null> => {
+              try {
+                const trgmResults = await queryTrigramFacts(db, {
+                  span_text: finalTranscript,
+                  candidate_project_ids: candidateProjectIds,
+                  t_call: event_at_utc!,
+                  current_interaction_id: interaction_id!,
+                  current_evidence_event_ids: currentEvidenceEventIds,
+                  limit: maxRows,
+                });
+                if (!trgmResults.length) return null;
+                const facts: ChannelResult["facts"] = [];
+                for (const r of trgmResults) {
+                  facts.push({
+                    fact_id: `${r.project_id}:${r.fact_kind}:${r.as_of_at}`,
+                    project_id: r.project_id,
+                    fact: {
+                      project_id: r.project_id,
+                      as_of_at: r.as_of_at,
+                      observed_at: r.observed_at,
+                      fact_kind: r.fact_kind,
+                      fact_payload: r.fact_payload,
+                      evidence_event_id: r.evidence_event_id,
+                      interaction_id: r.interaction_id,
+                    },
+                  });
+                }
+                return facts.length > 0 ? { channel: "trgm", facts } : null;
+              } catch (_e) {
+                warnings.push("project_facts_trgm_exception");
+                return null;
+              }
+            })(),
+          );
+        }
+
+        // CHANNEL: vector (embedding similarity via match_project_facts_vector RPC)
+        if (RETRIEVAL_VECTOR_ENABLED && searchQuery.length > 0) {
+          channelPromises.push(
+            (async (): Promise<ChannelResult | null> => {
+              try {
+                const { data: vecRows, error: vecErr } = await db
+                  .rpc("match_project_facts_vector", {
+                    query_text: searchQuery,
+                    project_ids: candidateProjectIds,
+                    as_of_cutoff: event_at_utc,
+                    match_count: maxRows,
+                    match_threshold: 0.5,
+                  });
+                if (vecErr || !vecRows?.length) {
+                  if (vecErr) warnings.push("project_facts_vector_failed");
+                  return null;
+                }
+                const facts: ChannelResult["facts"] = [];
+                for (const row of vecRows as any[]) {
+                  const fact = toFactRow(row);
+                  if (fact) facts.push({ fact_id: factId(row), project_id: fact.project_id, fact });
+                }
+                return facts.length > 0 ? { channel: "vector", facts } : null;
+              } catch (_e) {
+                warnings.push("project_facts_vector_exception");
+                return null;
+              }
+            })(),
+          );
+        }
+
+        // Await all channels in parallel
+        const channelSettled = await Promise.all(channelPromises);
+        const channelResults: ChannelResult[] = channelSettled.filter(
+          (r): r is ChannelResult => r !== null,
+        );
+        for (const cr of channelResults) activeChannels.push(cr.channel);
+
+        if (channelResults.length > 0) {
+          if (channelResults.length === 1) {
+            // Single channel: skip RRF overhead, use direct results
+            const singleChannel = channelResults[0];
+            const byProject = new Map<string, ProjectFactRow[]>();
+            for (const item of singleChannel.facts) {
+              const pid = item.project_id;
+              if (!byProject.has(pid)) byProject.set(pid, []);
+              byProject.get(pid)!.push(item.fact);
+            }
+            project_facts = candidateProjectIds.map((pid) => ({
               project_id: pid,
-              as_of_at: String(row.as_of_at),
-              observed_at: String(row.observed_at),
-              fact_kind: String(row.fact_kind),
-              fact_payload: row.fact_payload,
-              evidence_event_id: rowEvidenceEventId,
-              interaction_id: rowInteractionId,
-            });
+              facts: (byProject.get(pid) || []).slice(0, WORLD_MODEL_FACTS_MAX_PER_PROJECT),
+            }));
+          } else {
+            // Multi-channel: RRF fusion
+            const fused = rrfPipeline(channelResults, RRF_TOP_N, RRF_K);
+            const byProject = new Map<string, ProjectFactRow[]>();
+            for (const rc of fused) {
+              const pid = rc.project_id;
+              if (!byProject.has(pid)) byProject.set(pid, []);
+              byProject.get(pid)!.push({
+                ...rc.fact,
+                rrf_score: rc.rrf_score,
+                rrf_ranks: rc.ranks,
+              });
+            }
+            project_facts = candidateProjectIds.map((pid) => ({
+              project_id: pid,
+              facts: (byProject.get(pid) || []).slice(0, WORLD_MODEL_FACTS_MAX_PER_PROJECT),
+            }));
           }
 
-          project_facts = candidateProjectIds.map((pid) => ({
-            project_id: pid,
-            facts: (byProject.get(pid) || []).slice(0, WORLD_MODEL_FACTS_MAX_PER_PROJECT),
-          }));
-
           const anyFacts = project_facts.some((p) => p.facts.length > 0);
-          if (anyFacts) sources_used.push("project_facts");
+          if (anyFacts) {
+            sources_used.push("project_facts");
+            if (channelResults.length > 1) sources_used.push("rrf_fusion");
+          }
         }
       } catch (_factsErr) {
         warnings.push("project_facts_skipped");
+      }
+    }
+
+    // ========================================
+    // RRF EVIDENCE ENRICHMENT (M2-D/M2-E contract)
+    // Compute per-candidate rrf_score, rrf_channel_ranks, and evidence_tier_label
+    // from the fused project_facts. Max rrf_score across facts for each project.
+    // ========================================
+    if (project_facts && project_facts.length > 0 && activeChannels.length > 1) {
+      const maxRrfByProject = new Map<string, { score: number; ranks: ChannelRanks }>();
+      for (const pack of project_facts) {
+        for (const fact of pack.facts) {
+          if (fact.rrf_score != null && fact.rrf_score > 0) {
+            const existing = maxRrfByProject.get(pack.project_id);
+            if (!existing || fact.rrf_score > existing.score) {
+              maxRrfByProject.set(pack.project_id, {
+                score: fact.rrf_score,
+                ranks: fact.rrf_ranks || {},
+              });
+            }
+          }
+        }
+      }
+
+      for (const candidate of finalCandidates) {
+        const rrfData = maxRrfByProject.get(candidate.project_id);
+        if (rrfData) {
+          candidate.evidence.rrf_score = Math.round(rrfData.score * 10000) / 10000;
+          candidate.evidence.rrf_channel_ranks = rrfData.ranks;
+
+          // Tier classification (thresholds from M2-E spec Section 2)
+          const hasStrongAnchor = candidate.evidence.assigned ||
+            (candidate.evidence.alias_matches || []).some((m) =>
+              m.match_type === "exact" || m.match_type === "address" || m.match_type === "client"
+            );
+          const score = rrfData.score;
+          if (score >= 0.85 && hasStrongAnchor) {
+            candidate.evidence.evidence_tier_label = "smoking_gun";
+          } else if (score >= 0.60 && (hasStrongAnchor || (candidate.evidence.alias_matches || []).length > 0)) {
+            candidate.evidence.evidence_tier_label = "strong";
+          } else if (score >= 0.35 || (candidate.evidence.source_strength ?? 0) >= 0.50) {
+            candidate.evidence.evidence_tier_label = "moderate";
+          } else if (score >= 0.15) {
+            candidate.evidence.evidence_tier_label = "weak";
+          } else {
+            candidate.evidence.evidence_tier_label = "anti";
+          }
+        } else {
+          // No RRF data for this candidate (no facts returned by any channel)
+          candidate.evidence.rrf_score = 0;
+          candidate.evidence.evidence_tier_label = "anti";
+        }
       }
     }
 
@@ -3111,6 +3507,7 @@ Deno.serve(async (req: Request) => {
         homeowner_override_conflict_project_id: homeownerOverrideConflictProjectId,
         homeowner_override_conflict_term: homeownerOverrideConflictTerm,
         homeowner_override_skipped_reason: homeownerOverrideSkippedReason,
+        ...(activeChannels.length > 0 ? { retrieval_channels: activeChannels } : {}),
       },
       span: {
         start_ms,
