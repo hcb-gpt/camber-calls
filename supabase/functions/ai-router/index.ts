@@ -307,9 +307,7 @@ function filterClosedProjectCandidates(
   ctx: ContextPackage,
 ): { filtered: ContextPackage; removed_count: number } {
   const candidates = Array.isArray(ctx.candidates) ? ctx.candidates : [];
-  const kept = candidates.filter((c) =>
-    ATTRIBUTION_ELIGIBLE_STATUSES.has(String(c.status || "").trim().toLowerCase())
-  );
+  const kept = candidates.filter((c) => ATTRIBUTION_ELIGIBLE_STATUSES.has(String(c.status || "").trim().toLowerCase()));
   const removedCount = candidates.length - kept.length;
   if (removedCount === 0) return { filtered: ctx, removed_count: 0 };
   return {
@@ -1326,7 +1324,8 @@ Deno.serve(async (req: Request) => {
       result = {
         ...result,
         decision: "review",
-        reasoning: `${result.reasoning} closed_project_hard_filter: chosen project status=${chosenStatus} is not attribution-eligible.`,
+        reasoning:
+          `${result.reasoning} closed_project_hard_filter: chosen project status=${chosenStatus} is not attribution-eligible.`,
       };
     }
   }
