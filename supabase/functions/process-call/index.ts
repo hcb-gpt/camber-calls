@@ -880,7 +880,7 @@ Deno.serve(async (req: Request) => {
       const interactionReviewReasons = terminalEmptyTranscript
         ? ["terminal_empty_transcript", ...g.reasons]
         : [...g.reasons, "ai_candidate_only"];
-      await db.from("interactions").upsert({
+      const { error: interactionsErr } = await db.from("interactions").upsert({
         interaction_id: iid,
         channel: "call",
         contact_id: contact_id || null,
@@ -895,6 +895,37 @@ Deno.serve(async (req: Request) => {
         transcript_chars: n.transcript?.length || 0,
         is_shadow,
       }, { onConflict: "interaction_id" });
+
+      // Stopline 3: Fail closed on required writes — interactions row is a
+      // prerequisite for context-assembly contact resolution.
+      if (interactionsErr) {
+        console.error(JSON.stringify({
+          error: "interactions_write_failed",
+          interaction_id: iid,
+          run_id,
+          version: PROCESS_CALL_VERSION,
+          detail: interactionsErr.message,
+          code: interactionsErr.code,
+        }));
+        if (audit_id) {
+          await db.from("event_audit").update({
+            gate_status: "ERROR",
+            gate_reasons: ["interactions_write_failed", interactionsErr.message],
+          }).eq("id", audit_id);
+        }
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            run_id,
+            version: PROCESS_CALL_VERSION,
+            interaction_id: iid,
+            error_code: "interactions_write_failed",
+            error: interactionsErr.message,
+            ms: Date.now() - t0,
+          }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        );
+      }
 
       if (terminalEmptyTranscript) {
         // Terminalize legacy null-span pending rows for this interaction.
