@@ -118,6 +118,9 @@ const PROMPT_VERSION = WORLD_MODEL_FACTS_ENABLED ? "v1.12.0_world_model_facts" :
 const THRESHOLD_AUTO_ASSIGN = 0.75;
 const THRESHOLD_REVIEW = 0.50;
 
+// Defense-in-depth: closed-project hard filter (mirrors context-assembly VALID_PROJECT_STATUSES)
+const ATTRIBUTION_ELIGIBLE_STATUSES = new Set(["active", "warranty", "estimating"]);
+
 // ============================================================
 // TYPES
 // ============================================================
@@ -297,6 +300,19 @@ function withSanitizedTranscript(
       },
     },
     replaced: sanitized.replaced,
+  };
+}
+
+function filterClosedProjectCandidates(
+  ctx: ContextPackage,
+): { filtered: ContextPackage; removed_count: number } {
+  const candidates = Array.isArray(ctx.candidates) ? ctx.candidates : [];
+  const kept = candidates.filter((c) => ATTRIBUTION_ELIGIBLE_STATUSES.has(String(c.status || "").trim().toLowerCase()));
+  const removedCount = candidates.length - kept.length;
+  if (removedCount === 0) return { filtered: ctx, removed_count: 0 };
+  return {
+    filtered: { ...ctx, candidates: kept },
+    removed_count: removedCount,
   };
 }
 
@@ -909,7 +925,7 @@ Deno.serve(async (req: Request) => {
     });
   }
 
-  const context_package: ContextPackage | null = body.context_package || null;
+  let context_package: ContextPackage | null = body.context_package || null;
   const dry_run = body.dry_run === true;
 
   if (!context_package) {
@@ -925,6 +941,18 @@ Deno.serve(async (req: Request) => {
       status: 400,
       headers: { "Content-Type": "application/json" },
     });
+  }
+
+  // ── CLOSED-PROJECT HARD FILTER (pre-inference) ─────────────
+  // Defense-in-depth: remove candidates with ineligible project status
+  // before they reach the LLM. Context-assembly already filters at the
+  // DB level, but this catches leaks from direct calls or stale data.
+  const closedProjectFilter = filterClosedProjectCandidates(context_package);
+  context_package = closedProjectFilter.filtered;
+  if (closedProjectFilter.removed_count > 0) {
+    console.log(
+      `[ai-router] Closed-project hard filter removed ${closedProjectFilter.removed_count} candidates pre-inference`,
+    );
   }
 
   const homeownerOverrideEvaluation = evaluateHomeownerOverride(
@@ -1270,6 +1298,34 @@ Deno.serve(async (req: Request) => {
         confidence: 0,
         decision: "none",
         reasoning: `blocked_project: ${blockRow.reason}. Original decision overridden by blocklist.`,
+      };
+    }
+  }
+
+  // ========================================
+  // CLOSED-PROJECT HARD FILTER (post-inference)
+  // ========================================
+  // Defense-in-depth: verify the chosen project is still eligible after
+  // inference. Catches cases where the LLM picks a project_id that wasn't
+  // in the candidate list, or where project status changed between
+  // context-assembly and ai-router execution.
+  if (result.project_id && result.decision === "assign") {
+    const { data: chosenProject } = await db
+      .from("projects")
+      .select("status")
+      .eq("id", result.project_id)
+      .maybeSingle();
+
+    const chosenStatus = String(chosenProject?.status || "").trim().toLowerCase();
+    if (chosenProject && !ATTRIBUTION_ELIGIBLE_STATUSES.has(chosenStatus)) {
+      console.log(
+        `[ai-router] Closed-project hard filter (post-inference): project_id=${result.project_id} status=${chosenStatus} → downgraded to review`,
+      );
+      result = {
+        ...result,
+        decision: "review",
+        reasoning:
+          `${result.reasoning} closed_project_hard_filter: chosen project status=${chosenStatus} is not attribution-eligible.`,
       };
     }
   }

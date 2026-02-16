@@ -79,6 +79,9 @@ const SKIP_NON_ASSIGN_WRITES = (() => {
   return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
 })();
 
+// Defense-in-depth: closed-project hard filter (mirrors context-assembly VALID_PROJECT_STATUSES)
+const ATTRIBUTION_ELIGIBLE_STATUSES = new Set(["active", "warranty", "estimating"]);
+
 const VALID_CLAIM_TYPES = [
   "commitment",
   "deadline",
@@ -569,6 +572,39 @@ Deno.serve(async (req: Request) => {
       .single();
 
     const project_id = attribution?.applied_project_id || attribution?.project_id || null;
+
+    // ── CLOSED-PROJECT HARD FILTER ─────────────────────────────────
+    // Defense-in-depth: skip claim writes when the attributed project
+    // is closed/ineligible. Prevents journal contamination from stale
+    // attributions pointing at completed projects.
+    if (project_id && !dry_run) {
+      const { data: projectRow } = await db
+        .from("projects")
+        .select("status")
+        .eq("id", project_id)
+        .maybeSingle();
+
+      const projectStatus = String(projectRow?.status || "").trim().toLowerCase();
+      if (projectRow && !ATTRIBUTION_ELIGIBLE_STATUSES.has(projectStatus)) {
+        console.log(
+          `[journal-extract] Closed-project hard filter: skipping writes for span ${span_id}, project ${project_id} status=${projectStatus}`,
+        );
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            span_id,
+            interaction_id,
+            project_id,
+            skipped_closed_project: true,
+            project_status: projectStatus,
+            reason: "project_not_attribution_eligible",
+            function_version: FUNCTION_VERSION,
+            ms: Date.now() - t0,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+    }
 
     // ── IDEMPOTENCY GUARD ──────────────────────────────────────────
     // Check if completed claims already exist for this span_id.
