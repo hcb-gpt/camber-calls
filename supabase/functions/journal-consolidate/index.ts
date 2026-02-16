@@ -350,7 +350,7 @@ If there are no existing claims, mark everything as "new" with confidence 1.0.`;
             .single();
           if (targetClaim?.claim_confirmation_state === "confirmed") {
             console.warn(
-              `[journal-consolidate] Stopline 2: skipping AI supersede of human-confirmed claim ${j.related_claim_id} (attempted by new claim ${j.claim_id})`
+              `[journal-consolidate] Stopline 2: skipping AI supersede of human-confirmed claim ${j.related_claim_id} (attempted by new claim ${j.claim_id})`,
             );
             human_override_skips++;
             remained_new++;
@@ -375,7 +375,7 @@ If there are no existing claims, mark everything as "new" with confidence 1.0.`;
               .single();
             if (targetClaim?.claim_confirmation_state === "confirmed") {
               console.warn(
-                `[journal-consolidate] Stopline 2: skipping AI warrant_level update on human-confirmed claim ${j.related_claim_id}`
+                `[journal-consolidate] Stopline 2: skipping AI warrant_level update on human-confirmed claim ${j.related_claim_id}`,
               );
               human_override_skips++;
             } else {
