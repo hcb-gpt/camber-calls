@@ -1,5 +1,5 @@
 /**
- * segment-call Edge Function v2.5.2
+ * segment-call Edge Function v2.5.3
  * Multi-span producer: calls segment-llm, writes N conversation_spans, then chains each span to
  * context-assembly → ai-router.
  *
@@ -8,6 +8,10 @@
  * - Fail closed: if any required downstream step fails, return 500 + error_code=chain_failed.
  * - Downstream auth uses X-Edge-Secret (never service-role bearer).
  *
+ * v2.5.3:
+ * - Backfills parent interactions.transcript_chars when segment-call has non-empty transcript content.
+ * - Removes stale G4_EMPTY_TRANSCRIPT/terminal_empty_transcript reasons on parent interactions row.
+ *
  * Auth (internal gate; verify_jwt=false):
  * - X-Edge-Secret == EDGE_SHARED_SECRET, OR
  * - JWT + ALLOWED_EMAILS verified via auth.getUser() (debug path)
@@ -15,7 +19,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const SEGMENT_CALL_VERSION = "v2.5.2";
+const SEGMENT_CALL_VERSION = "v2.5.3";
 const MAX_SEGMENT_CHARS_HARD_LIMIT = 3000;
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
@@ -62,6 +66,11 @@ function sanitizeTranscriptForPipeline(text: string): TranscriptSanitizeResult {
     return " ";
   });
   return { text: sanitized, replaced };
+}
+
+function normalizeReasonCodes(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((r) => String(r || "").trim()).filter(Boolean);
 }
 
 function deterministicSegmentsForLength(
@@ -269,6 +278,9 @@ Deno.serve(async (req: Request) => {
 
     let spans_written = false;
     let spans_write_ok = false;
+    let parent_interaction_sync_applied = false;
+    let parent_interaction_sync_error: string | null = null;
+    let parent_interaction_transcript_chars: number | null = null;
 
     // ============================================================
     // 1) FETCH TRANSCRIPT
@@ -381,6 +393,70 @@ Deno.serve(async (req: Request) => {
     const segmenterWarnings: string[] = [];
     if (transcriptControlCharsSanitized > 0) {
       segmenterWarnings.push(`transcript_control_chars_sanitized_${transcriptControlCharsSanitized}`);
+    }
+
+    // ============================================================
+    // 3a) BACKFILL PARENT INTERACTION TRANSCRIPT METADATA
+    // Keeps interactions.transcript_chars/review_reasons in sync when
+    // segment-call receives transcript later than process-call.
+    // ============================================================
+    if (!dry_run && spanTranscript.length > 0) {
+      const transcriptChars = spanTranscript.length;
+      parent_interaction_transcript_chars = transcriptChars;
+
+      const { data: interactionRow, error: interactionFetchErr } = await db
+        .from("interactions")
+        .select("transcript_chars, review_reasons, needs_review")
+        .eq("interaction_id", interaction_id)
+        .maybeSingle();
+
+      if (interactionFetchErr) {
+        parent_interaction_sync_error = interactionFetchErr.message;
+        segmenterWarnings.push("interaction_parent_sync_fetch_failed");
+        await logDiagnostic("DB_WRITE_FAILED", {
+          reason: "interaction_parent_sync_fetch_failed",
+          interaction_id,
+          detail: interactionFetchErr.message,
+        }, "warning");
+      } else if (interactionRow) {
+        const currentChars = Number(interactionRow.transcript_chars || 0);
+        const existingReasons = normalizeReasonCodes(interactionRow.review_reasons);
+        const cleanedReasons = existingReasons.filter((r) =>
+          r !== "G4_EMPTY_TRANSCRIPT" && r !== "terminal_empty_transcript"
+        );
+        const removedEmptyTranscriptReason = existingReasons.length !== cleanedReasons.length;
+        const nextTranscriptChars = Math.max(currentChars, transcriptChars);
+        const shouldSync = nextTranscriptChars > currentChars || removedEmptyTranscriptReason;
+
+        if (shouldSync) {
+          const updatePayload: Record<string, unknown> = {
+            transcript_chars: nextTranscriptChars,
+          };
+          if (removedEmptyTranscriptReason) {
+            updatePayload.review_reasons = cleanedReasons;
+            if ((interactionRow.needs_review === true) && cleanedReasons.length === 0) {
+              updatePayload.needs_review = false;
+            }
+          }
+
+          const { error: interactionUpdateErr } = await db
+            .from("interactions")
+            .update(updatePayload)
+            .eq("interaction_id", interaction_id);
+
+          if (interactionUpdateErr) {
+            parent_interaction_sync_error = interactionUpdateErr.message;
+            segmenterWarnings.push("interaction_parent_sync_update_failed");
+            await logDiagnostic("DB_WRITE_FAILED", {
+              reason: "interaction_parent_sync_update_failed",
+              interaction_id,
+              detail: interactionUpdateErr.message,
+            }, "warning");
+          } else {
+            parent_interaction_sync_applied = true;
+          }
+        }
+      }
     }
 
     try {
@@ -760,6 +836,11 @@ Deno.serve(async (req: Request) => {
           span_count: spanCount,
           segmenter_version: segmenterVersion,
           segmenter_warnings: segmenterWarnings,
+          parent_interaction_sync: {
+            applied: parent_interaction_sync_applied,
+            transcript_chars: parent_interaction_transcript_chars,
+            error: parent_interaction_sync_error,
+          },
           chain: {
             attempted: true,
             auth_mode: "X-Edge-Secret",
@@ -819,6 +900,11 @@ Deno.serve(async (req: Request) => {
         span_count: spanCount,
         segmenter_version: segmenterVersion,
         segmenter_warnings: segmenterWarnings,
+        parent_interaction_sync: {
+          applied: parent_interaction_sync_applied,
+          transcript_chars: parent_interaction_transcript_chars,
+          error: parent_interaction_sync_error,
+        },
         chain: {
           attempted: true,
           auth_mode: "X-Edge-Secret",

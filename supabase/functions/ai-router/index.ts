@@ -1,13 +1,19 @@
 /**
- * ai-router Edge Function v1.13.0
+ * ai-router Edge Function v1.14.0
  * LLM-based project attribution for conversation spans
  *
- * @version 1.13.0
+ * @version 1.14.0
  * @date 2026-02-15
  * @purpose Use Claude Haiku to attribute spans to projects with anchored evidence
  *
  * CORE PRINCIPLE: span_attributions is the single source of truth.
  * NO writes to interactions.project_id from this path.
+ *
+ * v1.14.0 Changes (world model facts evidence; feature-flagged):
+ * - Adds optional world-model facts prompt surface per candidate project when WORLD_MODEL_FACTS_ENABLED=true.
+ * - Adds deterministic corroboration guardrail: world-model fact references can support assignment
+ *   only when references map to strong fact anchors and do not contradict transcript context.
+ * - Adds optional model output field `world_model_references[]` for citation of influencing facts.
  *
  * v1.13.0 Changes (deterministic homeowner override gate v1):
  * - Adds deterministic homeowner/client override in normal inference flow
@@ -81,11 +87,26 @@ import { applyCommonAliasCorroborationGuardrail, isCommonWordAlias } from "./ali
 import { applyBethanyRoadWinshipGuardrail } from "./bethany_winship_guardrail.ts";
 import { applyBizDevCommitmentGate } from "./bizdev_guardrails.ts";
 import { evaluateHomeownerOverride } from "./homeowner_override_gate.ts";
+import {
+  applyWorldModelReferenceGuardrail,
+  buildWorldModelFactsCandidateSummary,
+  filterProjectFactsForPrompt,
+  parseBoolEnv,
+  parseWorldModelReferences,
+  type ProjectFactsPack,
+  type WorldModelReference,
+} from "./world_model_facts.ts";
 
-const PROMPT_VERSION = "v1.11.0"; // prompt unchanged since v1.11.0
-const FUNCTION_VERSION = "v1.13.0";
+const PROMPT_VERSION_BASE = "v1.11.0";
+const FUNCTION_VERSION = "v1.14.0";
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
+const WORLD_MODEL_FACTS_ENABLED = parseBoolEnv(Deno.env.get("WORLD_MODEL_FACTS_ENABLED"), false);
+const WORLD_MODEL_FACTS_MAX_PER_PROJECT = Math.max(
+  0,
+  Math.min(50, Number.parseInt(Deno.env.get("WORLD_MODEL_FACTS_MAX_PER_PROJECT") || "20", 10) || 20),
+);
+const PROMPT_VERSION = WORLD_MODEL_FACTS_ENABLED ? "v1.12.0_world_model_facts" : PROMPT_VERSION_BASE;
 
 // Confidence thresholds
 const THRESHOLD_AUTO_ASSIGN = 0.75;
@@ -144,6 +165,7 @@ interface AttributionResult {
   anchors: Anchor[];
   suggested_aliases?: SuggestedAlias[];
   journal_references?: JournalReference[];
+  world_model_references?: WorldModelReference[];
 }
 
 interface JournalClaim {
@@ -226,6 +248,7 @@ interface ContextPackage {
   }>;
   place_mentions?: PlaceMention[];
   project_journal?: ProjectJournalState[];
+  project_facts?: ProjectFactsPack[];
   email_context?: EmailContextItem[];
   email_lookup_meta?: EmailLookupMeta | null;
 }
@@ -563,7 +586,7 @@ async function resolveReviewQueue(
 // PROMPT TEMPLATE
 // ============================================================
 
-const SYSTEM_PROMPT =
+const SYSTEM_PROMPT_BASE =
   `You are a project attribution specialist for HCB (Heartwood Custom Builders), a Georgia construction company.
 Given a phone call transcript segment and candidate projects, determine which project (if any) the conversation is about.
 
@@ -668,13 +691,46 @@ OUTPUT FORMAT (JSON only, no markdown):
 
 IMPORTANT: The "quote" field in anchors must contain text that ACTUALLY APPEARS in the transcript segment provided.`;
 
-function buildUserPrompt(ctx: ContextPackage): string {
+function buildSystemPrompt(worldModelFactsEnabled: boolean): string {
+  if (!worldModelFactsEnabled) return SYSTEM_PROMPT_BASE;
+  return `${SYSTEM_PROMPT_BASE}
+
+WORLD MODEL FACTS CONTEXT (when available):
+- World model facts are supplementary corroboration, not primary evidence.
+- Never assign a project using world model facts alone.
+- World model facts may influence assignment only when:
+  1) the cited facts include strong anchors (address/alias/client/rare-feature style evidence), and
+  2) they do not contradict transcript evidence.
+- If world model facts are weak-only or contradicted by transcript, choose decision="review" (or "none").
+
+OUTPUT EXTENSION (when world model facts are present):
+Add optional world_model_references array:
+  "world_model_references": [
+    {
+      "project_id": "<uuid>",
+      "fact_kind": "<fact_kind>",
+      "fact_as_of_at": "<ISO timestamp or null>",
+      "fact_excerpt": "<compact fact text used>",
+      "relevance": "<how this fact supports your decision>"
+    }
+  ]`;
+}
+
+function buildUserPrompt(
+  ctx: ContextPackage,
+  opts: {
+    worldModelFactsEnabled: boolean;
+    projectFacts: ProjectFactsPack[];
+  },
+): string {
   const journalByProject = new Map<string, ProjectJournalState>();
   if (ctx.project_journal && Array.isArray(ctx.project_journal)) {
     for (const pj of ctx.project_journal) {
       journalByProject.set(pj.project_id, pj);
     }
   }
+
+  const projectFacts = opts.worldModelFactsEnabled ? opts.projectFacts : [];
 
   const candidateList = ctx.candidates.map((c, i) => {
     const aliasMatchSummary = c.evidence.alias_matches.length > 0
@@ -704,6 +760,10 @@ function buildUserPrompt(ctx: ContextPackage): string {
       if (loopsSummary) journalSummary += `\n     Open loops: ${loopsSummary}`;
     }
 
+    const worldModelSummary = opts.worldModelFactsEnabled
+      ? buildWorldModelFactsCandidateSummary(c.project_id, projectFacts, 3)
+      : null;
+
     return `${i + 1}. ${c.project_name}
    - ID: ${c.project_id}
    - Address: ${c.address || "N/A"}
@@ -716,7 +776,7 @@ function buildUserPrompt(ctx: ContextPackage): string {
     }, sources=[${c.evidence.sources.join(",")}]
    - ${geoSummary}
    - ${aliasMatchSummary}
-${journalSummary}`;
+${journalSummary}${worldModelSummary ? `\n${worldModelSummary}` : ""}`;
   }).join("\n\n");
 
   const recentProjectList = ctx.contact.recent_projects.length > 0
@@ -790,10 +850,15 @@ ${candidateList || "No candidates found"}
 Analyze the transcript and determine which project (if any) this conversation is about.
 Consider the contact's fanout class — an anchored contact (fanout=1) on a single project is strong evidence; a floater (fanout>=5) provides no identity signal.
 Consider the journal context for each project — if the conversation topic matches known commitments, decisions, or open loops for a project, that strengthens the attribution.
-Treat email context as weak corroboration only; never use email context alone for decision="assign".
-Treat geo context as weak corroboration only; use it as a tie-breaker when transcript evidence is otherwise close.
-If journal claims influenced your decision, include them in journal_references.
-Remember: You MUST include an exact quote from the transcript to use decision="assign".`;
+  Treat email context as weak corroboration only; never use email context alone for decision="assign".
+  Treat geo context as weak corroboration only; use it as a tie-breaker when transcript evidence is otherwise close.
+  If journal claims influenced your decision, include them in journal_references.
+  ${
+    opts.worldModelFactsEnabled
+      ? "If world model facts influenced your decision, include them in world_model_references."
+      : ""
+  }
+  Remember: You MUST include an exact quote from the transcript to use decision="assign".`;
 }
 
 // ============================================================
@@ -873,10 +938,33 @@ Deno.serve(async (req: Request) => {
   let bizdev_commitment_to_start = false;
   let bizdev_commitment_tags: string[] = [];
   let bizdev_without_commitment = false;
+  let world_model_references: WorldModelReference[] = [];
+  let worldModelGuardrailDowngraded = false;
+  let worldModelGuardrailReason: string | null = null;
+  let worldModelStrongAnchorPresent = false;
+  let worldModelContradictionFound = false;
   let strictSanitizationRetryUsed = false;
   let transcriptControlCharsSanitized = 0;
   let homeownerDeterministicGateApplied = false;
   let homeownerDeterministicFallbackApplied = false;
+
+  const currentEvidenceEventIds = Array.from(
+    new Set(
+      [
+        ...(Array.isArray(context_package.meta?.current_evidence_event_ids)
+          ? context_package.meta.current_evidence_event_ids
+          : []),
+        ...(Array.isArray(context_package.meta?.evidence_event_ids) ? context_package.meta.evidence_event_ids : []),
+      ].map((id: unknown) => String(id || "").trim()).filter(Boolean),
+    ),
+  );
+  const projectFactsForPrompt = WORLD_MODEL_FACTS_ENABLED
+    ? filterProjectFactsForPrompt(context_package.project_facts, {
+      interaction_id: context_package.meta?.interaction_id || "",
+      current_evidence_event_ids: currentEvidenceEventIds,
+      max_per_project: WORLD_MODEL_FACTS_MAX_PER_PROJECT,
+    })
+    : [];
 
   try {
     const anthropic = new Anthropic({
@@ -889,9 +977,15 @@ Deno.serve(async (req: Request) => {
         model: MODEL_ID,
         max_tokens: MAX_TOKENS,
         messages: [
-          { role: "user", content: buildUserPrompt(contextPackageForPrompt) },
+          {
+            role: "user",
+            content: buildUserPrompt(contextPackageForPrompt, {
+              worldModelFactsEnabled: WORLD_MODEL_FACTS_ENABLED,
+              projectFacts: projectFactsForPrompt,
+            }),
+          },
         ],
-        system: SYSTEM_PROMPT,
+        system: buildSystemPrompt(WORLD_MODEL_FACTS_ENABLED),
       });
       const inferenceElapsedMs = Date.now() - inferenceStart;
       const tokensUsed = (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0);
@@ -945,6 +1039,7 @@ Deno.serve(async (req: Request) => {
     const journal_references: JournalReference[] = Array.isArray(parsed.journal_references)
       ? parsed.journal_references
       : [];
+    world_model_references = WORLD_MODEL_FACTS_ENABLED ? parseWorldModelReferences(parsed.world_model_references) : [];
 
     let decision = parsed.decision as "assign" | "review" | "none";
     let reasoning = parsed.reasoning || "No reasoning provided";
@@ -1044,6 +1139,32 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    if (WORLD_MODEL_FACTS_ENABLED && world_model_references.length > 0) {
+      const worldModelGuardrail = applyWorldModelReferenceGuardrail({
+        decision,
+        project_id,
+        transcript: spanTranscript,
+        world_model_references,
+        project_facts: projectFactsForPrompt,
+      });
+      world_model_references = worldModelGuardrail.world_model_references;
+      worldModelGuardrailDowngraded = worldModelGuardrail.downgraded;
+      worldModelGuardrailReason = worldModelGuardrail.reason_code;
+      worldModelStrongAnchorPresent = worldModelGuardrail.strong_anchor_present;
+      worldModelContradictionFound = worldModelGuardrail.contradiction_found;
+      if (worldModelGuardrail.decision !== decision) {
+        decision = worldModelGuardrail.decision;
+      }
+      if (worldModelGuardrail.downgraded) {
+        reasoning = `${reasoning} world_model_guardrail:${worldModelGuardrail.reason_code || "downgraded_to_review"}.`;
+        console.log(
+          `[ai-router] World-model guardrail downgraded assignment: reason=${
+            worldModelGuardrail.reason_code || "unknown"
+          }`,
+        );
+      }
+    }
+
     if (homeownerOverrideStrongAnchor && homeownerOverrideProjectId.length > 0) {
       const shouldForceHomeownerAssign = decision !== "assign" ||
         project_id !== homeownerOverrideProjectId ||
@@ -1079,6 +1200,7 @@ Deno.serve(async (req: Request) => {
       anchors: validatedAnchors,
       suggested_aliases: suggested_aliases.length > 0 ? suggested_aliases : undefined,
       journal_references: journal_references.length > 0 ? journal_references : undefined,
+      world_model_references: world_model_references.length > 0 ? world_model_references : undefined,
     };
   } catch (e: any) {
     const errorText = String(e?.message || "unknown_error").replace(/\s+/g, " ").slice(0, 220);
@@ -1289,6 +1411,19 @@ Deno.serve(async (req: Request) => {
           evidence_tags: c.evidence?.sources || [],
         })) || [],
         anchors: result.anchors,
+        ...(WORLD_MODEL_FACTS_ENABLED
+          ? {
+            world_model_references: result.world_model_references || [],
+            world_model_guardrail: {
+              enabled: WORLD_MODEL_FACTS_ENABLED,
+              downgraded: worldModelGuardrailDowngraded,
+              reason: worldModelGuardrailReason,
+              strong_anchor_present: worldModelStrongAnchorPresent,
+              contradiction_found: worldModelContradictionFound,
+              project_facts_available: projectFactsForPrompt.some((pack) => pack.facts.length > 0),
+            },
+          }
+          : {}),
         alias_guardrails: {
           common_alias_unconfirmed,
           flagged_alias_terms: common_alias_terms,
@@ -1407,6 +1542,11 @@ Deno.serve(async (req: Request) => {
       reasoning: result.reasoning,
       anchors: result.anchors,
       journal_references: result.journal_references,
+      ...(WORLD_MODEL_FACTS_ENABLED
+        ? {
+          world_model_references: result.world_model_references || [],
+        }
+        : {}),
       suggested_aliases: result.suggested_aliases,
       gatekeeper: {
         applied,
@@ -1419,6 +1559,19 @@ Deno.serve(async (req: Request) => {
         homeowner_deterministic_gate_applied: homeownerDeterministicGateApplied,
         homeowner_deterministic_fallback_applied: homeownerDeterministicFallbackApplied,
         homeowner_override_skip_reason: homeownerOverrideSkipReason,
+        ...(WORLD_MODEL_FACTS_ENABLED
+          ? {
+            world_model: {
+              enabled: WORLD_MODEL_FACTS_ENABLED,
+              references_count: world_model_references.length,
+              downgraded: worldModelGuardrailDowngraded,
+              reason: worldModelGuardrailReason,
+              strong_anchor_present: worldModelStrongAnchorPresent,
+              contradiction_found: worldModelContradictionFound,
+              project_facts_available: projectFactsForPrompt.some((pack) => pack.facts.length > 0),
+            },
+          }
+          : {}),
         sanitization: {
           control_chars_sanitized: transcriptControlCharsSanitized,
           strict_retry_used: strictSanitizationRetryUsed,
