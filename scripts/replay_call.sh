@@ -17,6 +17,8 @@
 #   SUPABASE_URL
 #   SUPABASE_SERVICE_ROLE_KEY
 #   EDGE_SHARED_SECRET
+#   ORIGIN_SESSION (required for write-mode)
+#   CLAIM_RECEIPT (required for write-mode)
 #
 # Exit codes:
 #   0 = PASS
@@ -24,6 +26,10 @@
 #   2 = ERROR (config/network)
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/claim_guard.sh"
 
 # ============================================================
 # DEFAULTS
@@ -35,6 +41,8 @@ DO_REROUTE=false
 INTERACTION_ID=""
 MAX_RETRIES=3
 RETRY_DELAY=2
+RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+WRITE_MODE=false
 
 # ============================================================
 # PARSE ARGS
@@ -87,6 +95,9 @@ if [[ "$DO_RESEED" == "false" && "$DO_REROUTE" == "false" ]]; then
   DO_RESEED=true
   DO_REROUTE=true
 fi
+if [[ "$DO_RESEED" == "true" || "$DO_REROUTE" == "true" ]]; then
+  WRITE_MODE=true
+fi
 
 # ============================================================
 # VALIDATION
@@ -102,6 +113,10 @@ for var in SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY EDGE_SHARED_SECRET; do
     exit 2
   fi
 done
+
+if [[ "$WRITE_MODE" == "true" ]]; then
+  require_claim_context "replay_call.sh" || exit 2
+fi
 
 # ============================================================
 # HELPERS
@@ -133,6 +148,8 @@ curl_with_retry() {
       -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
       -H "X-Edge-Secret: ${EDGE_SHARED_SECRET}" \
       -H "X-Source: admin-reseed" \
+      -H "X-Origin-Session: ${ORIGIN_SESSION:-unknown}" \
+      -H "X-Claim-Receipt: ${CLAIM_RECEIPT:-unclaimed}" \
       -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
       -d "$data" 2>/dev/null || echo -e "\n000")
 
@@ -161,15 +178,19 @@ curl_with_retry() {
 # ARTIFACT SETUP
 # ============================================================
 ARTIFACT_DIR="/tmp/proofs/${INTERACTION_ID}"
-if [[ "$SAVE_ARTIFACTS" == "true" ]]; then
+if [[ "$SAVE_ARTIFACTS" == "true" || "$WRITE_MODE" == "true" ]]; then
+  ARTIFACT_DIR="/tmp/proofs/replay_call/${INTERACTION_ID}/${RUN_STAMP}"
   mkdir -p "$ARTIFACT_DIR"
+  if [[ "$WRITE_MODE" == "true" ]]; then
+    write_claim_artifact "$ARTIFACT_DIR" "replay_call.sh" "reseed_reroute"
+  fi
   log "Artifacts will be saved to: $ARTIFACT_DIR"
 fi
 
 # ============================================================
 # STEP 1: ADMIN-RESEED (if requested)
 # ============================================================
-IDEMPOTENCY_KEY="replay-$(date -u +%Y%m%dT%H%M%S)-$$"
+IDEMPOTENCY_KEY="replay-${ORIGIN_SESSION:-unknown}-$(date -u +%Y%m%dT%H%M%S)-$$"
 
 if [[ "$DO_RESEED" == "true" || "$DO_REROUTE" == "true" ]]; then
   # Determine mode
@@ -188,7 +209,7 @@ if [[ "$DO_RESEED" == "true" || "$DO_REROUTE" == "true" ]]; then
     "{\"interaction_id\":\"${INTERACTION_ID}\",\"mode\":\"${MODE}\",\"idempotency_key\":\"${IDEMPOTENCY_KEY}\",\"reason\":\"replay_call.sh\"}" \
     180)
 
-  if [[ "$SAVE_ARTIFACTS" == "true" ]]; then
+  if [[ "$SAVE_ARTIFACTS" == "true" || "$WRITE_MODE" == "true" ]]; then
     echo "$RESEED_RESULT" > "$ARTIFACT_DIR/reseed_response.json"
   fi
 
@@ -216,7 +237,7 @@ SCOREBOARD=$(curl_with_retry \
   "{\"p_interaction_id\":\"${INTERACTION_ID}\"}" \
   30)
 
-if [[ "$SAVE_ARTIFACTS" == "true" ]]; then
+if [[ "$SAVE_ARTIFACTS" == "true" || "$WRITE_MODE" == "true" ]]; then
   echo "$SCOREBOARD" > "$ARTIFACT_DIR/scoreboard.json"
 fi
 
@@ -236,7 +257,7 @@ SCOREBOARD_LINE="$STATUS | $INTERACTION_ID | gen=$GENERATION spans=$SPANS_ACTIVE
 
 log_always "$SCOREBOARD_LINE"
 
-if [[ "$SAVE_ARTIFACTS" == "true" ]]; then
+if [[ "$SAVE_ARTIFACTS" == "true" || "$WRITE_MODE" == "true" ]]; then
   log_always "Artifacts: $ARTIFACT_DIR/"
 fi
 
