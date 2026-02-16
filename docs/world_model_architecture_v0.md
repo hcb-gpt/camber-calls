@@ -1,6 +1,6 @@
 # World Model Architecture v0 (project_facts + evidence_events)
 
-**Status:** DRAFT — pending STRAT-2 “world-model non‑negotiables”  
+**Status:** DRAFT — aligned to STRAT-2 non‑negotiables v0 (2026-02-16); gaps G1–G3 tracked below  
 **Owner:** DATA-3  
 **Date:** 2026-02-16  
 **Scope:** Design only (no migrations applied in this doc)
@@ -95,10 +95,10 @@ We model two time axes:
 
 ### 2.2 Retrieval modes (important)
 
-We should support two query modes (both are useful):
+We should support two query modes — but **KNOWN_AS_OF is the default** when building context packs.
 
 **Mode A: TRUTH_AS_OF(t)**  
-Use when building the best world model today about the past.
+Use when building the best world model today about the past (GT evaluation + manual analysis only).
 - Filter: `as_of_at <= t`
 - Ignore: `observed_at`
 
@@ -106,8 +106,10 @@ Use when building the best world model today about the past.
 Use when evaluating historical performance or generating context that must not use future knowledge.
 - Filter: `as_of_at <= t AND observed_at <= t`
 
-**Operational note:**  
-For the *same call* we are processing at `t_call`, avoid circularity by excluding facts whose `evidence_event_id` (or `interaction_id`) matches the current call in the context pack.
+**Mandatory operational constraints (STRAT-2 N2):**
+- **Default:** `context-assembly` MUST use **KNOWN_AS_OF** when building context packs.
+- **Same-call exclusion:** exclude any facts whose `evidence_event_id` or `interaction_id` matches the current call (mandatory, not optional).
+- Mode A (TRUTH_AS_OF) is only allowed for GT evaluation and manual analysis.
 
 ---
 
@@ -115,7 +117,7 @@ For the *same call* we are processing at `t_call`, avoid circularity by excludin
 
 ### 3.1 Pointer requirements by fact class
 
-We explicitly tier fact types by required evidence:
+We explicitly tier fact types by required evidence. **These are enforcement requirements (STRAT-2 N3), not conventions.**
 
 1) **Execution-critical** (permits approved, payment received, schedule commitment, inspection passed)
    - Must include `evidence_event_id`
@@ -178,6 +180,9 @@ Until we add explicit `supersedes_fact_id`, use a **soft supersession** conventi
 - Newer fact wins for the same `(project_id, fact_kind, fact_payload.fact_key)` if present.
 - Encode a stable `fact_key` inside `fact_payload` for facts that update (e.g., `fact_key='permit_status'`).
 
+**Hard gate before production reads (STRAT-2 N4):**
+- Soft supersession is acceptable for v0 seeding, but **before `context-assembly` reads `project_facts` in production**, we must define an explicit supersession policy (e.g., `supersedes_fact_id` or an equivalent conflict-resolution mechanism).
+
 ---
 
 ## 5) Retrieval Integration Sketch (v0)
@@ -203,6 +208,10 @@ Suggested SQL shape (not executed here):
 - Filter by time mode (Section 2.2)
 - Optional lookback: `as_of_at >= (t_call - interval '90 days')` for high-churn kinds
 - Order: `as_of_at DESC, observed_at DESC`
+
+**Retrieval stance (STRAT-2 D3):**
+- Retrieval is **key-based selection** for 1–5 candidate projects (project_id + fact_kind + recency).
+- Defer FTS/trgm over `fact_payload` until proven need.
 
 ### 5.2 Where to plug in
 
@@ -337,7 +346,43 @@ These are proof queries to validate the design once we start writing facts:
 
 ## 10) Pending STRAT-2 non‑negotiables (explicit placeholder)
 
-- Whether STRAT-2 wants typed fact storage immediately (value_* columns) vs JSON-first.
-- Whether “project_documents” must exist as a table vs evidence_events + linking facts.
-- Whether retrieval must be FTS-first vs key-based selection.
+This spec is aligned to STRAT-2 “world model” non‑negotiables v0 (2026-02-16).
 
+### Decisions (D1–D3)
+- **D1 JSON-first:** no typed columns yet; prefer generated columns + GIN only when needed.
+- **D2 No new tables:** use `evidence_events` + linking facts (`fact_kind='document.ref'`), no `project_documents` table in v0.
+- **D3 Key-based retrieval:** for 1–5 candidate projects by kind/recency; defer FTS/trgm until proven need.
+
+### Hard constraints (N1–N4)
+- **N1 Stopline alignment is mandatory:** facts must not create any path to write `interactions.project_id`; must not bypass attribution_lock monotonicity; fact-write failures must fail-closed (no silent 200).
+- **N2 Anti-leakage default:** KNOWN_AS_OF must be default in context pack assembly; same-call exclusion is mandatory.
+- **N3 Provenance tier enforcement:** execution-critical facts require `evidence_event_id`; planning-level facts require `evidence_event_id` OR `interaction_id`; reject orphan facts.
+- **N4 Supersession clarity before prod reads:** soft supersession OK for seeding; explicit supersession required before production context packs read `project_facts`.
+
+## 11) Gaps (G1–G3) — required doc sections
+
+These gaps must be explicitly owned/closed before the spec is treated as “merge-ready” for implementation.
+
+### G1 Auth model for fact writes (TBD, must be explicit)
+
+v0 proposal (doc-only):
+- **Write entrypoints:** a single RPC (e.g., `write_project_facts_v0`) invoked only by internal Edge Functions (service role).
+- **Auth pattern:** internal `X-Edge-Secret` gate at the function boundary + service role DB key; no end-user JWT writes.
+- **RLS stance:** keep `project_facts` service-role only in v0; formalize RLS later when there is a UI/editor.
+- **Stopline enforcement location:** inside the write RPC/function (reject any attempt to touch Stopline 1/2 surfaces; fail closed on write error).
+
+### G2 Deletion / retraction policy (TBD, append-only preferred)
+
+v0 proposal:
+- **No hard deletes** for facts once written.
+- Use an append-only **retraction** pattern (a new fact that references the prior fact id) and a “current facts” read view that excludes retracted rows.
+- If we need soft deletion later, add explicit lifecycle fields; do not rely on ad-hoc deletes.
+
+### G3 GT correction interaction (span_attributions ↔ project_facts)
+
+v0 stance:
+- GT corrections (via `apply_gt_correction` / human overrides in `span_attributions`) remain the source of truth for attribution evaluation.
+- `project_facts` seeding should not be automatically mutated by GT corrections until there is a defined, audited promotion policy for facts.
+
+Future integration (post-v0):
+- GT corrections can trigger re-extraction / consolidation that yields updated facts, but only through the same stopline-safe write path defined in G1.
