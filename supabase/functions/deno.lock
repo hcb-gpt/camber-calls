@@ -1,5 +1,5 @@
 {
-  "version": "5",
+  "version": "4",
   "specifiers": {
     "jsr:@supabase/functions-js@*": "2.95.3",
     "npm:openai@^4.52.5": "4.104.0"
