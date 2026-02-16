@@ -1,0 +1,225 @@
+{
+  "generated_on": "2026-02-15T17:11:19.417027Z",
+  "scope": "Recommended Gandalf public.projects fields (lean sync target from Camber SSOT)",
+  "existing_projects_columns_recommended": [
+    {
+      "column": "id",
+      "type": "uuid",
+      "camber_path": "project.project_id",
+      "recommended": "keep",
+      "notes": "Primary key."
+    },
+    {
+      "column": "name",
+      "type": "text",
+      "camber_path": "project.project_name",
+      "recommended": "keep",
+      "notes": "Human project name."
+    },
+    {
+      "column": "aliases",
+      "type": "text[]",
+      "camber_path": "project.project_aliases[]",
+      "recommended": "keep",
+      "notes": "Alt names for matching/dedupe."
+    },
+    {
+      "column": "address",
+      "type": "text",
+      "camber_path": "project.site.address.full",
+      "recommended": "keep_optional",
+      "notes": "Legacy single-line address; prefer street/city/state/zip fields below."
+    },
+    {
+      "column": "street",
+      "type": "text",
+      "camber_path": "project.site.address.street",
+      "recommended": "keep",
+      "notes": "Site street address."
+    },
+    {
+      "column": "city",
+      "type": "text",
+      "camber_path": "project.site.address.city",
+      "recommended": "keep",
+      "notes": "Site city."
+    },
+    {
+      "column": "state",
+      "type": "text",
+      "camber_path": "project.site.address.state",
+      "recommended": "keep",
+      "notes": "Site state."
+    },
+    {
+      "column": "zip",
+      "type": "text",
+      "camber_path": "project.site.address.postal_code",
+      "recommended": "keep",
+      "notes": "Site postal code."
+    },
+    {
+      "column": "county",
+      "type": "text",
+      "camber_path": "project.jurisdiction.county",
+      "recommended": "keep",
+      "notes": "County for jurisdiction/reporting."
+    },
+    {
+      "column": "permit_jurisdiction",
+      "type": "text",
+      "camber_path": "project.jurisdiction.name",
+      "recommended": "keep",
+      "notes": "Permit authority / municipality (e.g., North High Shoals)."
+    },
+    {
+      "column": "permit_authority_type",
+      "type": "text",
+      "camber_path": "project.jurisdiction.authority_type",
+      "recommended": "keep_optional",
+      "notes": "Town/county/city/etc."
+    },
+    {
+      "column": "parcel_id",
+      "type": "text",
+      "camber_path": "project.site.tax_parcel_id",
+      "recommended": "keep",
+      "notes": "Tax parcel ID (stable join key)."
+    },
+    {
+      "column": "map_id",
+      "type": "text",
+      "camber_path": "project.site.map_id",
+      "recommended": "keep_optional",
+      "notes": "GIS/map reference id (if used)."
+    },
+    {
+      "column": "zoning",
+      "type": "text",
+      "camber_path": "project.site.zoning_district",
+      "recommended": "keep_optional",
+      "notes": "Zoning district."
+    },
+    {
+      "column": "subdivision_name",
+      "type": "text",
+      "camber_path": "project.site.subdivision_name",
+      "recommended": "keep_optional",
+      "notes": "Subdivision / neighborhood name."
+    },
+    {
+      "column": "lot_number",
+      "type": "text",
+      "camber_path": "project.site.lot_number",
+      "recommended": "keep_optional",
+      "notes": "Lot number within subdivision."
+    },
+    {
+      "column": "water_source",
+      "type": "text",
+      "camber_path": "project.utilities.water_source",
+      "recommended": "keep_optional",
+      "notes": "Public / Well / Unknown."
+    },
+    {
+      "column": "sewer_type",
+      "type": "text",
+      "camber_path": "project.utilities.sewer_type",
+      "recommended": "keep_optional",
+      "notes": "Public / Septic / Unknown."
+    },
+    {
+      "column": "has_pool",
+      "type": "boolean",
+      "camber_path": "project.building.has_pool",
+      "recommended": "keep_optional",
+      "notes": "Project has pool planned/installed."
+    },
+    {
+      "column": "acreage",
+      "type": "numeric",
+      "camber_path": "project.site.total_acreage",
+      "recommended": "keep_optional",
+      "notes": "Total acreage."
+    },
+    {
+      "column": "buildertrend_id",
+      "type": "text",
+      "camber_path": "project.integrations.buildertrend_id",
+      "recommended": "keep_optional",
+      "notes": "External system ID."
+    },
+    {
+      "column": "status",
+      "type": "text",
+      "camber_path": "project.lifecycle.status",
+      "recommended": "keep_optional",
+      "notes": "active/closed/etc."
+    },
+    {
+      "column": "job_type",
+      "type": "text",
+      "camber_path": "project.job_type",
+      "recommended": "keep_optional",
+      "notes": "New build / remodel / etc (if standardized)."
+    },
+    {
+      "column": "phase",
+      "type": "text",
+      "camber_path": "project.lifecycle.phase",
+      "recommended": "keep_optional",
+      "notes": "High-level construction phase tag."
+    },
+    {
+      "column": "start_date",
+      "type": "date",
+      "camber_path": "project.lifecycle.start_date",
+      "recommended": "keep_optional",
+      "notes": "Project start date."
+    },
+    {
+      "column": "target_completion_date",
+      "type": "date",
+      "camber_path": "project.lifecycle.target_completion_date",
+      "recommended": "keep_optional",
+      "notes": "Target completion date."
+    },
+    {
+      "column": "contract_value",
+      "type": "numeric",
+      "camber_path": "project.financial.contract_value",
+      "recommended": "keep_optional",
+      "notes": "Contract value if tracked at project level."
+    },
+    {
+      "column": "permit_notes",
+      "type": "text",
+      "camber_path": "project.permits.notes",
+      "recommended": "keep_optional",
+      "notes": "High-level notes, not per-permit details."
+    }
+  ],
+  "proposed_projects_columns_to_consider": [
+    {
+      "column": "floodplain_status",
+      "type": "text",
+      "camber_path": "project.site.floodplain_status",
+      "recommended": "add_optional",
+      "notes": "Enum suggested: yes/no/unknown. Useful for compliance and early risk flags."
+    },
+    {
+      "column": "within_200ft_waterbody",
+      "type": "text",
+      "camber_path": "project.site.within_200ft_waterbody",
+      "recommended": "add_optional",
+      "notes": "Enum suggested: yes/no/na/unknown. Captured on some municipal applications; keep if you want quick filtering."
+    },
+    {
+      "column": "zone",
+      "type": "text",
+      "camber_path": "project.site.zone",
+      "recommended": "add_optional_if_distinct",
+      "notes": "Only add if your jurisdictions use 'Zone' separately from zoning_district; otherwise map into zoning."
+    }
+  ]
+}

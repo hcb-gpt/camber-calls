@@ -21,6 +21,21 @@ Deno.test("resolveCallPartyPhones inbound uses to=owner and from=other_party", (
   assertEquals(result.otherPartyPhone, "+15551230001");
 });
 
+Deno.test("resolveCallPartyPhones inbound uses normalized phones when present", () => {
+  const result = resolveCallPartyPhones({
+    direction: "inbound",
+    from_phone_norm: "+15551230001",
+    to_phone_norm: "+15551239999",
+    // Raw fields can be absent in some webhook payloads.
+    from_phone: null,
+    to_phone: null,
+  });
+
+  assertEquals(result.direction, "inbound");
+  assertEquals(result.ownerPhone, "+15551239999");
+  assertEquals(result.otherPartyPhone, "+15551230001");
+});
+
 Deno.test("resolveCallPartyPhones outbound uses from=owner and to=other_party", () => {
   const result = resolveCallPartyPhones({
     direction: "outbound",
@@ -46,6 +61,19 @@ Deno.test("resolveCallPartyPhones respects explicit owner/other_party fields", (
   assertEquals(result.otherPartyPhone, "+15550000002");
 });
 
+Deno.test("resolveCallPartyPhones prefers normalized values over raw values", () => {
+  const result = resolveCallPartyPhones({
+    direction: "inbound",
+    from_phone_norm: "+15550000001",
+    to_phone_norm: "+15550000002",
+    from_phone: "+16660000001",
+    to_phone: "+16660000002",
+  });
+
+  assertEquals(result.ownerPhone, "+15550000002");
+  assertEquals(result.otherPartyPhone, "+15550000001");
+});
+
 Deno.test("resolveCallPartyPhones unknown direction keeps historical fallback", () => {
   const result = resolveCallPartyPhones({
     direction: "sideways",
@@ -66,6 +94,26 @@ Deno.test("resolveCallPartyPhones falls back to contact_phone only when needed",
 
   assertEquals(result.ownerPhone, null);
   assertEquals(result.otherPartyPhone, "+15554443333");
+});
+
+Deno.test("resolveCallPartyPhones inbound does not swap parties when only from_phone is present", () => {
+  const result = resolveCallPartyPhones({
+    direction: "inbound",
+    from_phone: "+15551230001",
+  });
+
+  assertEquals(result.ownerPhone, null);
+  assertEquals(result.otherPartyPhone, "+15551230001");
+});
+
+Deno.test("resolveCallPartyPhones outbound does not swap parties when only to_phone is present", () => {
+  const result = resolveCallPartyPhones({
+    direction: "outbound",
+    to_phone: "+15551230001",
+  });
+
+  assertEquals(result.ownerPhone, null);
+  assertEquals(result.otherPartyPhone, "+15551230001");
 });
 
 Deno.test("resolveCallPartyPhones 20-row mixed direction matrix", () => {
