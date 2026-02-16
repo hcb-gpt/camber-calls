@@ -44,3 +44,6 @@ verify_jwt = false
 
 [functions.journal-embed-backfill]
 verify_jwt = false
+
+[functions.gt-apply]
+verify_jwt = false
