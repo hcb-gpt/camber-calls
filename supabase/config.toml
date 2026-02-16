@@ -9,6 +9,9 @@ verify_jwt = false
 [functions.segment-llm]
 verify_jwt = false
 
+[functions.journal-extract]
+verify_jwt = false
+
 [functions.admin-reseed]
 verify_jwt = false
 
