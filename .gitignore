@@ -9,6 +9,7 @@
 
 # Supabase
 .supabase/
+supabase/functions/deno.lock
 
 # IDE
 .idea/
