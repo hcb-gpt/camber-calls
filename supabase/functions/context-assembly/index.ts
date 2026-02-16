@@ -463,6 +463,22 @@ interface ProjectJournalState {
   last_journal_activity: string | null; // Timestamp of most recent claim
 }
 
+// v2.2.0: World model facts (time-aware, provenance-backed)
+interface ProjectFactRow {
+  project_id: string;
+  as_of_at: string;
+  observed_at: string;
+  fact_kind: string;
+  fact_payload: any;
+  evidence_event_id: string | null;
+  interaction_id: string | null;
+}
+
+interface ProjectFactsPack {
+  project_id: string;
+  facts: ProjectFactRow[];
+}
+
 interface EmailContextItem {
   message_id: string;
   thread_id: string | null;
@@ -527,6 +543,7 @@ interface ContextPackage {
   candidates: Candidate[];
   place_mentions: PlaceMention[];
   project_journal: ProjectJournalState[]; // v1.4.0: journal-derived state per candidate project
+  project_facts?: ProjectFactsPack[]; // v2.2.0: optional world model facts per candidate project
   email_context: EmailContextItem[];
   email_lookup_meta: EmailLookupMeta | null;
   continuity_links: ContinuityLink[];
@@ -574,6 +591,19 @@ function normalizeTradeLabel(value: string | null | undefined): string {
 function clamp(num: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, num));
 }
+
+function parseBoolEnv(key: string, defaultValue = false): boolean {
+  const raw = (Deno.env.get(key) || "").trim().toLowerCase();
+  if (!raw) return defaultValue;
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "y";
+}
+
+const WORLD_MODEL_FACTS_ENABLED = parseBoolEnv("WORLD_MODEL_FACTS_ENABLED", false);
+const WORLD_MODEL_FACTS_MAX_PER_PROJECT = clamp(
+  Number.parseInt(Deno.env.get("WORLD_MODEL_FACTS_MAX_PER_PROJECT") || "20", 10) || 20,
+  0,
+  50,
+);
 
 function tokenizeTextForOverlap(text: string): string[] {
   return (text || "")
@@ -2992,6 +3022,78 @@ Deno.serve(async (req: Request) => {
     const finalProjectJournal = project_journal.filter((pj) => finalCandidateIdSet.has(pj.project_id));
 
     // ========================================
+    // SOURCE 14: PROJECT_FACTS (World model) (v2.2.0; feature-flagged)
+    // Time-aware, provenance-backed facts per candidate project.
+    //
+    // Hard constraints:
+    // - Default to KNOWN_AS_OF (as_of_at <= t_call AND observed_at <= t_call)
+    // - Same-call exclusion (drop any facts sourced from this interaction)
+    // ========================================
+    let project_facts: ProjectFactsPack[] | undefined;
+    if (WORLD_MODEL_FACTS_ENABLED && finalCandidates.length > 0 && event_at_utc) {
+      try {
+        // Best-effort: gather evidence_event_id(s) for the current call so we can exclude them too.
+        const { data: evidenceRows } = await db
+          .from("evidence_events")
+          .select("evidence_event_id")
+          .eq("source_type", "call")
+          .eq("source_id", interaction_id);
+        const currentEvidenceEventIds = new Set(
+          (evidenceRows || []).map((r: any) => String(r.evidence_event_id || "")).filter(Boolean),
+        );
+
+        const candidateProjectIds = finalCandidates.map((c) => c.project_id);
+        const maxRows = WORLD_MODEL_FACTS_MAX_PER_PROJECT * candidateProjectIds.length * 3;
+
+        const { data: factRows, error: factsErr } = await db
+          .from("project_facts")
+          .select("project_id, as_of_at, observed_at, fact_kind, fact_payload, evidence_event_id, interaction_id")
+          .in("project_id", candidateProjectIds)
+          .lte("as_of_at", event_at_utc)
+          .lte("observed_at", event_at_utc)
+          .order("as_of_at", { ascending: false })
+          .order("observed_at", { ascending: false })
+          .limit(maxRows);
+
+        if (factsErr) {
+          warnings.push("project_facts_fetch_failed");
+        } else if (factRows && factRows.length > 0) {
+          const byProject = new Map<string, ProjectFactRow[]>();
+          for (const row of factRows as any[]) {
+            const rowInteractionId = row.interaction_id ? String(row.interaction_id) : null;
+            const rowEvidenceEventId = row.evidence_event_id ? String(row.evidence_event_id) : null;
+
+            // Mandatory same-call exclusion (interaction_id OR evidence_event_id match).
+            if (rowInteractionId && rowInteractionId === interaction_id) continue;
+            if (rowEvidenceEventId && currentEvidenceEventIds.has(rowEvidenceEventId)) continue;
+
+            const pid = String(row.project_id);
+            if (!byProject.has(pid)) byProject.set(pid, []);
+            byProject.get(pid)!.push({
+              project_id: pid,
+              as_of_at: String(row.as_of_at),
+              observed_at: String(row.observed_at),
+              fact_kind: String(row.fact_kind),
+              fact_payload: row.fact_payload,
+              evidence_event_id: rowEvidenceEventId,
+              interaction_id: rowInteractionId,
+            });
+          }
+
+          project_facts = candidateProjectIds.map((pid) => ({
+            project_id: pid,
+            facts: (byProject.get(pid) || []).slice(0, WORLD_MODEL_FACTS_MAX_PER_PROJECT),
+          }));
+
+          const anyFacts = project_facts.some((p) => p.facts.length > 0);
+          if (anyFacts) sources_used.push("project_facts");
+        }
+      } catch (_factsErr) {
+        warnings.push("project_facts_skipped");
+      }
+    }
+
+    // ========================================
     // BUILD CONTEXT PACKAGE
     // ========================================
     const context_package: ContextPackage = {
@@ -3028,6 +3130,7 @@ Deno.serve(async (req: Request) => {
       candidates: finalCandidates,
       place_mentions,
       project_journal: finalProjectJournal,
+      ...(project_facts ? { project_facts } : {}),
       email_context,
       email_lookup_meta,
       continuity_links,
