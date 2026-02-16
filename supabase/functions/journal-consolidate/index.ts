@@ -336,12 +336,26 @@ If there are no existing claims, mark everything as "new" with confidence 1.0.`;
     let conflicts_detected = 0;
     let remained_new = 0;
     let review_queue_entries = 0;
+    let human_override_skips = 0;
 
     if (!dry_run) {
       for (const j of result.judgments) {
         if (!newClaimIds.includes(j.claim_id)) continue;
 
         if (j.relationship === "supersedes" && j.related_claim_id) {
+          // Stopline 2 guard: AI must never override human-confirmed claims
+          const { data: targetClaim } = await db.from("journal_claims")
+            .select("claim_confirmation_state")
+            .eq("claim_id", j.related_claim_id)
+            .single();
+          if (targetClaim?.claim_confirmation_state === "confirmed") {
+            console.warn(
+              `[journal-consolidate] Stopline 2: skipping AI supersede of human-confirmed claim ${j.related_claim_id} (attempted by new claim ${j.claim_id})`,
+            );
+            human_override_skips++;
+            remained_new++;
+            continue;
+          }
           await db.from("journal_claims")
             .update({ relationship: "supersedes", supersedes_claim_id: j.related_claim_id })
             .eq("claim_id", j.claim_id);
@@ -354,9 +368,21 @@ If there are no existing claims, mark everything as "new" with confidence 1.0.`;
             .update({ relationship: "corroborates" })
             .eq("claim_id", j.claim_id);
           if (j.warrant_level_update && ["high", "medium", "low"].includes(j.warrant_level_update)) {
-            await db.from("journal_claims")
-              .update({ warrant_level: j.warrant_level_update })
-              .eq("claim_id", j.related_claim_id);
+            // Stopline 2 guard: AI must never modify human-confirmed claims
+            const { data: targetClaim } = await db.from("journal_claims")
+              .select("claim_confirmation_state")
+              .eq("claim_id", j.related_claim_id)
+              .single();
+            if (targetClaim?.claim_confirmation_state === "confirmed") {
+              console.warn(
+                `[journal-consolidate] Stopline 2: skipping AI warrant_level update on human-confirmed claim ${j.related_claim_id}`,
+              );
+              human_override_skips++;
+            } else {
+              await db.from("journal_claims")
+                .update({ warrant_level: j.warrant_level_update })
+                .eq("claim_id", j.related_claim_id);
+            }
           }
           corroborated++;
         } else if (j.relationship === "conflicts" && j.related_claim_id) {
@@ -453,7 +479,7 @@ If there are no existing claims, mark everything as "new" with confidence 1.0.`;
         project_id,
         claims_processed: newClaims.length,
         existing_claims_in_context: (existingClaims || []).length,
-        judgments: { superseded, corroborated, conflicts_detected, remained_new },
+        judgments: { superseded, corroborated, conflicts_detected, remained_new, human_override_skips },
         review_queue_entries: dry_run ? 0 : review_queue_entries,
         cross_project_signals: result.cross_project_signals.length,
         raw_judgments: dry_run ? result.judgments : undefined,

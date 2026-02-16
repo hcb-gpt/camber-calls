@@ -1,10 +1,15 @@
 /**
- * journal-extract Edge Function v1.2.2
+ * journal-extract Edge Function v1.3.0
  * Extracts structured epistemic claims from attributed conversation spans
  *
- * @version 1.2.2
+ * @version 1.3.0
  * @date 2026-02-14
  * @purpose D1 deliverable - journal claim extraction from spans
+ *
+ * v1.3.0 changes (DEV-4):
+ *   - Add optional write gate to block claim writes when attribution decision
+ *     is review/none (env: JOURNAL_EXTRACT_SKIP_NON_ASSIGN_WRITES=true).
+ *   - Emits contamination metric log and response counters for blocked writes.
  *
  * v1.2.2 changes (DEV-1):
  *   - Fire-and-forget chain to journal-consolidate for successful writes with
@@ -62,13 +67,17 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const FUNCTION_VERSION = "v1.2.2";
+const FUNCTION_VERSION = "v1.3.0";
 const PROMPT_VERSION = "journal-extract-v2";
 const MAX_TOKENS = 4096;
 const DEFAULT_MODEL = "claude-3-haiku-20240307";
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_TRANSCRIPT_CHARS = 8000; // Cap transcript to prevent inference timeouts
 const JOURNAL_CONSOLIDATE_TIMEOUT_MS = 120000;
+const SKIP_NON_ASSIGN_WRITES = (() => {
+  const raw = (Deno.env.get("JOURNAL_EXTRACT_SKIP_NON_ASSIGN_WRITES") || "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+})();
 
 const VALID_CLAIM_TYPES = [
   "commitment",
@@ -598,7 +607,19 @@ Deno.serve(async (req: Request) => {
         status: "running",
         config: { model, prompt_version: PROMPT_VERSION, function_version: FUNCTION_VERSION, span_id },
       });
-      if (runErr) console.error("[journal-extract] journal_runs insert failed:", runErr.message);
+      if (runErr) {
+        console.error("[journal-extract] journal_runs insert failed:", runErr.message);
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            error_code: "journal_runs_insert_failed",
+            error: runErr.message,
+            interaction_id,
+            span_id,
+          }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        );
+      }
     }
 
     // ── TRANSCRIPT TRUNCATION ────────────────────────────────────
@@ -675,6 +696,9 @@ Deno.serve(async (req: Request) => {
     let loops_written = 0;
     const claim_ids: string[] = [];
     let skipped_no_project = false;
+    let skipped_non_assign_write_gate = false;
+    let blocked_by_write_gate_claims = 0;
+    const attribution_decision = attribution?.decision || null;
     let journal_consolidate_fired = false;
 
     if (!dry_run && extraction.claims.length > 0) {
@@ -697,13 +721,43 @@ Deno.serve(async (req: Request) => {
         }).eq("run_id", run_id);
         if (noProjectUpdateErr) {
           console.error("[journal-extract] journal_runs update (no project) failed:", noProjectUpdateErr.message);
+          return new Response(
+            JSON.stringify({
+              ok: false,
+              error_code: "journal_runs_status_update_failed",
+              error: noProjectUpdateErr.message,
+              interaction_id,
+              span_id,
+            }),
+            { status: 500, headers: { "Content-Type": "application/json" } },
+          );
+        }
+      } else if (SKIP_NON_ASSIGN_WRITES && attribution_decision !== "assign") {
+        skipped_non_assign_write_gate = true;
+        blocked_by_write_gate_claims = extraction.claims.length;
+        console.log(
+          `[journal-extract][metric] review_contamination_write_blocked span_id=${span_id} decision=${
+            attribution_decision ?? "unknown"
+          } blocked_claims=${blocked_by_write_gate_claims}`,
+        );
+
+        const { error: gateUpdateErr } = await db.from("journal_runs").update({
+          status: "success",
+          completed_at: new Date().toISOString(),
+          claims_extracted: extraction.claims.length,
+          error_message: `write_gate_non_assign_blocked: decision=${
+            attribution_decision ?? "unknown"
+          } blocked_claims=${blocked_by_write_gate_claims}`,
+        }).eq("run_id", run_id);
+        if (gateUpdateErr) {
+          console.error("[journal-extract] journal_runs update (write gate) failed:", gateUpdateErr.message);
         }
       } else {
         const claimRows = extraction.claims.map((c) => {
           const speaker = c.speaker_label ? speakerContactMap.get(c.speaker_label) : null;
           const claim_id = crypto.randomUUID();
           claim_ids.push(claim_id);
-          const claimIsConfirmed = attribution?.decision === "assign" && !!project_id;
+          const claimIsConfirmed = attribution_decision === "assign" && !!project_id;
 
           return {
             claim_id,
@@ -715,7 +769,7 @@ Deno.serve(async (req: Request) => {
             source_span_id: span_id,
             claim_type: c.claim_type,
             claim_text: c.claim_text,
-            attribution_decision: attribution?.decision || null,
+            attribution_decision,
             claim_confirmation_state: claimIsConfirmed ? "confirmed" : "unconfirmed",
             confirmed_at: claimIsConfirmed ? new Date().toISOString() : null,
             confirmed_by: claimIsConfirmed ? "journal_extract_auto_assign" : null,
@@ -748,6 +802,24 @@ Deno.serve(async (req: Request) => {
 
         if (claimErr) {
           console.error("[journal-extract] journal_claims insert failed:", claimErr.message);
+          // Best-effort: mark the run as failed
+          try {
+            await db.from("journal_runs").update({
+              status: "failed",
+              completed_at: new Date().toISOString(),
+              error_message: `journal_claims_write_failed: ${claimErr.message}`.slice(0, 500),
+            }).eq("run_id", run_id);
+          } catch { /* best-effort */ }
+          return new Response(
+            JSON.stringify({
+              ok: false,
+              error_code: "journal_claims_write_failed",
+              error: claimErr.message,
+              interaction_id,
+              span_id,
+            }),
+            { status: 500, headers: { "Content-Type": "application/json" } },
+          );
         } else {
           const insertedCount = typeof insertedCountRaw === "number"
             ? insertedCountRaw
@@ -771,6 +843,16 @@ Deno.serve(async (req: Request) => {
           const { error: loopErr } = await db.from("journal_open_loops").insert(loopRows);
           if (loopErr) {
             console.error("[journal-extract] journal_open_loops insert failed:", loopErr.message);
+            return new Response(
+              JSON.stringify({
+                ok: false,
+                error_code: "journal_open_loops_write_failed",
+                error: loopErr.message,
+                interaction_id,
+                span_id,
+              }),
+              { status: 500, headers: { "Content-Type": "application/json" } },
+            );
           } else {
             loops_written = loopRows.length;
           }
@@ -783,6 +865,16 @@ Deno.serve(async (req: Request) => {
         }).eq("run_id", run_id);
         if (successUpdateErr) {
           console.error("[journal-extract] journal_runs update (success) failed:", successUpdateErr.message);
+          return new Response(
+            JSON.stringify({
+              ok: false,
+              error_code: "journal_runs_status_update_failed",
+              error: successUpdateErr.message,
+              interaction_id,
+              span_id,
+            }),
+            { status: 500, headers: { "Content-Type": "application/json" } },
+          );
         }
 
         if (claims_written > 0 && project_id && run_id && expectedSecret) {
@@ -808,6 +900,10 @@ Deno.serve(async (req: Request) => {
         claim_ids: dry_run ? [] : claim_ids,
         summary: extraction.summary,
         speakers_resolved: speakerContactMap.size,
+        write_gate_enabled: SKIP_NON_ASSIGN_WRITES,
+        skipped_non_assign_write_gate,
+        blocked_by_write_gate_claims,
+        attribution_decision,
         skipped_no_project,
         ...(skipped_no_project ? { reason: "no_project_attribution: re-trigger after ai-router attributes span" } : {}),
         model,

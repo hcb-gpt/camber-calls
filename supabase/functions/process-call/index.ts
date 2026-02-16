@@ -1,8 +1,8 @@
 /**
- * process-call Edge Function v4.3.5
+ * process-call Edge Function v4.3.6
  * Full v3.6 pipeline in Supabase - Ported from v4.0.22 context_assembly
  *
- * @version 4.3.5
+ * @version 4.3.6
  * @date 2026-02-15
  * @port context_assembly v4.0.22 - 6-source ranking, word boundaries, speaker stripping
  *
@@ -13,7 +13,7 @@
  *
  * v4.2.0 CHANGES (attribution gap fix):
  * - Write candidate_projects to interactions
- * - Call auto_assign_project() after upsert to close PR-12 policy gap
+ * - (auto_assign_project RPC removed in v4.3.6 -- Stopline 1 violation)
  *
  * v4.3.2 CHANGES (lineage persistence):
  * - Persist zapier_zap_id and zapier_run_id from _zapier_ingest_meta into calls_raw.
@@ -52,7 +52,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { normalizePhoneForLookup } from "./phone_lookup.ts";
 import { resolveCallPartyPhones } from "./phone_direction.ts";
 
-const PROCESS_CALL_VERSION = "v4.3.5"; // normalized-phone owner mapping + quality warnings + empty-transcript terminalization + auth/lineage chain hardening
+const PROCESS_CALL_VERSION = "v4.3.6"; // remove auto_assign_project RPC (Stopline 1) + normalized-phone owner mapping + quality warnings + empty-transcript terminalization + auth/lineage chain hardening
 const GATE = { PASS: "PASS", SKIP: "SKIP", NEEDS_REVIEW: "NEEDS_REVIEW" };
 const ID_PATTERN = /^cll_[a-zA-Z0-9_]+$/;
 const ALLOWED_PROVENANCE_SOURCES = [
@@ -352,8 +352,6 @@ Deno.serve(async (req: Request) => {
   let project_source: string | null = null;
   let project_confidence: number | null = null;
 
-  // v4.2.0: auto-assign tracking
-  let auto_assign_result: any = null;
   // v4.3.0: segment-call chain tracking
   let segment_call_fired = false;
   let segment_call_status: number | null = null;
@@ -875,14 +873,14 @@ Deno.serve(async (req: Request) => {
 
     // ========================================
     // INTERACTIONS
-    // v4.2.0: Write candidate_projects so auto_assign_project can read them
+    // v4.2.0: Write candidate_projects for downstream pipeline visibility
     // ========================================
     if (g.decision === "PASS" || g.decision === "NEEDS_REVIEW") {
       const interactionNeedsReview = terminalEmptyTranscript ? false : true;
       const interactionReviewReasons = terminalEmptyTranscript
         ? ["terminal_empty_transcript", ...g.reasons]
         : [...g.reasons, "ai_candidate_only"];
-      await db.from("interactions").upsert({
+      const { error: interactionsErr } = await db.from("interactions").upsert({
         interaction_id: iid,
         channel: "call",
         contact_id: contact_id || null,
@@ -897,6 +895,37 @@ Deno.serve(async (req: Request) => {
         transcript_chars: n.transcript?.length || 0,
         is_shadow,
       }, { onConflict: "interaction_id" });
+
+      // Stopline 3: Fail closed on required writes — interactions row is a
+      // prerequisite for context-assembly contact resolution.
+      if (interactionsErr) {
+        console.error(JSON.stringify({
+          error: "interactions_write_failed",
+          interaction_id: iid,
+          run_id,
+          version: PROCESS_CALL_VERSION,
+          detail: interactionsErr.message,
+          code: interactionsErr.code,
+        }));
+        if (audit_id) {
+          await db.from("event_audit").update({
+            gate_status: "ERROR",
+            gate_reasons: ["interactions_write_failed", interactionsErr.message],
+          }).eq("id", audit_id);
+        }
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            run_id,
+            version: PROCESS_CALL_VERSION,
+            interaction_id: iid,
+            error_code: "interactions_write_failed",
+            error: interactionsErr.message,
+            ms: Date.now() - t0,
+          }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        );
+      }
 
       if (terminalEmptyTranscript) {
         // Terminalize legacy null-span pending rows for this interaction.
@@ -918,29 +947,10 @@ Deno.serve(async (req: Request) => {
       }
 
       // ========================================
-      // v4.2.0: AUTO-ASSIGN PROJECT
+      // v4.2.0 AUTO-ASSIGN PROJECT -- REMOVED in v4.3.6 (Stopline 1 violation)
+      // auto_assign_project wrote to interactions.project_id, which is not AI truth.
+      // SSOT for routing output is span_attributions; ai-router handles attribution.
       // ========================================
-      if (contact_id && candidateProjectsJson.length > 0) {
-        try {
-          const { data: assignResult, error: assignErr } = await db.rpc(
-            "auto_assign_project",
-            { p_interaction_id: iid },
-          );
-
-          if (!assignErr && assignResult) {
-            auto_assign_result = assignResult;
-            if (assignResult.assigned) {
-              project_id = assignResult.project_id;
-              project_source = (project_source || "") + "+auto_assigned_" + assignResult.reason;
-              sources_used.push("auto_assign_project");
-            }
-          } else if (assignErr) {
-            warnings.push(`auto_assign_error: ${assignErr.message}`);
-          }
-        } catch (e: any) {
-          warnings.push(`auto_assign_exception: ${e.message}`);
-        }
-      }
 
       // ========================================
       // v4.3.0: CHAIN TO SEGMENT-CALL
@@ -1022,8 +1032,8 @@ Deno.serve(async (req: Request) => {
           name: c.project_name,
           score: c.rank_score,
         })),
-        // v4.2.0: auto-assign result
-        auto_assign: auto_assign_result,
+        // v4.2.0: auto-assign removed (Stopline 1); field kept null for backward compat
+        auto_assign: null,
         // v4.3.0: segment-call chain
         segment_call: {
           fired: segment_call_fired,
