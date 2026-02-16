@@ -15,6 +15,11 @@
  *   only when references map to strong fact anchors and do not contradict transcript context.
  * - Adds optional model output field `world_model_references[]` for citation of influencing facts.
  *
+ * v1.14.0 Changes (junk-call prefilter):
+ * - Adds conservative junk-call prefilter (voicemail / connection-failure / minimal-content patterns).
+ * - For junk spans, forces decision='none' with needs_review=false and reasoning tagged with junk_call_filtered.
+ * - Keeps fail-open behavior for substantive snippets and fail-closed behavior for attribution/review queue writes.
+ *
  * v1.13.0 Changes (deterministic homeowner override gate v1):
  * - Adds deterministic homeowner/client override in normal inference flow
  *   (after evidence assembly, before final attribution write).
@@ -82,6 +87,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
+import { evaluateJunkCallPrefilter } from "../_shared/junk_call_prefilter.ts";
 import { parseLlmJson } from "../_shared/llm_json.ts";
 import { applyCommonAliasCorroborationGuardrail, isCommonWordAlias } from "./alias_guardrails.ts";
 import { applyBethanyRoadWinshipGuardrail } from "./bethany_winship_guardrail.ts";
@@ -292,6 +298,14 @@ function withSanitizedTranscript(
     },
     replaced: sanitized.replaced,
   };
+}
+
+function deriveSpanDurationSeconds(contextPackage: ContextPackage): number | null {
+  const startMs = Number(contextPackage.span?.start_ms);
+  const endMs = Number(contextPackage.span?.end_ms);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return null;
+  if (endMs <= startMs) return null;
+  return Math.round((endMs - startMs) / 1000);
 }
 
 // ============================================================
@@ -564,7 +578,7 @@ async function resolveReviewQueue(
   db: any,
   spanId: string,
   notes: string,
-) {
+): Promise<{ error: { message: string; details?: string } | null }> {
   const { error } = await db
     .from("review_queue")
     .update({
@@ -580,6 +594,7 @@ async function resolveReviewQueue(
   if (error) {
     console.error("[ai-router] review_queue resolve failed:", error.message);
   }
+  return { error };
 }
 
 // ============================================================
@@ -947,6 +962,9 @@ Deno.serve(async (req: Request) => {
   let transcriptControlCharsSanitized = 0;
   let homeownerDeterministicGateApplied = false;
   let homeownerDeterministicFallbackApplied = false;
+  let junkCallFiltered = false;
+  let junkCallFilterReasonCodes: string[] = [];
+  let junkCallFilterSignalSummary: string[] = [];
 
   const currentEvidenceEventIds = Array.from(
     new Set(
@@ -1256,6 +1274,34 @@ Deno.serve(async (req: Request) => {
     }
   }
 
+  const junkPrefilter = evaluateJunkCallPrefilter({
+    transcript: context_package.span?.transcript_text || "",
+    durationSeconds: deriveSpanDurationSeconds(context_package),
+  });
+  junkCallFilterReasonCodes = junkPrefilter.reasonCodes;
+  junkCallFilterSignalSummary = junkPrefilter.signalSummary;
+
+  if (
+    !homeownerDeterministicAssignApplied &&
+    !model_error &&
+    result.decision !== "assign" &&
+    junkPrefilter.isJunk
+  ) {
+    junkCallFiltered = true;
+    result = {
+      ...result,
+      project_id: null,
+      confidence: Math.min(result.confidence || 0, 0.2),
+      decision: "none",
+      reasoning: `${result.reasoning} junk_call_filtered: ${junkPrefilter.reasonCodes.join(",")} (${
+        junkPrefilter.signalSummary.join(",")
+      })`,
+    };
+    console.log(
+      `[ai-router] junk-call prefilter applied: span=${span_id} reasons=${junkPrefilter.reasonCodes.join(",")}`,
+    );
+  }
+
   // ========================================
   // GATEKEEPER (SPAN-LEVEL ONLY)
   // ========================================
@@ -1312,13 +1358,17 @@ Deno.serve(async (req: Request) => {
     // WRITE TO SPAN_ATTRIBUTIONS (ALWAYS)
     // ========================================
     const attribution_lock = applied ? "ai" : null;
-    const needs_review = result.decision === "review" || result.decision === "none";
-    const attribution_source = homeownerDeterministicFallbackApplied
+    const needs_review = junkCallFiltered ? false : result.decision === "review" || result.decision === "none";
+    const attribution_source = junkCallFiltered
+      ? "junk_call_prefilter"
+      : homeownerDeterministicFallbackApplied
       ? "homeowner_deterministic_fallback"
       : homeownerDeterministicGateApplied
       ? "homeowner_deterministic_override"
       : deriveAttributionSource(result.anchors, model_error);
-    const evidence_tier = homeownerDeterministicAssignApplied
+    const evidence_tier = junkCallFiltered
+      ? 3
+      : homeownerDeterministicAssignApplied
       ? 1
       : deriveEvidenceTier(result.anchors, result.confidence, model_error);
 
@@ -1379,13 +1429,16 @@ Deno.serve(async (req: Request) => {
     const bizdevGateEffective = bizdev_without_commitment && !homeownerDeterministicAssignApplied;
     const bizdevSuppressedByHomeownerDeterministic = bizdev_without_commitment && homeownerDeterministicAssignApplied;
 
-    const needsReviewQueue = result.decision !== "assign" ||
-      needs_review === true ||
-      !quoteRequirementSatisfied ||
-      !effectiveStrongAnchor ||
-      common_alias_unconfirmed ||
-      bizdevGateEffective ||
-      (model_error && !homeownerDeterministicAssignApplied);
+    const needsReviewQueue = !junkCallFiltered &&
+      (
+        result.decision !== "assign" ||
+        needs_review === true ||
+        !quoteRequirementSatisfied ||
+        !effectiveStrongAnchor ||
+        common_alias_unconfirmed ||
+        bizdevGateEffective ||
+        (model_error && !homeownerDeterministicAssignApplied)
+      );
 
     if (needsReviewQueue) {
       const reason_codes = buildReasonCodes({
@@ -1452,6 +1505,11 @@ Deno.serve(async (req: Request) => {
           control_chars_sanitized: transcriptControlCharsSanitized,
           strict_retry_used: strictSanitizationRetryUsed,
         },
+        junk_prefilter: {
+          applied: junkCallFiltered,
+          reason_codes: junkCallFilterReasonCodes,
+          signal_summary: junkCallFilterSignalSummary,
+        },
         model_id: MODEL_ID,
         prompt_version: PROMPT_VERSION,
         created_at_utc: new Date().toISOString(),
@@ -1480,8 +1538,24 @@ Deno.serve(async (req: Request) => {
       }
       console.log(`[ai-router] Created review_queue item for span ${span_id}, reasons: ${reason_codes.join(",")}`);
     } else {
-      await resolveReviewQueue(db, span_id, "auto-applied by ai-router");
-      console.log(`[ai-router] Resolved review_queue item for span ${span_id} (auto-assigned)`);
+      const resolutionNotes = junkCallFiltered ? "junk_call_filtered" : "auto-applied by ai-router";
+      const resolveResult = await resolveReviewQueue(db, span_id, resolutionNotes);
+      if (resolveResult.error) {
+        return new Response(
+          JSON.stringify({
+            ok: false,
+            error_code: "review_queue_resolve_failed",
+            error: resolveResult.error.message,
+            interaction_id,
+            span_id,
+          }),
+          {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+          },
+        );
+      }
+      console.log(`[ai-router] Resolved review_queue item for span ${span_id} (${resolutionNotes})`);
     }
 
     // ========================================
@@ -1572,6 +1646,11 @@ Deno.serve(async (req: Request) => {
             },
           }
           : {}),
+        junk_call_prefilter: {
+          applied: junkCallFiltered,
+          reason_codes: junkCallFilterReasonCodes,
+          signal_summary: junkCallFilterSignalSummary,
+        },
         sanitization: {
           control_chars_sanitized: transcriptControlCharsSanitized,
           strict_retry_used: strictSanitizationRetryUsed,

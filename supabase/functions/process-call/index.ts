@@ -1,8 +1,8 @@
 /**
- * process-call Edge Function v4.3.6
+ * process-call Edge Function v4.3.7
  * Full v3.6 pipeline in Supabase - Ported from v4.0.22 context_assembly
  *
- * @version 4.3.6
+ * @version 4.3.7
  * @date 2026-02-15
  * @port context_assembly v4.0.22 - 6-source ranking, word boundaries, speaker stripping
  *
@@ -17,6 +17,10 @@
  *
  * v4.3.2 CHANGES (lineage persistence):
  * - Persist zapier_zap_id and zapier_run_id from _zapier_ingest_meta into calls_raw.
+ *
+ * v4.3.7 CHANGES (junk-call prefilter handoff):
+ * - Adds conservative junk-call prefilter on interaction writes.
+ * - Sets interactions.needs_review=false with junk_call_filtered reason when low-signal junk is detected.
  *
  * v4.3.5 CHANGES (inbound owner phone + quality warnings):
  * - Accept normalized fields (`to_phone_norm` / `from_phone_norm`) for party role mapping.
@@ -49,10 +53,11 @@
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { evaluateJunkCallPrefilter, normalizeDurationSeconds } from "../_shared/junk_call_prefilter.ts";
 import { normalizePhoneForLookup } from "./phone_lookup.ts";
 import { resolveCallPartyPhones } from "./phone_direction.ts";
 
-const PROCESS_CALL_VERSION = "v4.3.6"; // remove auto_assign_project RPC (Stopline 1) + normalized-phone owner mapping + quality warnings + empty-transcript terminalization + auth/lineage chain hardening
+const PROCESS_CALL_VERSION = "v4.3.7"; // adds conservative junk-call prefilter to interaction needs_review wiring
 const GATE = { PASS: "PASS", SKIP: "SKIP", NEEDS_REVIEW: "NEEDS_REVIEW" };
 const ID_PATTERN = /^cll_[a-zA-Z0-9_]+$/;
 const ALLOWED_PROVENANCE_SOURCES = [
@@ -241,6 +246,36 @@ function isTerminalEmptyTranscript(gateReasons: string[], transcript: string | n
     reason !== "G4_EMPTY_TRANSCRIPT" && reason !== "G4_TIMESTAMP_MISSING"
   );
   return hasEmptyTranscriptGate && transcriptLen < 10 && nonTerminalReasons.length === 0;
+}
+
+function readDurationSeconds(raw: any, normalized: any): number | null {
+  const candidates = [
+    normalized?.duration_seconds,
+    normalized?.duration_sec,
+    normalized?.call_duration_seconds,
+    normalized?.call_duration_sec,
+    normalized?.duration,
+    normalized?.signal?.duration_seconds,
+    normalized?.signal?.duration_sec,
+    normalized?.signal?.raw_event?.duration_seconds,
+    normalized?.signal?.raw_event?.duration_sec,
+    normalized?.signal?.raw_event?.duration,
+    raw?.duration_seconds,
+    raw?.duration_sec,
+    raw?.call_duration_seconds,
+    raw?.call_duration_sec,
+    raw?.duration,
+    raw?.signal?.duration_seconds,
+    raw?.signal?.duration_sec,
+    raw?.signal?.raw_event?.duration_seconds,
+    raw?.signal?.raw_event?.duration_sec,
+    raw?.signal?.raw_event?.duration,
+  ];
+  for (const value of candidates) {
+    const seconds = normalizeDurationSeconds(value);
+    if (seconds != null) return seconds;
+  }
+  return null;
 }
 
 Deno.serve(async (req: Request) => {
@@ -817,6 +852,14 @@ Deno.serve(async (req: Request) => {
     // GATE
     const g = m4(n);
     const terminalEmptyTranscript = isTerminalEmptyTranscript(g.reasons, n.transcript);
+    const junkFilter = evaluateJunkCallPrefilter({
+      transcript: n.transcript || "",
+      durationSeconds: readDurationSeconds(raw, n),
+    });
+    const junkCallFiltered = !terminalEmptyTranscript && g.decision === "PASS" && junkFilter.isJunk;
+    if (junkCallFiltered) {
+      warnings.push(`junk_call_filtered:${junkFilter.signalSummary.join(",")}`);
+    }
 
     // CALLS_RAW (primary storage - includes candidate info)
     const { data: cr } = await db.from("calls_raw").upsert({
@@ -876,9 +919,11 @@ Deno.serve(async (req: Request) => {
     // v4.2.0: Write candidate_projects for downstream pipeline visibility
     // ========================================
     if (g.decision === "PASS" || g.decision === "NEEDS_REVIEW") {
-      const interactionNeedsReview = terminalEmptyTranscript ? false : true;
+      const interactionNeedsReview = terminalEmptyTranscript || junkCallFiltered ? false : true;
       const interactionReviewReasons = terminalEmptyTranscript
         ? ["terminal_empty_transcript", ...g.reasons]
+        : junkCallFiltered
+        ? Array.from(new Set([...g.reasons, ...junkFilter.reasonCodes]))
         : [...g.reasons, "ai_candidate_only"];
       const { error: interactionsErr } = await db.from("interactions").upsert({
         interaction_id: iid,
@@ -1038,6 +1083,11 @@ Deno.serve(async (req: Request) => {
         segment_call: {
           fired: segment_call_fired,
           status: segment_call_status,
+        },
+        junk_prefilter: {
+          applied: junkCallFiltered,
+          reason_codes: junkFilter.reasonCodes,
+          signal_summary: junkFilter.signalSummary,
         },
         sources_used,
         warnings,
