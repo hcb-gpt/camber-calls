@@ -120,6 +120,8 @@ interface ReseedReceipt {
   attrib_count_after: number;
   status: "success" | "blocked_human_lock" | "error";
   human_locked_spans?: string[];
+  human_lock_count?: number;
+  human_lock_carryforward_count?: number;
   new_span_ids?: string[];
   superseded_span_ids?: string[];
   reroute_triggered?: boolean;
@@ -139,6 +141,12 @@ interface ReseedReceipt {
   close_loop_pending_null_after?: number;
   ms?: number;
 }
+
+type HumanLockedSpanInfo = {
+  span_id: string;
+  span_index: number;
+  applied_project_id: string;
+};
 
 Deno.serve(async (req: Request) => {
   const t0 = Date.now();
@@ -261,12 +269,17 @@ Deno.serve(async (req: Request) => {
 
   // Check for human locks on these spans
   let humanLockedSpans: string[] = [];
+  let humanLockedSpanInfos: HumanLockedSpanInfo[] = [];
   let attribCountBefore = 0;
 
   if (activeSpanIds.length > 0) {
+    const spanIdToIndex = new Map<string, number>(
+      (activeSpans || []).map((s) => [String(s.id), Number(s.span_index ?? 0)]),
+    );
+
     const { data: attribs, error: attribErr } = await db
       .from("span_attributions")
-      .select("span_id, attribution_lock")
+      .select("span_id, attribution_lock, applied_project_id")
       .in("span_id", activeSpanIds);
 
     if (attribErr) {
@@ -275,48 +288,33 @@ Deno.serve(async (req: Request) => {
     }
 
     attribCountBefore = (attribs || []).length;
-    humanLockedSpans = (attribs || [])
-      .filter((a) => a.attribution_lock === "human")
-      .map((a) => a.span_id);
+    const locked = (attribs || [])
+      .filter((a) => a.attribution_lock === "human" && a.applied_project_id)
+      .map((a) => ({
+        span_id: String(a.span_id),
+        span_index: spanIdToIndex.get(String(a.span_id)) ?? 0,
+        applied_project_id: String(a.applied_project_id),
+      }));
+
+    // De-dupe per span_id (span_attributions can have multiple rows per span_id).
+    const seen = new Set<string>();
+    humanLockedSpanInfos = [];
+    for (const row of locked) {
+      if (seen.has(row.span_id)) continue;
+      seen.add(row.span_id);
+      humanLockedSpanInfos.push(row);
+    }
+
+    humanLockedSpans = humanLockedSpanInfos.map((r) => r.span_id);
   }
 
   // ========================================
   // 7. HUMAN LOCK GATE
-  // POLICY: If any human-locked span, return 409
+  // POLICY: Do NOT block reseed on human locks.
+  // Instead, carry forward human locks to replacement spans by span_index.
   // ========================================
-  if (humanLockedSpans.length > 0) {
-    console.log(`[admin-reseed] Blocked: ${humanLockedSpans.length} human-locked spans`);
-
-    const receipt: ReseedReceipt = {
-      ok: false,
-      interaction_id,
-      idempotency_key,
-      mode,
-      span_count_before: spanCountBefore,
-      span_count_after: spanCountBefore, // No change
-      attrib_count_before: attribCountBefore,
-      attrib_count_after: attribCountBefore, // No change
-      status: "blocked_human_lock",
-      human_locked_spans: humanLockedSpans,
-    };
-
-    // Write audit log even for blocked operations
-    await writeOverrideLog(db, {
-      interaction_id,
-      idempotency_key,
-      reason,
-      mode,
-      requested_by,
-      receipt,
-    });
-
-    return jsonResponse({
-      ok: false,
-      error: "human_lock_present",
-      human_locked_spans: humanLockedSpans,
-      receipt,
-      ms: Date.now() - t0,
-    }, 409);
+  if (humanLockedSpanInfos.length > 0) {
+    console.log(`[admin-reseed] Found ${humanLockedSpanInfos.length} human-locked spans; will carry forward`);
   }
 
   // ========================================
@@ -782,6 +780,85 @@ Deno.serve(async (req: Request) => {
   }
 
   // ========================================
+  // 10b. CARRY FORWARD HUMAN LOCKS (SPAN-INDEX MAP)
+  // - Preserve Chad GT corrections across reseeds.
+  // - Insert a human-locked span_attributions row for replacement spans.
+  // ========================================
+  let humanLockCarryforwardCount = 0;
+  if (humanLockedSpanInfos.length > 0 && newSpanIds.length > 0) {
+    const spanIndexToNewSpanId = new Map<number, string>();
+    for (const row of newSpanIds.map((id, idx) => ({ id, idx }))) {
+      // newSpanIds are already ordered by span_index insertion order (we sorted `inserted`).
+      // Use positional index as a fallback. If `inserted` contained explicit span_index,
+      // its order matches, and span_index==position in most reseeds.
+      spanIndexToNewSpanId.set(row.idx, row.id);
+    }
+
+    // Prefer explicit mapping from inserted rows if available (span_index -> id)
+    try {
+      const { data: newSpans } = await db
+        .from("conversation_spans")
+        .select("id, span_index")
+        .in("id", newSpanIds);
+      for (const s of (newSpans || []) as any[]) {
+        if (s?.span_index !== undefined && s?.id) {
+          spanIndexToNewSpanId.set(Number(s.span_index), String(s.id));
+        }
+      }
+    } catch (_e) {
+      // Best-effort only; fallback mapping remains.
+    }
+
+    const nowIso = new Date().toISOString();
+    const carryRows = humanLockedSpanInfos
+      .map((info) => {
+        const newSpanId = spanIndexToNewSpanId.get(info.span_index);
+        if (!newSpanId) return null;
+        return {
+          span_id: newSpanId,
+          project_id: info.applied_project_id,
+          decision: "assign",
+          confidence: 1,
+          attribution_source: "admin_reseed_human_lock_carryforward",
+          reasoning: "admin-reseed: carried forward attribution_lock=human from superseded span by span_index",
+          attribution_lock: "human",
+          applied_project_id: info.applied_project_id,
+          applied_at_utc: nowIso,
+          needs_review: false,
+          attributed_by: `admin-reseed-${VERSION}`,
+          attributed_at: nowIso,
+          raw_response: {
+            source: "admin-reseed",
+            carryforward: true,
+            from_span_id: info.span_id,
+            from_span_index: info.span_index,
+            interaction_id,
+          },
+        };
+      })
+      .filter(Boolean) as any[];
+
+    if (carryRows.length > 0) {
+      const { data: insertedRows, error: carryErr } = await db
+        .from("span_attributions")
+        .upsert(carryRows, { onConflict: "span_id,project_id", ignoreDuplicates: false })
+        .select("span_id");
+
+      if (carryErr) {
+        console.error("[admin-reseed] Human-lock carryforward failed:", carryErr.message);
+        // Fail closed on carryforward: better to signal than silently drop locks.
+        return jsonResponse({ ok: false, error: "human_lock_carryforward_failed", detail: carryErr.message }, 500);
+      }
+
+      humanLockCarryforwardCount = (insertedRows || []).length;
+      structuredLog("INFO", "reseed_human_lock_carryforward_applied", requestId, interaction_id, newGeneration, {
+        human_lock_count: humanLockedSpanInfos.length,
+        human_lock_carryforward_count: humanLockCarryforwardCount,
+      });
+    }
+  }
+
+  // ========================================
   // 11. BUILD RECEIPT + WRITE AUDIT LOG
   // ========================================
   const receipt: ReseedReceipt = {
@@ -792,8 +869,11 @@ Deno.serve(async (req: Request) => {
     span_count_before: spanCountBefore,
     span_count_after: newSpanIds.length,
     attrib_count_before: attribCountBefore,
-    attrib_count_after: 0, // New spans have no attributions yet
+    attrib_count_after: humanLockCarryforwardCount, // New spans start with carry-forwarded human locks (if any)
     status: "success",
+    human_locked_spans: humanLockedSpans.length > 0 ? humanLockedSpans : undefined,
+    human_lock_count: humanLockedSpans.length > 0 ? humanLockedSpans.length : 0,
+    human_lock_carryforward_count: humanLockCarryforwardCount,
     superseded_span_ids: activeSpanIds,
     new_span_ids: newSpanIds,
     reroute_triggered: false,
