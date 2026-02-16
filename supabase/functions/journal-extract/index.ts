@@ -466,14 +466,21 @@ Deno.serve(async (req: Request) => {
     });
   }
 
-  const edgeSecret = req.headers.get("X-Edge-Secret") || req.headers.get("x-edge-secret");
+  const edgeSecretHeader = req.headers.get("X-Edge-Secret") || req.headers.get("x-edge-secret");
   const expectedSecret = Deno.env.get("EDGE_SHARED_SECRET");
 
-  const secretOk = expectedSecret && edgeSecret === expectedSecret;
+  const edgeSecret = edgeSecretHeader ? edgeSecretHeader.trim() : "";
+  const normalizedExpectedSecret = expectedSecret?.trim() || "";
+  const secretOk = normalizedExpectedSecret.length > 0 && edgeSecret === normalizedExpectedSecret;
 
   if (!secretOk) {
     return new Response(
-      JSON.stringify({ error: "unauthorized" }),
+      JSON.stringify({
+        error: "unauthorized",
+        hint: normalizedExpectedSecret
+          ? "Requires X-Edge-Secret matching EDGE_SHARED_SECRET"
+          : "Server auth config missing",
+      }),
       { status: 401, headers: { "Content-Type": "application/json" } },
     );
   }
