@@ -1,13 +1,21 @@
 /**
- * ai-router Edge Function v1.14.0
+ * ai-router Edge Function v1.15.0
  * LLM-based project attribution for conversation spans
  *
- * @version 1.14.0
+ * @version 1.15.0
  * @date 2026-02-15
  * @purpose Use Claude Haiku to attribute spans to projects with anchored evidence
  *
  * CORE PRINCIPLE: span_attributions is the single source of truth.
  * NO writes to interactions.project_id from this path.
+ *
+ * v1.15.0 Changes (M2-E: RRF reranker with evidence-tier weighting):
+ * - Accepts optional rrf_score and evidence_tier_label from context-assembly on each candidate
+ * - Pre-inference: reranks candidates by final_score = rrf_score * TIER_WEIGHTS[tier]
+ * - Evidence tier classification: smoking_gun (5x), strong (3x), moderate (1x), weak (0.5x), anti (-1x)
+ * - Post-inference guardrail: downgrades assign->review when chosen project tier is weak or anti
+ * - Backward compatible: if no rrf_score present, falls back to existing scoring (no reranking)
+ * - Adds rrf_reranker metadata to response guardrails block and review_queue context
  *
  * v1.14.0 Changes (world model facts evidence; feature-flagged):
  * - Adds optional world-model facts prompt surface per candidate project when WORLD_MODEL_FACTS_ENABLED=true.
@@ -87,12 +95,24 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Anthropic from "npm:@anthropic-ai/sdk@0.39.0";
+import OpenAI from "npm:openai@4.82.0";
 import { evaluateJunkCallPrefilter } from "../_shared/junk_call_prefilter.ts";
 import { parseLlmJson } from "../_shared/llm_json.ts";
 import { applyCommonAliasCorroborationGuardrail, isCommonWordAlias } from "./alias_guardrails.ts";
 import { applyBethanyRoadWinshipGuardrail } from "./bethany_winship_guardrail.ts";
 import { applyBizDevCommitmentGate } from "./bizdev_guardrails.ts";
 import { evaluateHomeownerOverride } from "./homeowner_override_gate.ts";
+import {
+  classifyEvidenceTier,
+  type EvidenceTierLabel,
+  type RerankCandidate,
+  rerankCandidates,
+  TIER_WEIGHTS,
+} from "./rrf_reranker.ts";
+import {
+  applyRrfTierGuardrail,
+  type RrfTierGuardrailResult,
+} from "./rrf_tier_guardrail.ts";
 import {
   applyWorldModelReferenceGuardrail,
   buildWorldModelFactsCandidateSummary,
@@ -103,16 +123,21 @@ import {
   type WorldModelReference,
 } from "./world_model_facts.ts";
 
-const PROMPT_VERSION_BASE = "v1.11.0";
-const FUNCTION_VERSION = "v1.14.0";
-const MODEL_ID = "claude-3-haiku-20240307";
+const PROMPT_VERSION_BASE = "v1.13.0_rrf_tiers";
+const FUNCTION_VERSION = "v1.16.0";
+const AI_PROVIDER = (Deno.env.get("AI_ROUTER_PROVIDER") || "anthropic").toLowerCase();
+const MODEL_ID = Deno.env.get("AI_ROUTER_MODEL") || (AI_PROVIDER === "openai" ? "gpt-4o" : "claude-3-haiku-20240307");
 const MAX_TOKENS = 1024;
 const WORLD_MODEL_FACTS_ENABLED = parseBoolEnv(Deno.env.get("WORLD_MODEL_FACTS_ENABLED"), false);
 const WORLD_MODEL_FACTS_MAX_PER_PROJECT = Math.max(
   0,
   Math.min(50, Number.parseInt(Deno.env.get("WORLD_MODEL_FACTS_MAX_PER_PROJECT") || "20", 10) || 20),
 );
-const PROMPT_VERSION = WORLD_MODEL_FACTS_ENABLED ? "v1.12.0_world_model_facts" : PROMPT_VERSION_BASE;
+const PROMPT_VERSION = (() => {
+  let v = WORLD_MODEL_FACTS_ENABLED ? "v1.13.0_rrf_tiers_world_model_facts" : PROMPT_VERSION_BASE;
+  if (AI_PROVIDER !== "anthropic") v += `_${AI_PROVIDER}`;
+  return v;
+})();
 
 // Confidence thresholds
 const THRESHOLD_AUTO_ASSIGN = 0.75;
@@ -249,6 +274,8 @@ interface ContextPackage {
       sources: string[];
       affinity_weight: number;
       source_strength?: number;
+      rrf_score?: number;
+      evidence_tier_label?: string;
       assigned: boolean;
       alias_matches: Array<{ term: string; match_type: string; snippet?: string }>;
       geo_distance_km?: number;
@@ -546,6 +573,8 @@ function buildReasonCodes(opts: {
   geoOnly?: boolean;
   commonAliasUnconfirmed?: boolean;
   bizdevWithoutCommitment?: boolean;
+  rrfTierDowngraded?: boolean;
+  rrfTierReasonCode?: string | null;
 }): string[] {
   const reasons: string[] = [];
   if (Array.isArray(opts.modelReasons)) reasons.push(...opts.modelReasons);
@@ -557,6 +586,7 @@ function buildReasonCodes(opts: {
   if (opts.commonAliasUnconfirmed) reasons.push("common_alias_unconfirmed");
   if (opts.bizdevWithoutCommitment) reasons.push("bizdev_without_commitment");
   if (opts.modelError) reasons.push("model_error");
+  if (opts.rrfTierDowngraded && opts.rrfTierReasonCode) reasons.push(opts.rrfTierReasonCode);
 
   return Array.from(new Set(reasons.filter(Boolean)));
 }
@@ -722,9 +752,20 @@ OUTPUT FORMAT (JSON only, no markdown):
 
 IMPORTANT: The "quote" field in anchors must contain text that ACTUALLY APPEARS in the transcript segment provided.`;
 
+const RRF_TIER_PROMPT_EXTENSION = `
+
+RRF EVIDENCE TIERS (when rrf_score is present on candidates):
+Some candidates may include rrf_score, tier, and tier_weight from multi-channel retrieval fusion.
+- smoking_gun (weight=5.0): Near-certain match from multiple retrieval channels. Safe to auto-assign with transcript anchor.
+- strong (weight=3.0): High-confidence retrieval signal. Auto-assign with corroboration.
+- moderate (weight=1.0): Moderate retrieval signal. Needs strong transcript anchor for assign.
+- weak (weight=0.5): Low retrieval signal. Supplementary only, never sufficient for assign alone.
+- anti (weight=-1.0): Negative retrieval signal. Weight against this candidate.
+Use rrf_score and tier as additional context alongside transcript anchors. They do not override transcript evidence.`;
+
 function buildSystemPrompt(worldModelFactsEnabled: boolean): string {
-  if (!worldModelFactsEnabled) return SYSTEM_PROMPT_BASE;
-  return `${SYSTEM_PROMPT_BASE}
+  if (!worldModelFactsEnabled) return SYSTEM_PROMPT_BASE + RRF_TIER_PROMPT_EXTENSION;
+  return `${SYSTEM_PROMPT_BASE}${RRF_TIER_PROMPT_EXTENSION}
 
 WORLD MODEL FACTS CONTEXT (when available):
 - World model facts are supplementary corroboration, not primary evidence.
@@ -804,6 +845,10 @@ function buildUserPrompt(
    - Status: ${c.status || "N/A"}, Phase: ${c.phase || "N/A"}
    - Evidence: assigned=${c.evidence.assigned}, affinity=${c.evidence.affinity_weight.toFixed(2)}, source_strength=${
       (c.evidence.source_strength ?? 0).toFixed(2)
+    }${typeof c.evidence.rrf_score === "number" ? `, rrf_score=${c.evidence.rrf_score.toFixed(3)}` : ""}${
+      typeof c.evidence.rrf_score === "number"
+        ? `, tier=${classifyEvidenceTier(c.evidence)}, tier_weight=${TIER_WEIGHTS[classifyEvidenceTier(c.evidence)]}`
+        : ""
     }, sources=[${c.evidence.sources.join(",")}]
    - ${geoSummary}
    - ${aliasMatchSummary}
@@ -1012,31 +1057,72 @@ Deno.serve(async (req: Request) => {
     })
     : [];
 
-  try {
-    const anthropic = new Anthropic({
-      apiKey: Deno.env.get("ANTHROPIC_API_KEY")!,
-    });
+  // ── M2-E: RRF RERANKER (pre-inference) ─────────────────────
+  // Rerank candidates by RRF score * evidence-tier weight before
+  // building the LLM prompt. If no rrf_score is present on any
+  // candidate, the original order is preserved (backward compat).
+  const rerankResult = rerankCandidates(
+    context_package.candidates as RerankCandidate[],
+  );
+  if (rerankResult.reranked) {
+    context_package = {
+      ...context_package,
+      candidates: rerankResult.candidates as ContextPackage["candidates"],
+    };
+    console.log(
+      `[ai-router] M2-E reranker applied: ${rerankResult.scores.map(
+        (s) => `${s.project_id.slice(0, 8)}:${s.tier}:${s.final_score.toFixed(3)}`,
+      ).join(", ")}`,
+    );
+  }
 
+  let rrfTierGuardrailDowngraded = false;
+  let rrfTierGuardrailBoosted = false;
+  let rrfTierGuardrailReasonCode: string | null = null;
+  let rrfTierGuardrailChosenTier: string | null = null;
+  let rrfTierGuardrailChosenRrfScore: number | null = null;
+
+  try {
     const runInference = async (contextPackageForPrompt: ContextPackage) => {
       const inferenceStart = Date.now();
-      const response = await anthropic.messages.create({
-        model: MODEL_ID,
-        max_tokens: MAX_TOKENS,
-        messages: [
-          {
-            role: "user",
-            content: buildUserPrompt(contextPackageForPrompt, {
-              worldModelFactsEnabled: WORLD_MODEL_FACTS_ENABLED,
-              projectFacts: projectFactsForPrompt,
-            }),
-          },
-        ],
-        system: buildSystemPrompt(WORLD_MODEL_FACTS_ENABLED),
+      const systemPrompt = buildSystemPrompt(WORLD_MODEL_FACTS_ENABLED);
+      const userPrompt = buildUserPrompt(contextPackageForPrompt, {
+        worldModelFactsEnabled: WORLD_MODEL_FACTS_ENABLED,
+        projectFacts: projectFactsForPrompt,
       });
+
+      let responseText = "";
+      let tokensUsed = 0;
+      let response: any;
+
+      if (AI_PROVIDER === "openai") {
+        const openai = new OpenAI({ apiKey: Deno.env.get("OPENAI_API_KEY")! });
+        const completion = await openai.chat.completions.create({
+          model: MODEL_ID,
+          max_tokens: MAX_TOKENS,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+        });
+        response = completion;
+        responseText = completion.choices?.[0]?.message?.content || "";
+        tokensUsed = (completion.usage?.prompt_tokens || 0) + (completion.usage?.completion_tokens || 0);
+      } else {
+        const anthropic = new Anthropic({ apiKey: Deno.env.get("ANTHROPIC_API_KEY")! });
+        const msg = await anthropic.messages.create({
+          model: MODEL_ID,
+          max_tokens: MAX_TOKENS,
+          messages: [{ role: "user", content: userPrompt }],
+          system: systemPrompt,
+        });
+        response = msg;
+        const textBlock = msg.content.find((b: any) => b.type === "text");
+        responseText = textBlock?.type === "text" ? textBlock.text : "";
+        tokensUsed = (msg.usage?.input_tokens || 0) + (msg.usage?.output_tokens || 0);
+      }
+
       const inferenceElapsedMs = Date.now() - inferenceStart;
-      const tokensUsed = (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0);
-      const textBlock = response.content.find((b: any) => b.type === "text");
-      const responseText = textBlock?.type === "text" ? textBlock.text : "";
       const parsed = parseLlmJson<any>(responseText).value;
 
       return {
@@ -1207,6 +1293,54 @@ Deno.serve(async (req: Request) => {
           `[ai-router] World-model guardrail downgraded assignment: reason=${
             worldModelGuardrail.reason_code || "unknown"
           }`,
+        );
+      }
+    }
+
+    // ── M2-E: RRF TIER GUARDRAIL (post-inference) ─────────────
+    // Downgrade assign->review when the chosen project's evidence
+    // tier is weak or anti. Boost confidence floor for smoking_gun.
+    // Only active when rrf_score/evidence_tier_label is present.
+    if (rerankResult.reranked) {
+      const rrfGuardrail = applyRrfTierGuardrail({
+        decision,
+        project_id,
+        confidence,
+        candidates: context_package.candidates.map((c) => ({
+          project_id: c.project_id,
+          evidence: {
+            rrf_score: c.evidence.rrf_score,
+            evidence_tier_label: c.evidence.evidence_tier_label
+              || classifyEvidenceTier(c.evidence),
+          },
+        })),
+      });
+      rrfTierGuardrailDowngraded = rrfGuardrail.downgraded;
+      rrfTierGuardrailBoosted = rrfGuardrail.boosted;
+      rrfTierGuardrailReasonCode = rrfGuardrail.reason_code;
+      rrfTierGuardrailChosenTier = rrfGuardrail.chosen_tier;
+      rrfTierGuardrailChosenRrfScore = rrfGuardrail.chosen_rrf_score;
+      if (rrfGuardrail.decision !== decision) {
+        decision = rrfGuardrail.decision;
+      }
+      if (rrfGuardrail.confidence !== confidence) {
+        confidence = rrfGuardrail.confidence;
+      }
+      if (rrfGuardrail.downgraded) {
+        reasoning =
+          `${reasoning} rrf_tier_guardrail:${rrfGuardrail.reason_code || "downgraded_to_review"} (tier=${
+            rrfGuardrail.chosen_tier || "unknown"
+          }).`;
+        console.log(
+          `[ai-router] RRF tier guardrail downgraded assignment: reason=${
+            rrfGuardrail.reason_code || "unknown"
+          } tier=${rrfGuardrail.chosen_tier || "unknown"}`,
+        );
+      }
+      if (rrfGuardrail.boosted) {
+        reasoning = `${reasoning} rrf_tier_boost:confidence_floor_applied (tier=${rrfGuardrail.chosen_tier}).`;
+        console.log(
+          `[ai-router] RRF tier guardrail boosted confidence: tier=${rrfGuardrail.chosen_tier}`,
         );
       }
     }
@@ -1507,6 +1641,8 @@ Deno.serve(async (req: Request) => {
         geoOnly: !effectiveStrongAnchor && result.anchors.some((a) => a.match_type === "city_or_location"),
         commonAliasUnconfirmed: common_alias_unconfirmed,
         bizdevWithoutCommitment: bizdevGateEffective,
+        rrfTierDowngraded: rrfTierGuardrailDowngraded,
+        rrfTierReasonCode: rrfTierGuardrailReasonCode,
       });
 
       const context_payload = {
@@ -1536,6 +1672,15 @@ Deno.serve(async (req: Request) => {
         alias_guardrails: {
           common_alias_unconfirmed,
           flagged_alias_terms: common_alias_terms,
+        },
+        rrf_reranker: {
+          reranked: rerankResult.reranked,
+          scores: rerankResult.scores,
+          guardrail_downgraded: rrfTierGuardrailDowngraded,
+          guardrail_boosted: rrfTierGuardrailBoosted,
+          guardrail_reason: rrfTierGuardrailReasonCode,
+          chosen_tier: rrfTierGuardrailChosenTier,
+          chosen_rrf_score: rrfTierGuardrailChosenRrfScore,
         },
         bizdev_classifier: {
           call_type: bizdev_call_type,
@@ -1702,6 +1847,15 @@ Deno.serve(async (req: Request) => {
             },
           }
           : {}),
+        rrf_reranker: {
+          reranked: rerankResult.reranked,
+          scores_count: rerankResult.scores.length,
+          guardrail_downgraded: rrfTierGuardrailDowngraded,
+          guardrail_boosted: rrfTierGuardrailBoosted,
+          guardrail_reason: rrfTierGuardrailReasonCode,
+          chosen_tier: rrfTierGuardrailChosenTier,
+          chosen_rrf_score: rrfTierGuardrailChosenRrfScore,
+        },
         junk_call_prefilter: {
           applied: junkCallFiltered,
           reason_codes: junkCallFilterReasonCodes,

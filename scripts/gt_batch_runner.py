@@ -20,6 +20,7 @@ Input format (gt_batch_v1.csv or gt_batch_v1.json):
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import datetime as dt
 import json
@@ -460,6 +461,7 @@ def main() -> int:
     parser.add_argument("--out-root", default="/Users/chadbarlow/Desktop/gt_batch_runs")
     parser.add_argument("--wait-seconds", type=int, default=6)
     parser.add_argument("--timeout-seconds", type=int, default=180)
+    parser.add_argument("--concurrency", type=int, default=20, help="max parallel trigger requests (default 20)")
     parser.add_argument("--baseline", default="", help="optional prior run dir or metrics.json for diff")
     args = parser.parse_args()
 
@@ -507,6 +509,8 @@ def main() -> int:
     trigger_rows: List[Dict[str, str]] = []
     interaction_map: Dict[str, str] = {}
 
+    # Build trigger jobs (mode=none skips HTTP calls)
+    trigger_jobs: List[Dict] = []
     for idx, interaction_id in enumerate(unique_interactions, start=1):
         if args.mode == "none":
             interaction_map[interaction_id] = interaction_id
@@ -546,7 +550,21 @@ def main() -> int:
             }
             url = f"{supabase_url}/functions/v1/admin-reseed"
 
-        status, resp = post_json(url, payload, headers, timeout=args.timeout_seconds)
+        trigger_jobs.append({
+            "idx": idx,
+            "interaction_id": interaction_id,
+            "url": url,
+            "payload": payload,
+            "shadow_id": shadow_id,
+            "idem_key": idem_key,
+        })
+
+    def _fire_trigger(job: Dict) -> Dict[str, str]:
+        interaction_id = job["interaction_id"]
+        shadow_id = job["shadow_id"]
+        idem_key = job["idem_key"]
+
+        status, resp = post_json(job["url"], job["payload"], headers, timeout=args.timeout_seconds)
         response_file = trigger_dir / f"{interaction_id}.json"
         response_file.write_text(json.dumps({"http_status": status, "response": resp}, indent=2), encoding="utf-8")
 
@@ -564,21 +582,28 @@ def main() -> int:
             if not ok:
                 error = str(resp.get("error") if isinstance(resp, dict) else "admin_reseed_failed")
 
-        interaction_map[interaction_id] = run_interaction_id
+        return {
+            "interaction_id": interaction_id,
+            "run_interaction_id": run_interaction_id,
+            "mode": args.mode,
+            "ok": bool_to_str(ok),
+            "http_status": str(status),
+            "error": error,
+            "idempotency_key": idem_key,
+            "shadow_id": shadow_id,
+            "response_file": str(response_file),
+        }
 
-        trigger_rows.append(
-            {
-                "interaction_id": interaction_id,
-                "run_interaction_id": run_interaction_id,
-                "mode": args.mode,
-                "ok": bool_to_str(ok),
-                "http_status": str(status),
-                "error": error,
-                "idempotency_key": idem_key,
-                "shadow_id": shadow_id,
-                "response_file": str(response_file),
-            }
-        )
+    # Fire all triggers concurrently
+    if trigger_jobs:
+        max_workers = min(args.concurrency, len(trigger_jobs))
+        print(f"[gt-batch] Firing {len(trigger_jobs)} triggers with concurrency={max_workers}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_fire_trigger, job): job for job in trigger_jobs}
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                interaction_map[result["interaction_id"]] = result["run_interaction_id"]
+                trigger_rows.append(result)
 
     write_csv(run_dir / "trigger_results.csv", TRIGGER_FIELDS, trigger_rows)
 
