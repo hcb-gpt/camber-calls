@@ -50,7 +50,9 @@ jobs:
       - name: Setup Supabase CLI
         uses: supabase/setup-cli@v1
         with:
-          version: latest
+          # Pin to known-good version. `latest` caused deno.lock v5
+          # incompatibility that broke 14/19 deploys. Bump intentionally.
+          version: 2.76.8
 
       - name: Deploy function
         run: |
