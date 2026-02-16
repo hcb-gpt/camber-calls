@@ -36,3 +36,5 @@ Read-only query helpers for verifying time-sync invariants and provenance hygien
   - Oversize spans joined to interactions for owner/contact context (useful for GT acceptance like Randy Booth/Jimmy Chastain).
 - `interaction_transcript_parent_mismatch_v1.sql`
   - Detects interactions where `transcript_chars=0` while active conversation spans contain transcript text.
+- `review_queue_junk_candidates_v1.sql`
+  - Read-only candidate set for pending review_queue spans likely to be junk calls (voicemail, connection-failure, or minimal-content noise).
