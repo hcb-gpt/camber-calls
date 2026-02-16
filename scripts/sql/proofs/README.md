@@ -34,3 +34,5 @@ Read-only query helpers for verifying time-sync invariants and provenance hygien
   - Quantifies span attributions in last 30d that point to projects with `phase='closed'` (or closed-ish status) and breaks down by contact.
 - `span_oversize_last30d_with_people.sql`
   - Oversize spans joined to interactions for owner/contact context (useful for GT acceptance like Randy Booth/Jimmy Chastain).
+- `interaction_transcript_parent_mismatch_v1.sql`
+  - Detects interactions where `transcript_chars=0` while active conversation spans contain transcript text.
