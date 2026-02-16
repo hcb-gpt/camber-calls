@@ -33,11 +33,13 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { authErrorResponse, requireEdgeSecret } from "../_shared/auth.ts";
 
-const VERSION = "1.6.0"; // v1.6.0: duplicate-key race recovery for conversation_spans_active_unique
+const VERSION = "1.7.0"; // v1.7.0: fix human_lock_carryforward upsert to use span_model_prompt unique constraint
 const ALLOWED_SOURCES = ["admin-reseed", "system"];
 const CLOSE_LOOP_MAX_ATTEMPTS = 2;
 const CLOSE_LOOP_MODEL_ID = "admin-reseed-close-loop";
 const CLOSE_LOOP_PROMPT_VERSION = "v1";
+const CARRYFORWARD_MODEL_ID = "admin-reseed-human-lock-carryforward";
+const CARRYFORWARD_PROMPT_VERSION = "v1";
 const REROUTE_CONCURRENCY = Math.max(1, Number(Deno.env.get("ADMIN_RESEED_REROUTE_CONCURRENCY") || "4"));
 const INTERNAL_CALL_TIMEOUT_MS = Math.max(5000, Number(Deno.env.get("ADMIN_RESEED_INTERNAL_TIMEOUT_MS") || "18000"));
 
@@ -825,6 +827,8 @@ Deno.serve(async (req: Request) => {
           applied_project_id: info.applied_project_id,
           applied_at_utc: nowIso,
           needs_review: false,
+          model_id: CARRYFORWARD_MODEL_ID,
+          prompt_version: CARRYFORWARD_PROMPT_VERSION,
           attributed_by: `admin-reseed-${VERSION}`,
           attributed_at: nowIso,
           raw_response: {
@@ -841,7 +845,7 @@ Deno.serve(async (req: Request) => {
     if (carryRows.length > 0) {
       const { data: insertedRows, error: carryErr } = await db
         .from("span_attributions")
-        .upsert(carryRows, { onConflict: "span_id,project_id", ignoreDuplicates: false })
+        .upsert(carryRows, { onConflict: "span_id,model_id,prompt_version", ignoreDuplicates: false })
         .select("span_id");
 
       if (carryErr) {
