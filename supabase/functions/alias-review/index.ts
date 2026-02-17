@@ -312,7 +312,21 @@ async function approveOne(
 
     if (!rpcErr) {
       const result = typeof rpcData === "string" ? JSON.parse(rpcData) : rpcData;
-      return { ok: true, index, method: "rpc", ...result };
+      // Check cross-project collisions (informational)
+      const alias = result?.alias || result?.alias_text;
+      const projectId = result?.project_id;
+      let collisions: { project_id: string; project_name: string }[] = [];
+      if (alias && projectId) {
+        collisions = await findCollisions(db, alias, projectId);
+      }
+      return {
+        ok: true,
+        index,
+        method: "rpc",
+        ...result,
+        has_collisions: collisions.length > 0,
+        collisions,
+      };
     }
 
     // RPC not available — fall back to direct writes
@@ -391,6 +405,13 @@ async function approveOne(
       };
     }
 
+    // Check cross-project collisions (informational)
+    const collisions = await findCollisions(
+      db,
+      suggestion.alias,
+      suggestion.project_id,
+    );
+
     return {
       ok: true,
       index,
@@ -398,6 +419,8 @@ async function approveOne(
       suggestion_id: suggestionId,
       alias: suggestion.alias,
       project_id: suggestion.project_id,
+      has_collisions: collisions.length > 0,
+      collisions,
     };
   } catch (err) {
     console.error(

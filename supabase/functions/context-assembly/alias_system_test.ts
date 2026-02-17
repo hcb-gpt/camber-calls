@@ -135,28 +135,33 @@ Deno.test(
 );
 
 // ---------------------------------------------------------------------------
-// Helper: findTermInText (inlined copy for testing)
+// Helper: findTermInText (inlined copy for testing — scans ALL occurrences)
 // ---------------------------------------------------------------------------
 function findTermInText(textLower: string, termLower: string): number {
-  const idx = textLower.indexOf(termLower);
-  if (idx < 0) return -1;
-  const before = idx === 0 ? " " : textLower[idx - 1];
-  const afterIdx = idx + termLower.length;
-  const after = afterIdx >= textLower.length ? " " : textLower[afterIdx];
   const isWordChar = (ch: string) => /[a-z0-9]/i.test(ch);
-  if (isWordChar(before)) return -1;
-  if (isWordChar(after)) return -1;
-  if (after === "'" || after === "\u2019") {
-    const nextIdx = afterIdx + 1;
-    if (nextIdx < textLower.length && textLower[nextIdx].toLowerCase() === "s") {
-      const afterS = nextIdx + 1;
-      if (afterS >= textLower.length || !isWordChar(textLower[afterS])) {
-        return idx;
+  let startPos = 0;
+  while (startPos < textLower.length) {
+    const idx = textLower.indexOf(termLower, startPos);
+    if (idx < 0) return -1;
+    const before = idx === 0 ? " " : textLower[idx - 1];
+    const afterIdx = idx + termLower.length;
+    const after = afterIdx >= textLower.length ? " " : textLower[afterIdx];
+    if (!isWordChar(before) && !isWordChar(after)) return idx;
+    if (!isWordChar(before) && (after === "'" || after === "\u2019")) {
+      const nextIdx = afterIdx + 1;
+      if (
+        nextIdx < textLower.length &&
+        textLower[nextIdx].toLowerCase() === "s"
+      ) {
+        const afterS = nextIdx + 1;
+        if (afterS >= textLower.length || !isWordChar(textLower[afterS])) {
+          return idx;
+        }
       }
     }
-    return -1;
+    startPos = idx + 1;
   }
-  return idx;
+  return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +204,53 @@ Deno.test(
       r5,
       -1,
       "No boundary after term should NOT match",
+    );
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Test 5: findTermInText first-occurrence-only regression
+// ---------------------------------------------------------------------------
+Deno.test(
+  "findTermInText finds later occurrence when first is embedded",
+  () => {
+    // "preskelton" embeds "skelton" at idx 3 (non-boundary),
+    // but "skelton's house" has a valid match later.
+    const r1 = findTermInText(
+      "the preskelton area, skelton's house",
+      "skelton",
+    );
+    assertEquals(
+      r1,
+      21,
+      "Should skip embedded 'preskelton' and find valid match at idx 21",
+    );
+
+    // Multiple embedded, valid one at end
+    const r2 = findTermInText(
+      "preskelton and reskelton but skelton wins",
+      "skelton",
+    );
+    assertEquals(
+      r2 >= 0,
+      true,
+      "Should find the standalone 'skelton' after two embedded ones",
+    );
+    assertEquals(
+      r2,
+      29,
+      "Match should be at position 29 (after 'but ')",
+    );
+
+    // All embedded — no valid match
+    const r3 = findTermInText(
+      "preskelton and reskelton",
+      "skelton",
+    );
+    assertEquals(
+      r3,
+      -1,
+      "Should return -1 when all occurrences are embedded",
     );
   },
 );

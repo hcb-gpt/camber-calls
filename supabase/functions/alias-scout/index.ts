@@ -331,11 +331,31 @@ async function discoverTranscriptMining(
     return [];
   }
 
-  // Group transcript segments by project
+  // Validate project IDs are still active before processing
+  const rawProjectIds = [
+    ...new Set(
+      spans
+        .filter((r: Record<string, unknown>) => r.applied_project_id)
+        .map((r: Record<string, unknown>) => r.applied_project_id as string),
+    ),
+  ];
+  const { data: validProjects } = await db
+    .from("projects")
+    .select("id")
+    .in("id", rawProjectIds)
+    .in("status", ["active", "warranty", "estimating"])
+    .eq("project_kind", "client");
+
+  const validProjectIds = new Set(
+    (validProjects || []).map((p: { id: string }) => p.id),
+  );
+
+  // Group transcript segments by project (only active projects)
   const projectTerms: Map<string, Map<string, Set<string>>> = new Map();
 
   for (const row of spans) {
     const projectId = row.applied_project_id as string;
+    if (!validProjectIds.has(projectId)) continue;
     const span = row.span as Record<string, unknown> | null;
     if (!span?.transcript_segment) continue;
 

@@ -104,28 +104,33 @@ function stripSpeakerLabels(text: string): string {
   );
 }
 
-/** Word-boundary-aware term search - prevents partial word matches */
+/** Word-boundary-aware term search - scans ALL occurrences, not just first */
 function findTermInText(textLower: string, termLower: string): number {
-  const idx = textLower.indexOf(termLower);
-  if (idx < 0) return -1;
-  const before = idx === 0 ? " " : textLower[idx - 1];
-  const afterIdx = idx + termLower.length;
-  const after = afterIdx >= textLower.length ? " " : textLower[afterIdx];
   const isWordChar = (ch: string) => /[a-z0-9]/i.test(ch);
-  if (isWordChar(before)) return -1;
-  if (isWordChar(after)) return -1;
-  // Handle possessive 's / \u2019s — treat as valid word boundary
-  if (after === "'" || after === "\u2019") {
-    const nextIdx = afterIdx + 1;
-    if (nextIdx < textLower.length && textLower[nextIdx].toLowerCase() === "s") {
-      const afterS = nextIdx + 1;
-      if (afterS >= textLower.length || !isWordChar(textLower[afterS])) {
-        return idx; // possessive — valid match
+  let startPos = 0;
+  while (startPos < textLower.length) {
+    const idx = textLower.indexOf(termLower, startPos);
+    if (idx < 0) return -1;
+    const before = idx === 0 ? " " : textLower[idx - 1];
+    const afterIdx = idx + termLower.length;
+    const after = afterIdx >= textLower.length ? " " : textLower[afterIdx];
+    if (!isWordChar(before) && !isWordChar(after)) return idx;
+    // Handle possessive 's / \u2019s — treat as valid word boundary
+    if (!isWordChar(before) && (after === "'" || after === "\u2019")) {
+      const nextIdx = afterIdx + 1;
+      if (
+        nextIdx < textLower.length &&
+        textLower[nextIdx].toLowerCase() === "s"
+      ) {
+        const afterS = nextIdx + 1;
+        if (afterS >= textLower.length || !isWordChar(textLower[afterS])) {
+          return idx; // possessive — valid match
+        }
       }
     }
-    return -1; // apostrophe mid-word (e.g., O'Neal) — not a boundary
+    startPos = idx + 1;
   }
-  return idx;
+  return -1;
 }
 
 /** Normalize alias terms (dedupe, min length) */
