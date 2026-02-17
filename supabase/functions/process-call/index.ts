@@ -112,7 +112,19 @@ function findTermInText(textLower: string, termLower: string): number {
   const afterIdx = idx + termLower.length;
   const after = afterIdx >= textLower.length ? " " : textLower[afterIdx];
   const isWordChar = (ch: string) => /[a-z0-9]/i.test(ch);
-  if (isWordChar(before) || isWordChar(after)) return -1;
+  if (isWordChar(before)) return -1;
+  if (isWordChar(after)) return -1;
+  // Handle possessive 's / \u2019s — treat as valid word boundary
+  if (after === "'" || after === "\u2019") {
+    const nextIdx = afterIdx + 1;
+    if (nextIdx < textLower.length && textLower[nextIdx].toLowerCase() === "s") {
+      const afterS = nextIdx + 1;
+      if (afterS >= textLower.length || !isWordChar(textLower[afterS])) {
+        return idx; // possessive — valid match
+      }
+    }
+    return -1; // apostrophe mid-word (e.g., O'Neal) — not a boundary
+  }
   return idx;
 }
 
