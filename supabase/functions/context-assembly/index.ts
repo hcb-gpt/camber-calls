@@ -604,6 +604,10 @@ const WORLD_MODEL_FACTS_MAX_PER_PROJECT = clamp(
   0,
   50,
 );
+const DISABLE_INTERACTION_PROJECT_ID_FALLBACKS = parseBoolEnv(
+  "DISABLE_INTERACTION_PROJECT_ID_FALLBACKS",
+  false,
+);
 
 function tokenizeTextForOverlap(text: string): string[] {
   return (text || "")
@@ -1263,9 +1267,12 @@ Deno.serve(async (req: Request) => {
     let effective_fanout = 0;
     let floater_flag = false; // Backwards compat: derived from fanout_class
 
+    const interactionContactColumns = DISABLE_INTERACTION_PROJECT_ID_FALLBACKS
+      ? "contact_id, contact_name, contact_phone, event_at_utc"
+      : "contact_id, contact_name, contact_phone, event_at_utc, project_id";
     const { data: interaction } = await db
       .from("interactions")
-      .select("contact_id, contact_name, contact_phone, event_at_utc, project_id")
+      .select(interactionContactColumns)
       .eq("interaction_id", interaction_id)
       .single();
 
@@ -1274,7 +1281,9 @@ Deno.serve(async (req: Request) => {
       contact_name = interaction.contact_name;
       contact_phone = interaction.contact_phone;
       event_at_utc = interaction.event_at_utc;
-      interaction_project_id = interaction.project_id || null;
+      if (!DISABLE_INTERACTION_PROJECT_ID_FALLBACKS) {
+        interaction_project_id = interaction.project_id || null;
+      }
     }
 
     if (contact_id) {
@@ -1335,7 +1344,9 @@ Deno.serve(async (req: Request) => {
         const { data: prows } = await db
           .from("projects")
           .select("id, name")
-          .in("id", projectIds);
+          .in("id", projectIds)
+          .in("status", VALID_PROJECT_STATUSES)
+          .eq("project_kind", VALID_PROJECT_KIND);
 
         const nameById = new Map((prows || []).map((p) => [p.id, p.name]));
 
@@ -1630,7 +1641,7 @@ Deno.serve(async (req: Request) => {
     }
 
     // SOURCE 3: existing_project from interactions
-    {
+    if (!DISABLE_INTERACTION_PROJECT_ID_FALLBACKS) {
       const { data: irows } = await db
         .from("interactions")
         .select("project_id")
@@ -1679,7 +1690,10 @@ Deno.serve(async (req: Request) => {
       callbackSpans = findCallbackPhraseSpans(transcriptClean, transcriptLower);
 
       // Fetch all projects + aliases for matching
-      const { data: allProjects } = await db.from("projects").select("id, name, aliases, city, address");
+      // PR-11: Filter by status and project_kind to exclude inactive/internal projects
+      const { data: allProjects } = await db.from("projects").select("id, name, aliases, city, address")
+        .in("status", VALID_PROJECT_STATUSES)
+        .eq("project_kind", VALID_PROJECT_KIND);
 
       // Pre-filter transcript-scan project corpus by blocklist; final global filter is applied later.
       const projects = (allProjects || []).filter(
@@ -2070,7 +2084,7 @@ Deno.serve(async (req: Request) => {
       for (const pid of candidatesById.keys()) {
         claimProjectIds.add(pid);
       }
-      if (!claimProjectIds.size && interaction_project_id) {
+      if (!DISABLE_INTERACTION_PROJECT_ID_FALLBACKS && !claimProjectIds.size && interaction_project_id) {
         claimProjectIds.add(interaction_project_id);
       }
 
@@ -2118,7 +2132,7 @@ Deno.serve(async (req: Request) => {
                 ? source
                   ? matchesJournalSourceContact(contact_id, contact_phone, source.contact_id, source.contact_phone)
                   : false
-                : interaction_project_id
+                : !DISABLE_INTERACTION_PROJECT_ID_FALLBACKS && interaction_project_id
                 ? row.project_id === interaction_project_id
                 : false;
 
@@ -2373,8 +2387,8 @@ Deno.serve(async (req: Request) => {
             const { data: activeProjects } = await db
               .from("projects")
               .select("id, contract_value")
-              .eq("status", "active")
-              .eq("project_kind", "client")
+              .in("status", VALID_PROJECT_STATUSES)
+              .eq("project_kind", VALID_PROJECT_KIND)
               .not("contract_value", "is", null);
 
             if (activeProjects?.length) {
@@ -2444,7 +2458,8 @@ Deno.serve(async (req: Request) => {
               .from("projects")
               .select("id")
               .in("id", specProjectIds)
-              .eq("status", "active");
+              .in("status", VALID_PROJECT_STATUSES)
+              .eq("project_kind", VALID_PROJECT_KIND);
 
             const activeIds = new Set((activeProjects || []).map((p) => p.id));
             const matchedProjects = specRows.filter((r) => activeIds.has(r.project_id));
@@ -2483,9 +2498,12 @@ Deno.serve(async (req: Request) => {
         const eventMs = Date.parse(event_at_utc);
         if (!Number.isNaN(eventMs)) {
           const sinceIso = new Date(eventMs - CONTINUITY_LOOKBACK_HOURS * 60 * 60 * 1000).toISOString();
+          const continuityPriorColumns = DISABLE_INTERACTION_PROJECT_ID_FALLBACKS
+            ? "interaction_id, event_at_utc"
+            : "interaction_id, project_id, event_at_utc";
           const { data: priorRows } = await db
             .from("interactions")
-            .select("interaction_id, project_id, event_at_utc")
+            .select(continuityPriorColumns)
             .eq("contact_id", contact_id)
             .lt("event_at_utc", event_at_utc)
             .gte("event_at_utc", sinceIso)
@@ -2493,11 +2511,18 @@ Deno.serve(async (req: Request) => {
             .limit(CONTINUITY_MAX_PRIOR_CALLS * 2);
 
           const projectIds = Array.from(
-            new Set((priorRows || []).map((r) => r.project_id).filter(Boolean) as string[]),
+            new Set(
+              (!DISABLE_INTERACTION_PROJECT_ID_FALLBACKS
+                ? (priorRows || []).map((r) => r.project_id).filter(Boolean)
+                : [])
+                .map((id) => String(id)),
+            ),
           );
           const priorProjectNames = new Map<string, string>();
-          if (projectIds.length) {
-            const { data: pnameRows } = await db.from("projects").select("id, name").in("id", projectIds);
+          if (projectIds.length && !DISABLE_INTERACTION_PROJECT_ID_FALLBACKS) {
+            const { data: pnameRows } = await db.from("projects").select("id, name").in("id", projectIds)
+              .in("status", VALID_PROJECT_STATUSES)
+              .eq("project_kind", VALID_PROJECT_KIND);
             for (const r of (pnameRows || [])) {
               if (r.id) priorProjectNames.set(r.id, r.name || r.id);
             }
@@ -2536,8 +2561,12 @@ Deno.serve(async (req: Request) => {
 
             continuity_links.push({
               prior_interaction_id: row.interaction_id,
-              prior_project_id: row.project_id || null,
-              prior_project_name: row.project_id ? priorProjectNames.get(row.project_id) || row.project_id : null,
+              prior_project_id: DISABLE_INTERACTION_PROJECT_ID_FALLBACKS ? null : row.project_id || null,
+              prior_project_name: DISABLE_INTERACTION_PROJECT_ID_FALLBACKS
+                ? null
+                : row.project_id
+                ? priorProjectNames.get(row.project_id) || row.project_id
+                : null,
               prior_event_at_utc: row.event_at_utc || null,
               gap_minutes: gapMinutes,
               tier,
