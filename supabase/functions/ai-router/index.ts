@@ -1,10 +1,18 @@
 /**
- * ai-router Edge Function v1.14.0
+ * ai-router Edge Function v1.15.0
  * LLM-based project attribution for conversation spans
  *
- * @version 1.14.0
- * @date 2026-02-15
+ * @version 1.15.0
+ * @date 2026-02-17
  * @purpose Use Claude Haiku to attribute spans to projects with anchored evidence
+ *
+ * v1.15.0 Changes (3-band decision policy):
+ * - Replaces 2-band confidence gate (assign/none) with 3-band (assign/review/none).
+ * - Lowers THRESHOLD_REVIEW from 0.50 to 0.25, widening the review band and shrinking "none".
+ * - Adds safe low-confidence assign path: promotes review→assign when confidence >= 0.40
+ *   AND guardrails are satisfied (anchored contact + strong alias, or smoking_gun tier).
+ * - Updates prompt to instruct LLM to always include best candidate in review decisions.
+ * - Adds candidate_project_id to review_queue context_payload for downstream processing.
  *
  * CORE PRINCIPLE: span_attributions is the single source of truth.
  * NO writes to interactions.project_id from this path.
@@ -103,8 +111,8 @@ import {
   type WorldModelReference,
 } from "./world_model_facts.ts";
 
-const PROMPT_VERSION_BASE = "v1.11.0";
-const FUNCTION_VERSION = "v1.14.0";
+const PROMPT_VERSION_BASE = "v1.13.0";
+const FUNCTION_VERSION = "v1.15.0";
 const MODEL_ID = "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
 const WORLD_MODEL_FACTS_ENABLED = parseBoolEnv(Deno.env.get("WORLD_MODEL_FACTS_ENABLED"), false);
@@ -114,9 +122,10 @@ const WORLD_MODEL_FACTS_MAX_PER_PROJECT = Math.max(
 );
 const PROMPT_VERSION = WORLD_MODEL_FACTS_ENABLED ? "v1.12.0_world_model_facts" : PROMPT_VERSION_BASE;
 
-// Confidence thresholds
+// Confidence thresholds (3-band policy v1.15.0)
 const THRESHOLD_AUTO_ASSIGN = 0.75;
-const THRESHOLD_REVIEW = 0.50;
+const THRESHOLD_REVIEW = 0.25;
+const THRESHOLD_SAFE_LOW_ASSIGN = 0.40;
 
 // Defense-in-depth: closed-project hard filter (mirrors context-assembly VALID_PROJECT_STATUSES)
 const ATTRIBUTION_ELIGIBLE_STATUSES = new Set(["active", "warranty", "estimating"]);
@@ -526,6 +535,48 @@ function deriveEvidenceTier(anchors: Anchor[], confidence: number, modelError: b
   return 3;
 }
 
+/**
+ * Safe low-confidence assign (v1.15.0 3-band policy).
+ * Promotes review→assign when guardrails make it safe:
+ * - Anchored contact (fanout=1) with at least one strong alias match on the chosen project
+ * - Smoking_gun evidence tier on the chosen project
+ * Requires confidence >= THRESHOLD_SAFE_LOW_ASSIGN (0.40).
+ */
+function evaluateSafeLowConfidenceAssign(opts: {
+  decision: "assign" | "review" | "none";
+  project_id: string | null;
+  confidence: number;
+  fanout_class: string;
+  candidates: ContextPackage["candidates"];
+}): { promoted: boolean; reason: string | null } {
+  if (opts.decision !== "review" || !opts.project_id) {
+    return { promoted: false, reason: null };
+  }
+  if (opts.confidence < THRESHOLD_SAFE_LOW_ASSIGN) {
+    return { promoted: false, reason: null };
+  }
+
+  const chosen = opts.candidates.find((c) => c.project_id === opts.project_id);
+  if (!chosen) return { promoted: false, reason: null };
+
+  // Safe path 1: anchored contact with strong alias match on this project
+  if (opts.fanout_class === "anchored") {
+    const strongMatchTypes = new Set(["exact_project_name", "alias", "address_fragment", "client_name"]);
+    const hasStrongMatch = chosen.evidence.alias_matches.some((m) => strongMatchTypes.has(m.match_type));
+    if (hasStrongMatch) {
+      return { promoted: true, reason: "safe_anchored_contact_strong_match" };
+    }
+  }
+
+  // Safe path 2: smoking_gun evidence tier
+  const tierLabel = (chosen.evidence as any).evidence_tier_label;
+  if (tierLabel === "smoking_gun") {
+    return { promoted: true, reason: "safe_smoking_gun_tier" };
+  }
+
+  return { promoted: false, reason: null };
+}
+
 function canOverwriteLock(currentLock: string | null, newLock: string | null): boolean {
   const lockOrder: Record<string, number> = { "human": 3, "ai": 2 };
   const currentLevel = lockOrder[currentLock || ""] || 0;
@@ -643,8 +694,8 @@ RULES:
    - floater (fanout>=5): ANTI-SIGNAL. Treat like HCB staff for attribution — prioritize transcript anchors only
    - unknown (fanout=0): No project association — no signal from identity
 4. If multiple projects are mentioned, choose the PRIMARY topic of discussion
-5. If uncertain, choose "review" with confidence 0.50-0.74
-6. If no clear project match exists in the transcript, choose "none" with confidence <0.50
+5. If uncertain but you have a candidate, choose "review" with confidence 0.25-0.74 and ALWAYS include your best project_id guess
+6. Only choose "none" with confidence <0.25 when the transcript has truly NO project-related content (admin, overhead, wrong number, etc.)
 7. Common-word/material aliases (for example color/material terms like "white", "mystery white", "granite") are ambiguous and CANNOT be sole evidence for decision="assign"
 8. If a common-word alias appears, require corroboration in transcript from exact project name, address fragment, or client name before decision="assign"
 
@@ -672,10 +723,10 @@ GEO CONTEXT (when available):
 - Destination/origin roles can increase confidence inside review band when transcript anchors already exist.
 - If geo conflicts with strong transcript anchors, trust transcript anchors.
 
-CONFIDENCE THRESHOLDS:
+CONFIDENCE THRESHOLDS (3-band policy):
 - 0.75-1.00: Strong transcript-grounded evidence, safe to auto-assign
-- 0.50-0.74: Moderate evidence, needs human review
-- 0.00-0.49: Weak/no evidence, no assignment
+- 0.25-0.74: Some evidence exists, needs human review — ALWAYS include your best candidate project_id and reasoning
+- 0.00-0.24: No meaningful evidence at all, truly no project match
 
 ANCHOR STRENGTH POLICY:
 To use decision="assign", you MUST have at least one STRONG anchor type:
@@ -1160,6 +1211,27 @@ Deno.serve(async (req: Request) => {
       decision = "none";
     }
 
+    // v1.15.0: Safe low-confidence assign — promote review→assign when guardrails are satisfied
+    if (decision === "review" && project_id) {
+      const fanoutClass = context_package.contact?.fanout_class ||
+        (context_package.contact?.floater_flag ? "floater" : "unknown");
+      const safeLowAssign = evaluateSafeLowConfidenceAssign({
+        decision,
+        project_id,
+        confidence,
+        fanout_class: fanoutClass,
+        candidates: context_package.candidates || [],
+      });
+      if (safeLowAssign.promoted) {
+        decision = "assign";
+        confidence = Math.max(confidence, THRESHOLD_AUTO_ASSIGN);
+        reasoning = `${reasoning} safe_low_confidence_assign: ${safeLowAssign.reason}.`;
+        console.log(
+          `[ai-router] Safe low-confidence assign promoted review→assign: project=${project_id} reason=${safeLowAssign.reason}`,
+        );
+      }
+    }
+
     const bizdevGate = applyBizDevCommitmentGate({
       transcript: spanTranscript,
       decision,
@@ -1512,6 +1584,8 @@ Deno.serve(async (req: Request) => {
       const context_payload = {
         span_id,
         interaction_id,
+        candidate_project_id: result.project_id,
+        candidate_confidence: result.confidence,
         transcript_snippet: sanitizeTranscriptText(context_package.span?.transcript_text || "", "default").text
           .slice(0, 600),
         candidates: context_package.candidates?.map((c) => ({
