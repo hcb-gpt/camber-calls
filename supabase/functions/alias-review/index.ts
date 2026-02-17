@@ -82,9 +82,9 @@ Deno.serve(async (req: Request) => {
   // 3. ROUTE BY METHOD
   // ========================================
   if (req.method === "GET") {
-    return handleGet(db, req, t0);
+    return await handleGet(db, req, t0);
   }
-  return handlePost(db, req, t0);
+  return await handlePost(db, req, t0);
 });
 
 // ============================================================
