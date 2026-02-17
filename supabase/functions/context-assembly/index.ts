@@ -606,7 +606,7 @@ const WORLD_MODEL_FACTS_MAX_PER_PROJECT = clamp(
 );
 const DISABLE_INTERACTION_PROJECT_ID_FALLBACKS = parseBoolEnv(
   "DISABLE_INTERACTION_PROJECT_ID_FALLBACKS",
-  true,
+  false,
 );
 
 function tokenizeTextForOverlap(text: string): string[] {
