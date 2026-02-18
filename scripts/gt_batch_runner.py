@@ -461,6 +461,7 @@ def main() -> int:
     parser.add_argument("--wait-seconds", type=int, default=6)
     parser.add_argument("--timeout-seconds", type=int, default=180)
     parser.add_argument("--baseline", default="", help="optional prior run dir or metrics.json for diff")
+    parser.add_argument("--force", action="store_true", help="pass force=true to admin-reseed (cascade delete before re-segment)")
     args = parser.parse_args()
 
     supabase_url = ensure_env("SUPABASE_URL")
@@ -501,7 +502,7 @@ def main() -> int:
         "Authorization": f"Bearer {service_role}",
         "apikey": service_role,
         "X-Edge-Secret": edge_secret,
-        "X-Source": "gt-batch-runner",
+        "X-Source": "admin-reseed",
     }
 
     trigger_rows: List[Dict[str, str]] = []
@@ -543,10 +544,16 @@ def main() -> int:
                 "idempotency_key": idem_key,
                 "reason": "gt_batch_runner_v1",
                 "requested_by": "dev-1",
+                "force": args.force,
             }
             url = f"{supabase_url}/functions/v1/admin-reseed"
 
         status, resp = post_json(url, payload, headers, timeout=args.timeout_seconds)
+        # Retry once on 504 Gateway Timeout with 10s backoff
+        if status == 504:
+            print(f"  [{idx}/{len(unique_interactions)}] {interaction_id}: 504 timeout, retrying in 10s...")
+            time.sleep(10)
+            status, resp = post_json(url, payload, headers, timeout=args.timeout_seconds)
         response_file = trigger_dir / f"{interaction_id}.json"
         response_file.write_text(json.dumps({"http_status": status, "response": resp}, indent=2), encoding="utf-8")
 
