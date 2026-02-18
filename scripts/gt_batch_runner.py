@@ -461,6 +461,7 @@ def main() -> int:
     parser.add_argument("--wait-seconds", type=int, default=6)
     parser.add_argument("--timeout-seconds", type=int, default=180)
     parser.add_argument("--baseline", default="", help="optional prior run dir or metrics.json for diff")
+    parser.add_argument("--force", action="store_true", help="pass force=true to admin-reseed (cascade delete before re-segment)")
     args = parser.parse_args()
 
     supabase_url = ensure_env("SUPABASE_URL")
@@ -543,6 +544,7 @@ def main() -> int:
                 "idempotency_key": idem_key,
                 "reason": "gt_batch_runner_v1",
                 "requested_by": "dev-1",
+                "force": args.force,
             }
             url = f"{supabase_url}/functions/v1/admin-reseed"
 
