@@ -11,15 +11,24 @@ If the user’s first message is a role statement (examples: “you are strat”
 “you are dev”, “set role data”), treat it as session role selection. Valid roles
 are: `CHAD`, `DEV`, `DATA`, `STRAT`.
 
-Immediately after role is set, boot via MCP by fetching these four Orbit docs
-(canonical IDs; no duplicates):
+Immediately after role is set, fetch exactly these four Orbit docs (canonical
+IDs; no duplicates):
 
 1) `boot-protocol`
 2) `roles`
 3) `role-boundaries`
 4) `charter`
 
-Use `mcp__camber__fetch` with `id="<slug>"`.
+**Boot Protocol v2 (alias-first):** use the MCP tool `mcp__camber__fetch` in
+this order:
+- `id="b"`; fallback `id="boot-protocol"`
+- `id="r"`; fallback `id="roles"`
+- `id="rb"`; fallback `id="role-boundaries"`
+- `id="c"`; fallback `id="charter"`
+
+Only if MCP fetch is blocked / not_found / unavailable for the session, fall
+back to local disk reads from `/Users/chadbarlow/gh/hcb-gpt/orbit/docs/`.
+**Do not read local files during boot unless MCP fetch fails.**
 
 If any fetch fails (blocked / not_found / empty), stop and report via TRAM:
 
