@@ -33,7 +33,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { authErrorResponse, requireEdgeSecret } from "../_shared/auth.ts";
 
-const VERSION = "1.8.0"; // v1.8.0: add force param for FK cascade delete before re-segmentation
+const VERSION = "1.9.0"; // v1.9.0: canonical transcript lookup via v_canonical_transcripts view
 const ALLOWED_SOURCES = ["admin-reseed", "system"];
 const CLOSE_LOOP_MAX_ATTEMPTS = 2;
 const CLOSE_LOOP_MODEL_ID = "admin-reseed-close-loop";
@@ -131,6 +131,7 @@ interface ReseedReceipt {
   reroute_attempted?: number;
   reroute_succeeded?: number;
   reroute_failed?: number;
+  transcript_source?: string | null;
   insert_conflict_recovered?: boolean;
   conflict_constraint?: string | null;
   adopted_generation?: number | null;
@@ -409,17 +410,17 @@ Deno.serve(async (req: Request) => {
   // ========================================
   // 9. FETCH TRANSCRIPT FOR RECHUNKING
   // ========================================
-  // Try transcripts_comparison first (canonical source)
+  // Try v_canonical_transcripts first (canonical source — returns single winner row per interaction)
   const { data: transcriptData } = await db
-    .from("transcripts_comparison")
-    .select("transcript, words")
+    .from("v_canonical_transcripts")
+    .select("transcript, words, transcript_source")
     .eq("interaction_id", interaction_id)
-    .order("created_at", { ascending: false })
-    .limit(1)
     .maybeSingle();
 
   let transcript = transcriptData?.transcript || "";
-  let transcriptSource: string | null = transcript ? "transcripts_comparison" : null;
+  let transcriptSource: string | null = transcriptData?.transcript
+    ? (transcriptData?.transcript_source || "v_canonical_transcripts")
+    : null;
 
   if (!transcript) {
     // Fallback 2: canonical raw call transcript source
@@ -970,6 +971,7 @@ Deno.serve(async (req: Request) => {
     human_locked_spans: humanLockedSpans.length > 0 ? humanLockedSpans : undefined,
     human_lock_count: humanLockedSpans.length > 0 ? humanLockedSpans.length : 0,
     human_lock_carryforward_count: humanLockCarryforwardCount,
+    transcript_source: transcriptSource,
     superseded_span_ids: activeSpanIds,
     new_span_ids: newSpanIds,
     reroute_triggered: false,
@@ -1093,6 +1095,7 @@ Deno.serve(async (req: Request) => {
     spans_total: newSpanIds.length,
     spans_active: newSpanIds.length,
     reroute_triggered: receipt.reroute_triggered,
+    transcript_source: transcriptSource || "none",
   });
 
   console.log(

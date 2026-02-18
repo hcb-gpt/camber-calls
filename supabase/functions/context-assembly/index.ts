@@ -1,9 +1,9 @@
 /**
- * context-assembly Edge Function v2.1.1
+ * context-assembly Edge Function v2.2.0
  * Assembles LLM-ready context_package from span_id (SPAN-FIRST)
  *
- * @version 2.1.1
- * @date 2026-02-15
+ * @version 2.2.0
+ * @date 2026-02-18
  * @purpose Provide rich context for AI Router project attribution
  * @port 6-source candidate collection from process-call v3.9.6
  *
@@ -91,7 +91,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { computeClaimCrossref } from "./claim_crossref.ts";
 import { findHomeownerOverrideConflict, isHomeownerRoleLabel } from "./homeowner_override.ts";
 
-const ASSEMBLY_VERSION = "v2.1.1"; // v2.1.1: P0 homeowner override + contradiction escape hatch
+const ASSEMBLY_VERSION = "v2.2.0"; // v2.2.0: canonical transcript lookup via v_canonical_transcripts
 const SELECTION_RULES_VERSION = "v1.0.0";
 const MAX_CANDIDATES = 8;
 const MAX_CANDIDATES_FLOATER = 12; // Expanded for internal floater contacts
@@ -1283,16 +1283,14 @@ Deno.serve(async (req: Request) => {
     const start_ms = span.time_start_sec != null ? span.time_start_sec * 1000 : null;
     const end_ms = span.time_end_sec != null ? span.time_end_sec * 1000 : null;
 
-    // Fetch words from transcripts_comparison
+    // Fetch words from canonical transcript view (v2.2.0)
     let words: any[] | undefined;
     const { data: tc } = await db
-      .from("transcripts_comparison")
-      .select("words")
+      .from("v_canonical_transcripts")
+      .select("words, transcript_source")
       .eq("interaction_id", interaction_id)
       .not("words", "is", null)
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .single();
+      .maybeSingle();
 
     if (tc?.words && Array.isArray(tc.words)) {
       words = tc.words;
@@ -3226,6 +3224,7 @@ Deno.serve(async (req: Request) => {
         homeowner_override_conflict_project_id: homeownerOverrideConflictProjectId,
         homeowner_override_conflict_term: homeownerOverrideConflictTerm,
         homeowner_override_skipped_reason: homeownerOverrideSkippedReason,
+        transcript_source: tc?.transcript_source || null,
       },
       span: {
         start_ms,
