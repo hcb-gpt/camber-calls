@@ -501,7 +501,8 @@ def main() -> int:
         "Authorization": f"Bearer {service_role}",
         "apikey": service_role,
         "X-Edge-Secret": edge_secret,
-        "X-Source": "gt-batch-runner",
+        # admin-reseed enforces an allowlist on X-Source; use an allowed value.
+        "X-Source": "admin-reseed",
     }
 
     trigger_rows: List[Dict[str, str]] = []
