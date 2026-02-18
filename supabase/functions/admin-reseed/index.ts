@@ -419,6 +419,31 @@ Deno.serve(async (req: Request) => {
     .maybeSingle();
 
   let transcript = transcriptData?.transcript || "";
+  let transcriptSource: string | null = transcript ? "transcripts_comparison" : null;
+
+  if (!transcript) {
+    // Fallback 2: canonical raw call transcript source
+    const { data: callsRawData, error: callsRawErr } = await db
+      .from("calls_raw")
+      .select("transcript")
+      .eq("interaction_id", interaction_id)
+      .order("ingested_at_utc", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (callsRawErr) {
+      console.error("[admin-reseed] Failed to fetch calls_raw transcript:", callsRawErr.message);
+      return jsonResponse({ ok: false, error: "db_read_failed", detail: `calls_raw: ${callsRawErr.message}` }, 500);
+    }
+
+    if (callsRawData?.transcript) {
+      transcript = callsRawData.transcript;
+      transcriptSource = "calls_raw";
+      console.log(
+        `[admin-reseed] Using calls_raw transcript fallback for interaction=${interaction_id}, length=${transcript.length}`,
+      );
+    }
+  }
 
   // Fallback: reconstruct from existing spans if no transcript_comparison
   if (!transcript) {
@@ -457,6 +482,7 @@ Deno.serve(async (req: Request) => {
           .map((s) => s.transcript_segment || "")
           .filter(Boolean)
           .join("\n\n");
+        transcriptSource = `reconstructed_${fallbackSource}_spans`;
         console.log(
           `[admin-reseed] Reconstructed transcript from ${spanTexts.length} ${fallbackSource} spans, ${transcript.length} chars`,
         );
@@ -494,6 +520,7 @@ Deno.serve(async (req: Request) => {
       transcript_chars: transcriptChars,
       reseed_mode: mode,
       reroute: rerouteMode,
+      transcript_source: transcriptSource || "none",
     });
 
     // Structured log: reseed_segment_request
