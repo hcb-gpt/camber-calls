@@ -263,6 +263,20 @@
         "name_b": "John Smith",
         "expected_decision": "REJECT",
         "reason": "placeholder name — not a real identity"
+      },
+      {
+        "id": "NP-31",
+        "name_a": "Lou",
+        "name_b": "Luis",
+        "expected_decision": "REJECT",
+        "reason": "Lou (English diminutive of Louise, client Lou Winship) vs Luis (Spanish given name, vendor Luis Juarez) — phonetically similar but different people. Double Metaphone: Lou=L, Luis=LS — different codes but short-token risk."
+      },
+      {
+        "id": "NP-32",
+        "name_a": "Lou Winship",
+        "name_b": "Luis Juarez",
+        "expected_decision": "REJECT",
+        "reason": "Full name disambiguation — different first names (Lou vs Luis) AND different last names (Winship vs Juarez). No nickname whitelist path connects these."
       }
     ],
     "anchor_integration": [
