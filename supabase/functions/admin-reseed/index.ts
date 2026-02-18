@@ -33,7 +33,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { authErrorResponse, requireEdgeSecret } from "../_shared/auth.ts";
 
-const VERSION = "1.7.0"; // v1.7.0: fix human_lock_carryforward upsert to use span_model_prompt unique constraint
+const VERSION = "1.8.0"; // v1.8.0: add force param for FK cascade delete before re-segmentation
 const ALLOWED_SOURCES = ["admin-reseed", "system"];
 const CLOSE_LOOP_MAX_ATTEMPTS = 2;
 const CLOSE_LOOP_MODEL_ID = "admin-reseed-close-loop";
@@ -109,6 +109,7 @@ interface ReseedRequest {
   idempotency_key: string;
   mode?: "resegment_only" | "resegment_and_reroute" | "reseed_and_close_loop";
   requested_by?: string;
+  force?: boolean;
 }
 
 interface ReseedReceipt {
@@ -182,6 +183,7 @@ Deno.serve(async (req: Request) => {
     idempotency_key,
     mode = "resegment_only",
     requested_by = "system",
+    force = false,
   } = body;
 
   // Validate required fields
@@ -311,21 +313,84 @@ Deno.serve(async (req: Request) => {
   }
 
   // ========================================
-  // 7. HUMAN LOCK GATE
+  // 7. FORCE CASCADE DELETE (when force=true)
+  // Deletes all dependent data in FK order before re-segmenting.
+  // Order: striking_signals → journal_claims → span_attributions → conversation_spans
+  // ========================================
+  if (force) {
+    const { data: allSpans, error: allSpanErr } = await db
+      .from("conversation_spans")
+      .select("id")
+      .eq("interaction_id", interaction_id);
+
+    if (allSpanErr) {
+      console.error("[admin-reseed] Force cascade: failed to fetch all spans:", allSpanErr.message);
+      return jsonResponse({ ok: false, error: "db_read_failed", detail: allSpanErr.message }, 500);
+    }
+
+    const allSpanIdsForDelete = (allSpans || []).map((s: any) => s.id as string);
+
+    if (allSpanIdsForDelete.length > 0) {
+      // 1. striking_signals
+      const { error: ssErr } = await db
+        .from("striking_signals")
+        .delete()
+        .in("span_id", allSpanIdsForDelete);
+      if (ssErr) {
+        console.error("[admin-reseed] Force cascade: striking_signals delete failed:", ssErr.message);
+        return jsonResponse({ ok: false, error: "cascade_delete_failed", detail: `striking_signals: ${ssErr.message}` }, 500);
+      }
+
+      // 2. journal_claims
+      const { error: jcErr } = await db
+        .from("journal_claims")
+        .delete()
+        .in("span_id", allSpanIdsForDelete);
+      if (jcErr) {
+        console.error("[admin-reseed] Force cascade: journal_claims delete failed:", jcErr.message);
+        return jsonResponse({ ok: false, error: "cascade_delete_failed", detail: `journal_claims: ${jcErr.message}` }, 500);
+      }
+
+      // 3. span_attributions
+      const { error: saErr } = await db
+        .from("span_attributions")
+        .delete()
+        .in("span_id", allSpanIdsForDelete);
+      if (saErr) {
+        console.error("[admin-reseed] Force cascade: span_attributions delete failed:", saErr.message);
+        return jsonResponse({ ok: false, error: "cascade_delete_failed", detail: `span_attributions: ${saErr.message}` }, 500);
+      }
+
+      // 4. conversation_spans (all for this interaction)
+      const { error: csErr } = await db
+        .from("conversation_spans")
+        .delete()
+        .eq("interaction_id", interaction_id);
+      if (csErr) {
+        console.error("[admin-reseed] Force cascade: conversation_spans delete failed:", csErr.message);
+        return jsonResponse({ ok: false, error: "cascade_delete_failed", detail: `conversation_spans: ${csErr.message}` }, 500);
+      }
+
+      console.log(`[admin-reseed] Force cascade delete completed: ${allSpanIdsForDelete.length} spans + dependencies removed`);
+    }
+  }
+
+  // ========================================
+  // 7b. HUMAN LOCK GATE (skipped when force=true)
   // POLICY: Do NOT block reseed on human locks.
   // Instead, carry forward human locks to replacement spans by span_index.
   // ========================================
-  if (humanLockedSpanInfos.length > 0) {
+  if (!force && humanLockedSpanInfos.length > 0) {
     console.log(`[admin-reseed] Found ${humanLockedSpanInfos.length} human-locked spans; will carry forward`);
   }
 
   // ========================================
-  // 8. SUPERSEDE OLD SPANS (non-destructive)
+  // 8. SUPERSEDE OLD SPANS (non-destructive; skipped when force=true)
   // ========================================
   const reseedActionId = crypto.randomUUID();
-  const newGeneration = currentGeneration + 1;
+  const newGeneration = force ? 1 : currentGeneration + 1;
 
-  if (activeSpanIds.length > 0) {
+  if (!force && activeSpanIds.length > 0) {
     const { error: supersedErr } = await db
       .from("conversation_spans")
       .update({
@@ -787,7 +852,7 @@ Deno.serve(async (req: Request) => {
   // - Insert a human-locked span_attributions row for replacement spans.
   // ========================================
   let humanLockCarryforwardCount = 0;
-  if (humanLockedSpanInfos.length > 0 && newSpanIds.length > 0) {
+  if (!force && humanLockedSpanInfos.length > 0 && newSpanIds.length > 0) {
     const spanIndexToNewSpanId = new Map<number, string>();
     for (const row of newSpanIds.map((id, idx) => ({ id, idx }))) {
       // newSpanIds are already ordered by span_index insertion order (we sorted `inserted`).

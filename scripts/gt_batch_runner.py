@@ -547,6 +547,11 @@ def main() -> int:
             url = f"{supabase_url}/functions/v1/admin-reseed"
 
         status, resp = post_json(url, payload, headers, timeout=args.timeout_seconds)
+        # Retry once on 504 Gateway Timeout with 10s backoff
+        if status == 504:
+            print(f"  [{idx}/{len(unique_interactions)}] {interaction_id}: 504 timeout, retrying in 10s...")
+            time.sleep(10)
+            status, resp = post_json(url, payload, headers, timeout=args.timeout_seconds)
         response_file = trigger_dir / f"{interaction_id}.json"
         response_file.write_text(json.dumps({"http_status": status, "response": resp}, indent=2), encoding="utf-8")
 
