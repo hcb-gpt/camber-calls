@@ -1,0 +1,44 @@
+{
+  "http_status": 200,
+  "response": {
+    "ok": true,
+    "receipt": {
+      "ok": true,
+      "interaction_id": "cll_06E3A9094NX6N25F8TQXEPH3YG",
+      "idempotency_key": "gt-batch-20260218T035851Z-010-cll_06E3A9094NX6N25F8TQXEPH3YG",
+      "mode": "resegment_and_reroute",
+      "span_count_before": 3,
+      "span_count_after": 2,
+      "attrib_count_before": 3,
+      "attrib_count_after": 2,
+      "status": "success",
+      "human_lock_count": 0,
+      "human_lock_carryforward_count": 0,
+      "superseded_span_ids": [
+        "283352cb-786b-4228-8113-d258579756e8",
+        "7c5f8854-3e56-4d98-ab33-b9a8dad0d04b",
+        "606d93ac-4e2d-4927-8589-0a918661266f"
+      ],
+      "new_span_ids": [
+        "64467637-fafb-4dbb-99b5-72edaadff864",
+        "7d1713b9-7660-41c3-961f-e546824bd0be"
+      ],
+      "reroute_triggered": true,
+      "insert_conflict_recovered": false,
+      "conflict_constraint": null,
+      "adopted_generation": null,
+      "reroute_attempted": 2,
+      "reroute_succeeded": 2,
+      "reroute_failed": 0,
+      "close_loop_applied": false,
+      "close_loop_attempts": 0,
+      "close_loop_missing_before": 0,
+      "close_loop_missing_after": 0,
+      "close_loop_fallback_inserted": 0,
+      "close_loop_stale_pending_dismissed": 0,
+      "close_loop_pending_on_superseded_after": 0,
+      "close_loop_pending_null_after": 0,
+      "ms": 19460
+    }
+  }
+}

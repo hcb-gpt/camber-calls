@@ -174,3 +174,28 @@ Deno.test("whitelist includes new additions (Debbie, Randy, Mitch)", () => {
   assertEquals(fixture.nickname_whitelist["randy"], "randall");
   assertEquals(fixture.nickname_whitelist["mitch"], "mitchell");
 });
+
+Deno.test("spot check: Lou/Luis first-name-only = REJECT", () => {
+  const np31 = fixture.test_cases.name_pairs.find((tc: { id: string }) =>
+    tc.id === "NP-31"
+  );
+  assertExists(np31, "NP-31 missing");
+  assertEquals(np31.expected_decision, "REJECT");
+});
+
+Deno.test("spot check: Lou Winship/Luis Juarez full name = REJECT", () => {
+  const np32 = fixture.test_cases.name_pairs.find((tc: { id: string }) =>
+    tc.id === "NP-32"
+  );
+  assertExists(np32, "NP-32 missing");
+  assertEquals(np32.expected_decision, "REJECT");
+});
+
+Deno.test("nickname whitelist: lou maps to louise, not luis", () => {
+  assertEquals(fixture.nickname_whitelist["lou"], "louise");
+  assertEquals(
+    fixture.nickname_whitelist["luis"],
+    undefined,
+    "luis must NOT be in nickname whitelist — it is a distinct Spanish given name",
+  );
+});

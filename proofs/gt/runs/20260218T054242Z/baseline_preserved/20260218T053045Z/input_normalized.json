@@ -1,0 +1,57 @@
+[
+  {
+    "row_id": "row_0001",
+    "interaction_id": "cll_06E3K1VVKNT435XKDTRBNB8QD0",
+    "span_index": "0",
+    "span_id": "",
+    "expected_project_id": "",
+    "expected_project_name_contains": "",
+    "expected_decision": "",
+    "notes": "T1: zero-span common",
+    "tags": "tier0"
+  },
+  {
+    "row_id": "row_0002",
+    "interaction_id": "cll_06E3HS7S75RQK080ZN7K9Q84B0",
+    "span_index": "0",
+    "span_id": "",
+    "expected_project_id": "",
+    "expected_project_name_contains": "",
+    "expected_decision": "assign",
+    "notes": "T2: zero-span multi-span",
+    "tags": "tier0"
+  },
+  {
+    "row_id": "row_0003",
+    "interaction_id": "cll_06E3HG24Q9YM7BGK44NCQRV2Z8",
+    "span_index": "0",
+    "span_id": "",
+    "expected_project_id": "",
+    "expected_project_name_contains": "",
+    "expected_decision": "assign",
+    "notes": "T3: zero-span single",
+    "tags": "tier0"
+  },
+  {
+    "row_id": "row_0004",
+    "interaction_id": "cll_06E39KQRPDSAZ0B88TX3ZN87T8",
+    "span_index": "0",
+    "span_id": "",
+    "expected_project_id": "",
+    "expected_project_name_contains": "winship",
+    "expected_decision": "assign",
+    "notes": "T4: regression guard",
+    "tags": "tier0"
+  },
+  {
+    "row_id": "row_0005",
+    "interaction_id": "cll_06E37X99FHT1X1VB9SZNBR67MR",
+    "span_index": "0",
+    "span_id": "",
+    "expected_project_id": "",
+    "expected_project_name_contains": "",
+    "expected_decision": "",
+    "notes": "T5: regression correct",
+    "tags": "tier0"
+  }
+]
