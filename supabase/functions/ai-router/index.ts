@@ -113,7 +113,7 @@ import {
 
 const PROMPT_VERSION_BASE = "v1.13.0";
 const FUNCTION_VERSION = "v1.15.0";
-const MODEL_ID = Deno.env.get("AI_ROUTER_MODEL") || "claude-sonnet-4-5-20250514";
+const MODEL_ID = Deno.env.get("AI_ROUTER_MODEL") || "claude-3-haiku-20240307";
 const MAX_TOKENS = 1024;
 const WORLD_MODEL_FACTS_ENABLED = parseBoolEnv(Deno.env.get("WORLD_MODEL_FACTS_ENABLED"), false);
 const WORLD_MODEL_FACTS_MAX_PER_PROJECT = Math.max(
