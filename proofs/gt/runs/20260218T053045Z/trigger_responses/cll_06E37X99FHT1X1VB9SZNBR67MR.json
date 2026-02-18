@@ -1,0 +1,50 @@
+{
+  "http_status": 200,
+  "response": {
+    "ok": true,
+    "receipt": {
+      "ok": true,
+      "interaction_id": "cll_06E37X99FHT1X1VB9SZNBR67MR",
+      "idempotency_key": "gt-batch-20260218T053045Z-001-cll_06E37X99FHT1X1VB9SZNBR67MR",
+      "mode": "resegment_and_reroute",
+      "span_count_before": 5,
+      "span_count_after": 6,
+      "attrib_count_before": 5,
+      "attrib_count_after": 6,
+      "status": "success",
+      "human_lock_count": 0,
+      "human_lock_carryforward_count": 0,
+      "superseded_span_ids": [
+        "ee1addb4-7bf7-4d8b-839d-40023b616c0c",
+        "d0c6673e-acdc-4490-b826-733c3e86e562",
+        "fade4a04-721b-49c4-baa0-e20d8fc03208",
+        "256eb589-ba67-4172-b2f8-5ddea4c8e377",
+        "b6b3e4a7-09b4-495a-9858-03786a07d009"
+      ],
+      "new_span_ids": [
+        "1c3b394a-c3ad-4356-bce1-a30ce081cc39",
+        "013cfdab-9f81-44e8-814f-654bdbb30eb0",
+        "8ca0b963-0422-4598-95cb-d32bfa134f31",
+        "e0e1e398-7553-4314-93e7-229d3306bb96",
+        "a57bedb5-7702-45ba-8cb8-75de6d46ade8",
+        "ae29efa3-4d1b-43b1-8701-516818517b04"
+      ],
+      "reroute_triggered": true,
+      "insert_conflict_recovered": false,
+      "conflict_constraint": null,
+      "adopted_generation": null,
+      "reroute_attempted": 6,
+      "reroute_succeeded": 6,
+      "reroute_failed": 0,
+      "close_loop_applied": false,
+      "close_loop_attempts": 0,
+      "close_loop_missing_before": 0,
+      "close_loop_missing_after": 0,
+      "close_loop_fallback_inserted": 0,
+      "close_loop_stale_pending_dismissed": 0,
+      "close_loop_pending_on_superseded_after": 0,
+      "close_loop_pending_null_after": 0,
+      "ms": 41041
+    }
+  }
+}
