@@ -17,7 +17,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { parseLlmJson } from "../_shared/llm_json.ts";
 
-const SEGMENT_LLM_VERSION = "segment-llm_v1.3.0";
+const SEGMENT_LLM_VERSION = "segment-llm_v1.4.0";
 
 // ============================================================
 // STRUCTURED LOGGING (per GPT-DEV-6 spec)
@@ -54,10 +54,10 @@ function structuredLog(
 // ============================================================
 // GUARDRAIL DEFAULTS
 // ============================================================
-const DEFAULT_MAX_SEGMENTS = 10;
+const DEFAULT_MAX_SEGMENTS = 6;
 const DEFAULT_MIN_SEGMENT_CHARS = 200;
-const DEFAULT_MAX_SEGMENT_CHARS = 3000;
-const DEFAULT_TARGET_SEGMENT_CHARS = 1800;
+const DEFAULT_MAX_SEGMENT_CHARS = 8000;
+const DEFAULT_TARGET_SEGMENT_CHARS = 5000;
 const PROJECT_ANCHOR_TERMS = ["woodberry", "sparta"];
 
 // ============================================================
