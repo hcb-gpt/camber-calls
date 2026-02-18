@@ -353,7 +353,25 @@ Deno.serve(async (req: Request) => {
     .limit(1)
     .maybeSingle();
 
-  let transcript = transcriptData?.transcript || "";
+  let transcript = (transcriptData?.transcript || "").trim();
+
+  // Fallback: use calls_raw transcript when transcript_comparison is missing
+  if (!transcript) {
+    const { data: rawCall, error: rawErr } = await db
+      .from("calls_raw")
+      .select("transcript")
+      .eq("interaction_id", interaction_id)
+      .maybeSingle();
+
+    if (rawErr) {
+      console.warn("[admin-reseed] Failed to fetch calls_raw transcript:", rawErr.message);
+    } else {
+      transcript = (rawCall?.transcript || "").trim();
+      if (transcript) {
+        console.log(`[admin-reseed] Loaded transcript from calls_raw (${transcript.length} chars)`);
+      }
+    }
+  }
 
   // Fallback: reconstruct from existing spans if no transcript_comparison
   if (!transcript) {
