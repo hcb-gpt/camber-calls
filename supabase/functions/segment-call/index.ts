@@ -12,6 +12,11 @@
  * - Backfills parent interactions.transcript_chars when segment-call has non-empty transcript content.
  * - Removes stale G4_EMPTY_TRANSCRIPT/terminal_empty_transcript reasons on parent interactions row.
  *
+ * v2.6.0:
+ * - Canonical transcript lookup via v_canonical_transcripts view.
+ * - Deepgram canonical overrides request_body transcript; emits warning when overriding.
+ * - Adds transcript_source to response JSON and segment_metadata.
+ *
  * Auth (internal gate; verify_jwt=false):
  * - X-Edge-Secret == EDGE_SHARED_SECRET, OR
  * - JWT + ALLOWED_EMAILS verified via auth.getUser() (debug path)
@@ -19,7 +24,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const SEGMENT_CALL_VERSION = "v2.5.3";
+const SEGMENT_CALL_VERSION = "v2.6.0";
 const MAX_SEGMENT_CHARS_HARD_LIMIT = 3000;
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
@@ -29,6 +34,8 @@ const AI_ROUTER_URL = `${SUPABASE_URL}/functions/v1/ai-router`;
 const STRIKING_DETECT_URL = `${SUPABASE_URL}/functions/v1/striking-detect`;
 const JOURNAL_EXTRACT_URL = `${SUPABASE_URL}/functions/v1/journal-extract`;
 const GENERATE_SUMMARY_URL = `${SUPABASE_URL}/functions/v1/generate-summary`;
+const EVIDENCE_ASSEMBLER_URL = `${SUPABASE_URL}/functions/v1/evidence-assembler`;
+const DECISION_AUDITOR_URL = `${SUPABASE_URL}/functions/v1/decision-auditor`;
 
 type SegmentFromLLM = {
   span_index: number;
@@ -49,6 +56,13 @@ type SpanChainStatus = {
   // v2.4.0: async post-attribution hooks
   striking_detect_fired: boolean;
   journal_extract_fired: boolean;
+  // v2.6.0: evidence assembler + decision auditor
+  evidence_assembler_status?: number | null;
+  evidence_assembler_error?: string | null;
+  decision_auditor_status?: number | null;
+  decision_auditor_error?: string | null;
+  assembler_triggered?: boolean;
+  auditor_triggered?: boolean;
 };
 
 const jsonHeaders = { "Content-Type": "application/json" };
@@ -158,6 +172,45 @@ async function logDiagnostic(
   } catch (e) {
     console.warn(`[segment-call] diagnostic_logs insert failed: ${(e as Error)?.message || e}`);
   }
+}
+
+// v2.6.0: Evidence assembler + decision auditor feature flag
+const ASSEMBLER_MODE = Deno.env.get("ASSEMBLER_MODE") || "off"; // "off" | "shadow" | "live"
+
+function shouldRunAssembler(ctx: any): { run: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  const candidates = ctx.candidates || [];
+  const contact = ctx.contact;
+
+  // Gate 1: Floater/drifter/unknown
+  if (["floater", "drifter", "unknown"].includes(contact?.fanout_class || "")) {
+    reasons.push("floater_drifter_unknown");
+  }
+  // Gate 2: No strong alias match
+  const hasStrong = candidates.some((c: any) =>
+    c.evidence?.alias_matches?.some((m: any) =>
+      ["exact_project_name", "alias", "address_fragment", "client_name"].includes(m.match_type)
+    )
+  );
+  if (!hasStrong) reasons.push("no_strong_alias");
+
+  // Gate 3: Top-2 tie
+  const strengths = candidates.map((c: any) => c.evidence?.source_strength || 0).sort((a: number, b: number) => b - a);
+  if (strengths.length >= 2 && Math.abs(strengths[0] - strengths[1]) < 0.10) {
+    reasons.push("candidate_tie");
+  }
+  // Gate 4: Collision-risk alias (common-word)
+  if (candidates.some((c: any) => c.evidence?.common_word_alias_demoted)) {
+    reasons.push("collision_risk_alias");
+  }
+  // Gate 5: Null contact
+  if (!contact?.contact_id) reasons.push("null_contact");
+
+  return { run: reasons.length > 0, reasons };
+}
+
+function shouldRunAuditor(decision: string, confidence: number): boolean {
+  return decision === "assign" && confidence < 0.85;
 }
 
 Deno.serve(async (req: Request) => {
@@ -286,6 +339,30 @@ Deno.serve(async (req: Request) => {
     // 1) FETCH TRANSCRIPT
     // ============================================================
     let spanTranscript: string | null = typeof transcript === "string" ? transcript : null;
+    let transcriptSource: string | null = null;
+    const canonicalWarnings: string[] = [];
+
+    // --- Canonical transcript view lookup (v2.6.0) ---
+    const { data: canonicalRow } = await db
+      .from("v_canonical_transcripts")
+      .select("transcript, transcript_source")
+      .eq("interaction_id", interaction_id)
+      .maybeSingle();
+
+    if (canonicalRow?.transcript && canonicalRow.transcript_source?.startsWith("deepgram/")) {
+      // Deepgram canonical overrides request_body
+      if (spanTranscript && spanTranscript !== canonicalRow.transcript) {
+        canonicalWarnings.push("request_body_transcript_overridden_by_deepgram_canonical");
+      }
+      spanTranscript = canonicalRow.transcript;
+      transcriptSource = canonicalRow.transcript_source;
+    } else if (!spanTranscript && canonicalRow?.transcript) {
+      // Non-deepgram canonical used as fallback
+      spanTranscript = canonicalRow.transcript;
+      transcriptSource = canonicalRow.transcript_source;
+    } else if (spanTranscript) {
+      transcriptSource = "request_body";
+    }
 
     if (!spanTranscript) {
       const { data: callsRaw, error: fetchErr } = await db
@@ -312,6 +389,7 @@ Deno.serve(async (req: Request) => {
       }
 
       spanTranscript = callsRaw.transcript;
+      transcriptSource = "calls_raw";
     }
 
     const transcriptSanitize = sanitizeTranscriptForPipeline(spanTranscript || "");
@@ -391,6 +469,7 @@ Deno.serve(async (req: Request) => {
     let segments: SegmentFromLLM[] = [];
     let segmenterVersion = "fallback_trivial_v1";
     const segmenterWarnings: string[] = [];
+    segmenterWarnings.push(...canonicalWarnings);
     if (transcriptControlCharsSanitized > 0) {
       segmenterWarnings.push(`transcript_control_chars_sanitized_${transcriptControlCharsSanitized}`);
     }
@@ -542,6 +621,7 @@ Deno.serve(async (req: Request) => {
       const metadata: Record<string, any> = {
         confidence: seg.confidence,
         boundary_quote: seg.boundary_quote,
+        transcript_source: transcriptSource,
       };
       // Mark segments created by deterministic fallback
       if (isDeterministicFallback) {
@@ -685,6 +765,45 @@ Deno.serve(async (req: Request) => {
         continue;
       }
 
+      // --- EVIDENCE ASSEMBLER (gated, v2.6.0) ---
+      let assemblerResult: any = null;
+      let assemblerTriggered = false;
+      const gatingCheck = shouldRunAssembler(contextData.context_package);
+
+      if (ASSEMBLER_MODE !== "off" && gatingCheck.run) {
+        assemblerTriggered = true;
+        status.assembler_triggered = true;
+        try {
+          const asmResp = await fetch(EVIDENCE_ASSEMBLER_URL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Edge-Secret": edgeSecret,
+              "X-Source": "segment-call",
+            },
+            body: JSON.stringify({
+              context_package: contextData.context_package,
+              interaction_id,
+              span_id: span.id,
+              dry_run,
+              gating_reasons: gatingCheck.reasons,
+            }),
+          });
+          status.evidence_assembler_status = asmResp.status;
+          if (asmResp.ok) {
+            assemblerResult = await asmResp.json();
+            // In live mode, use enriched package for ai-router
+            if (ASSEMBLER_MODE === "live" && assemblerResult?.enriched_context_package) {
+              contextData.context_package = assemblerResult.enriched_context_package;
+            }
+          }
+        } catch (e: any) {
+          // Fail-open: log and continue with original context_package
+          console.error("[segment-call] evidence-assembler failed (fail-open):", e.message);
+          status.evidence_assembler_error = e.message;
+        }
+      }
+
       // ai-router
       try {
         const routerResp = await fetch(AI_ROUTER_URL, {
@@ -791,6 +910,81 @@ Deno.serve(async (req: Request) => {
             // Non-fatal
           }
         }
+
+        // --- DECISION AUDITOR (gated, v2.6.0) ---
+        let auditorResult: any = null;
+        let auditorTriggered = false;
+
+        if (ASSEMBLER_MODE !== "off" && routerData?.decision &&
+            shouldRunAuditor(routerData.decision, routerData.confidence || 0)) {
+          auditorTriggered = true;
+          status.auditor_triggered = true;
+          try {
+            const audResp = await fetch(DECISION_AUDITOR_URL, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-Edge-Secret": edgeSecret,
+                "X-Source": "segment-call",
+              },
+              body: JSON.stringify({
+                enriched_context_package: contextData.context_package,
+                ai_router_decision: {
+                  decision: routerData.decision,
+                  confidence: routerData.confidence,
+                  project_id: routerData.gatekeeper?.applied_project_id || routerData.project_id,
+                  anchors: routerData.anchors || [],
+                  reason_codes: routerData.reason_codes || [],
+                },
+                evidence_brief: assemblerResult?.evidence_brief || null,
+                interaction_id,
+                span_id: span.id,
+                dry_run,
+              }),
+            });
+            status.decision_auditor_status = audResp.status;
+            if (audResp.ok) {
+              auditorResult = await audResp.json();
+              // In live mode, if auditor downgrades, log it
+              if (ASSEMBLER_MODE === "live" && auditorResult?.verdict === "downgrade") {
+                console.warn(`[segment-call] auditor downgraded span=${span.id}`);
+              }
+            }
+          } catch (e: any) {
+            // Fail-open: log and continue with ai-router's decision
+            console.error("[segment-call] decision-auditor failed (fail-open):", e.message);
+            status.decision_auditor_error = e.message;
+          }
+        }
+
+        // --- PERSIST ASSEMBLER DIAGNOSTICS (v2.6.0) ---
+        if (assemblerTriggered || auditorTriggered) {
+          try {
+            await db.from("assembler_diagnostics").insert({
+              span_id: span.id,
+              run_id: crypto.randomUUID(),
+              assembler_triggered: assemblerTriggered,
+              auditor_triggered: auditorTriggered,
+              gating_reasons: gatingCheck.reasons,
+              evidence_brief: assemblerResult?.evidence_brief || null,
+              audit_report: auditorResult?.audit_report || auditorResult || null,
+              auditor_verdict: auditorResult?.verdict || null,
+              assembler_iterations: assemblerResult?.iterations_used || null,
+              assembler_tool_calls: assemblerResult?.tool_calls_used || null,
+              assembler_wall_clock_ms: assemblerResult?.wall_clock_ms || null,
+              auditor_iterations: auditorResult?.iterations_used || null,
+              auditor_tool_calls: auditorResult?.tool_calls_used || null,
+              auditor_wall_clock_ms: auditorResult?.wall_clock_ms || null,
+              tool_call_log: [
+                ...(assemblerResult?.tool_call_log || []),
+                ...(auditorResult?.tool_call_log || []),
+              ],
+            });
+          } catch (e: any) {
+            // Non-fatal: diagnostics write failure should not break the pipeline
+            console.error("[segment-call] diagnostics write failed:", e.message);
+          }
+        }
       } catch (e: any) {
         status.error_code = "ai_router_exception";
         status.error_detail = e?.message || "unknown";
@@ -830,6 +1024,7 @@ Deno.serve(async (req: Request) => {
           error_code: "chain_failed",
           version: SEGMENT_CALL_VERSION,
           interaction_id,
+          transcript_source: transcriptSource,
           spans_written,
           spans_write_ok,
           span_ids: spanIds,
@@ -894,6 +1089,7 @@ Deno.serve(async (req: Request) => {
         ok: true,
         version: SEGMENT_CALL_VERSION,
         interaction_id,
+        transcript_source: transcriptSource,
         spans_written,
         spans_write_ok,
         span_ids: spanIds,
