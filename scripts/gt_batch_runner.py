@@ -502,7 +502,7 @@ def main() -> int:
         "Authorization": f"Bearer {service_role}",
         "apikey": service_role,
         "X-Edge-Secret": edge_secret,
-        "X-Source": "gt-batch-runner",
+        "X-Source": "admin-reseed",
     }
 
     trigger_rows: List[Dict[str, str]] = []
