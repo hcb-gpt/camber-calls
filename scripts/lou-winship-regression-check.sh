@@ -163,8 +163,118 @@ echo "--- Journal Runs (${RUN_COUNT} total: ${RUN_SUCCESS} success, ${RUN_FAILED
 jq -r '.[] | "  \(.status) claims=\(.claims_extracted) started=\(.started_at) error=\(.error_message // "none")"' <<<"$RUNS"
 echo ""
 
+# ============================================================
+# Speaker Identity Disambiguation Check (Lou vs Luis)
+# ============================================================
+IDENTITY_PASS=0
+IDENTITY_FAIL=0
+
+echo "--- Speaker Identity Disambiguation Check ---"
+
+# (a) Lou Winship contact record
+LOU_CONTACT=$(api_get "contacts" \
+  --data-urlencode "select=name,contact_type,is_internal" \
+  --data-urlencode "name=eq.Lou Winship" \
+  --data-urlencode "limit=1")
+LOU_CT=$(jq -r '.[0].contact_type // "MISSING"' <<<"$LOU_CONTACT")
+LOU_INTERNAL=$(jq -r '.[0].is_internal // "MISSING"' <<<"$LOU_CONTACT")
+
+if [[ "$LOU_CT" == "client" ]]; then
+  echo "  PASS: Lou Winship contact_type=client"
+  ((IDENTITY_PASS++))
+else
+  echo "  FAIL: Lou Winship contact_type=${LOU_CT} (expected: client)"
+  ((IDENTITY_FAIL++))
+fi
+
+if [[ "$LOU_INTERNAL" == "false" ]]; then
+  echo "  PASS: Lou Winship is_internal=false"
+  ((IDENTITY_PASS++))
+else
+  echo "  FAIL: Lou Winship is_internal=${LOU_INTERNAL} (expected: false)"
+  ((IDENTITY_FAIL++))
+fi
+
+# (b) Luis Juarez contact record
+LUIS_CONTACT=$(api_get "contacts" \
+  --data-urlencode "select=name,contact_type,is_internal" \
+  --data-urlencode "name=eq.Luis Juarez" \
+  --data-urlencode "limit=1")
+LUIS_CT=$(jq -r '.[0].contact_type // "MISSING"' <<<"$LUIS_CONTACT")
+LUIS_INTERNAL=$(jq -r '.[0].is_internal // "MISSING"' <<<"$LUIS_CONTACT")
+
+if [[ "$LUIS_INTERNAL" == "false" ]]; then
+  echo "  PASS: Luis Juarez is_internal=false"
+  ((IDENTITY_PASS++))
+else
+  echo "  FAIL: Luis Juarez is_internal=${LUIS_INTERNAL} (expected: false)"
+  ((IDENTITY_FAIL++))
+fi
+
+if [[ "$LUIS_CT" == "vendor" || "$LUIS_CT" == "subcontractor" ]]; then
+  echo "  PASS: Luis Juarez contact_type=${LUIS_CT}"
+  ((IDENTITY_PASS++))
+else
+  echo "  FAIL: Luis Juarez contact_type=${LUIS_CT} (expected: vendor or subcontractor)"
+  ((IDENTITY_FAIL++))
+fi
+
+# (c) Alias resolution for "Lou" — should match Lou Winship, not Luis Juarez
+LOU_ALIAS=$(api_get "contacts" \
+  --data-urlencode "select=name" \
+  --data-urlencode "aliases=cs.{Lou}" \
+  --data-urlencode "limit=5")
+LOU_ALIAS_NAMES=$(jq -r '[.[].name] | join(", ")' <<<"$LOU_ALIAS")
+LOU_ALIAS_HAS_LOU=$(jq '[.[].name] | any(. == "Lou Winship")' <<<"$LOU_ALIAS")
+LOU_ALIAS_HAS_LUIS=$(jq '[.[].name] | any(. == "Luis Juarez")' <<<"$LOU_ALIAS")
+
+if [[ "$LOU_ALIAS_HAS_LOU" == "true" ]]; then
+  echo "  PASS: alias 'Lou' resolves to Lou Winship (${LOU_ALIAS_NAMES})"
+  ((IDENTITY_PASS++))
+else
+  echo "  FAIL: alias 'Lou' does NOT resolve to Lou Winship (got: ${LOU_ALIAS_NAMES})"
+  ((IDENTITY_FAIL++))
+fi
+
+if [[ "$LOU_ALIAS_HAS_LUIS" == "false" ]]; then
+  echo "  PASS: alias 'Lou' does NOT resolve to Luis Juarez"
+  ((IDENTITY_PASS++))
+else
+  echo "  FAIL: alias 'Lou' incorrectly resolves to Luis Juarez (${LOU_ALIAS_NAMES})"
+  ((IDENTITY_FAIL++))
+fi
+
+# (d) Alias resolution for "Luis" — should match Luis Juarez, not Lou Winship
+LUIS_ALIAS=$(api_get "contacts" \
+  --data-urlencode "select=name" \
+  --data-urlencode "aliases=cs.{Luis}" \
+  --data-urlencode "limit=5")
+LUIS_ALIAS_NAMES=$(jq -r '[.[].name] | join(", ")' <<<"$LUIS_ALIAS")
+LUIS_ALIAS_HAS_LUIS=$(jq '[.[].name] | any(. == "Luis Juarez")' <<<"$LUIS_ALIAS")
+LUIS_ALIAS_HAS_LOU=$(jq '[.[].name] | any(. == "Lou Winship")' <<<"$LUIS_ALIAS")
+
+if [[ "$LUIS_ALIAS_HAS_LUIS" == "true" ]]; then
+  echo "  PASS: alias 'Luis' resolves to Luis Juarez (${LUIS_ALIAS_NAMES})"
+  ((IDENTITY_PASS++))
+else
+  echo "  FAIL: alias 'Luis' does NOT resolve to Luis Juarez (got: ${LUIS_ALIAS_NAMES})"
+  ((IDENTITY_FAIL++))
+fi
+
+if [[ "$LUIS_ALIAS_HAS_LOU" == "false" ]]; then
+  echo "  PASS: alias 'Luis' does NOT resolve to Lou Winship"
+  ((IDENTITY_PASS++))
+else
+  echo "  FAIL: alias 'Luis' incorrectly resolves to Lou Winship (${LUIS_ALIAS_NAMES})"
+  ((IDENTITY_FAIL++))
+fi
+
+echo ""
+echo "  Identity checks: ${IDENTITY_PASS} passed, ${IDENTITY_FAIL} failed"
+echo ""
+
 # Machine-parseable summary line
-echo "LOU_WINSHIP_REGRESSION call_id=${CALL_ID} spans=${SPAN_COUNT} journal_claims=${CLAIM_COUNT} claims_with_project=${CLAIMS_WITH_PROJECT} claims_no_project=${CLAIMS_NO_PROJECT} belief_claims=${BELIEF_COUNT} review_queue_total=${RQ_COUNT} review_queue_pending=${RQ_PENDING} journal_runs=${RUN_COUNT} runs_success=${RUN_SUCCESS} runs_failed=${RUN_FAILED} timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "LOU_WINSHIP_REGRESSION call_id=${CALL_ID} spans=${SPAN_COUNT} journal_claims=${CLAIM_COUNT} claims_with_project=${CLAIMS_WITH_PROJECT} claims_no_project=${CLAIMS_NO_PROJECT} belief_claims=${BELIEF_COUNT} review_queue_total=${RQ_COUNT} review_queue_pending=${RQ_PENDING} journal_runs=${RUN_COUNT} runs_success=${RUN_SUCCESS} runs_failed=${RUN_FAILED} identity_pass=${IDENTITY_PASS} identity_fail=${IDENTITY_FAIL} timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 if [[ "$JSON_OUTPUT" == "true" ]]; then
   echo ""
@@ -180,5 +290,7 @@ if [[ "$JSON_OUTPUT" == "true" ]]; then
     --argjson journal_runs "$RUN_COUNT" \
     --argjson runs_success "$RUN_SUCCESS" \
     --argjson runs_failed "$RUN_FAILED" \
-    '{call_id: $call_id, spans: $spans, journal_claims: $journal_claims, claims_with_project: $claims_with_project, claims_no_project: $claims_no_project, belief_claims: $belief_claims, review_queue_total: $review_queue_total, review_queue_pending: $review_queue_pending, journal_runs: $journal_runs, runs_success: $runs_success, runs_failed: $runs_failed, timestamp: (now | todate)}'
+    --argjson identity_pass "$IDENTITY_PASS" \
+    --argjson identity_fail "$IDENTITY_FAIL" \
+    '{call_id: $call_id, spans: $spans, journal_claims: $journal_claims, claims_with_project: $claims_with_project, claims_no_project: $claims_no_project, belief_claims: $belief_claims, review_queue_total: $review_queue_total, review_queue_pending: $review_queue_pending, journal_runs: $journal_runs, runs_success: $runs_success, runs_failed: $runs_failed, identity_pass: $identity_pass, identity_fail: $identity_fail, timestamp: (now | todate)}'
 fi
