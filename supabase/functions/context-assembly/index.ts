@@ -2796,28 +2796,6 @@ Deno.serve(async (req: Request) => {
     }
 
     // ========================================
-    // v2.3.0 Lever 2: Enrich first-name-unique alias matches
-    // If a short single-word alias term uniquely identifies one candidate, mark it
-    // ========================================
-    for (const [pid, meta] of candidatesById) {
-      for (const am of meta.alias_matches) {
-        if (am.term.includes(" ") || am.term.length >= 6) continue;
-        const termLower = am.term.toLowerCase();
-        let matchCount = 0;
-        for (const [otherPid, otherMeta] of candidatesById) {
-          if (otherPid === pid) continue;
-          if (otherMeta.alias_matches.some((m) => m.term.toLowerCase() === termLower)) {
-            matchCount++;
-            break;
-          }
-        }
-        if (matchCount === 0) {
-          am.match_type = "first_name_unique";
-        }
-      }
-    }
-
-    // ========================================
     // BUILD CANDIDATES ARRAY
     // PHONETIC-ADJACENT-ONLY: classify match strength, flag weak-only candidates
     // ========================================
