@@ -728,6 +728,13 @@ CONFIDENCE THRESHOLDS (3-band policy):
 - 0.25-0.74: Some evidence exists, needs human review — ALWAYS include your best candidate project_id and reasoning
 - 0.00-0.24: No meaningful evidence at all, truly no project match
 
+MULTI-SOURCE CORROBORATION EXCEPTION:
+When a candidate project's evidence includes 3 or more independent source categories
+(e.g., transcript mention + affinity + journal claim + project_facts + geo),
+a confidence of 0.65 or higher is sufficient for decision="assign".
+This exception applies ONLY when the sources are genuinely independent — multiple
+transcript matches from the same passage count as one source category.
+
 ANCHOR STRENGTH POLICY:
 To use decision="assign", you MUST have at least one STRONG anchor type:
 - STRONG: exact_project_name, alias, address_fragment, client_name

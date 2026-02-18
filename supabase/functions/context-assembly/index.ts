@@ -1912,6 +1912,39 @@ Deno.serve(async (req: Request) => {
         }
       } catch { /* RPC may not exist */ }
 
+      // POST-PROCESS: first-name unique anchor (Lever 2)
+      // When a weak single-word first-name alias match uniquely identifies
+      // exactly one candidate in the pool, promote it to first_name_unique.
+      // Safety: only for candidates already present from another source.
+      {
+        // Build map: lowercase single-word term -> set of project_ids that matched it
+        const termToProjects = new Map<string, Set<string>>();
+        for (const [pid, meta] of candidatesById) {
+          for (const m of meta.alias_matches) {
+            const t = m.term.trim();
+            if (!t.includes(" ") && t.length >= 3 && t.length < 6) {
+              const key = t.toLowerCase();
+              if (!termToProjects.has(key)) termToProjects.set(key, new Set());
+              termToProjects.get(key)!.add(pid);
+            }
+          }
+        }
+        // Promote unique first-name matches on multi-source candidates
+        for (const [pid, meta] of candidatesById) {
+          const hasOtherSource = meta.sources.some((s) => s !== "transcript_scan");
+          if (!hasOtherSource) continue;
+          for (const m of meta.alias_matches) {
+            const t = m.term.trim();
+            if (t.includes(" ") || t.length < 3 || t.length >= 6) continue;
+            const key = t.toLowerCase();
+            const matchingPids = termToProjects.get(key);
+            if (matchingPids && matchingPids.size === 1) {
+              m.match_type = "first_name_unique";
+            }
+          }
+        }
+      }
+
       // ========================================
       // SOURCE 7: GEO + ENROUTE DETECTION
       // POLICY (STRAT-1 BLOCK):
@@ -2759,6 +2792,28 @@ Deno.serve(async (req: Request) => {
         }
       } catch {
         // View doesn't exist
+      }
+    }
+
+    // ========================================
+    // v2.3.0 Lever 2: Enrich first-name-unique alias matches
+    // If a short single-word alias term uniquely identifies one candidate, mark it
+    // ========================================
+    for (const [pid, meta] of candidatesById) {
+      for (const am of meta.alias_matches) {
+        if (am.term.includes(" ") || am.term.length >= 6) continue;
+        const termLower = am.term.toLowerCase();
+        let matchCount = 0;
+        for (const [otherPid, otherMeta] of candidatesById) {
+          if (otherPid === pid) continue;
+          if (otherMeta.alias_matches.some((m) => m.term.toLowerCase() === termLower)) {
+            matchCount++;
+            break;
+          }
+        }
+        if (matchCount === 0) {
+          am.match_type = "first_name_unique";
+        }
       }
     }
 
