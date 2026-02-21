@@ -1114,6 +1114,35 @@ Deno.serve(async (req: Request) => {
       }).eq("id", audit_id);
     }
 
+    // RUNTIME LINEAGE EVIDENCE (fire-and-forget)
+    // Emits edges for operations that actually executed this invocation.
+    // DB trigger upserts system_lineage_edges (last_seen_at_utc, seen_count).
+    try {
+      const lineageEdges: { from: string; to: string; type: string }[] = [
+        { from: "edge:process-call", to: "table:public.calls_raw", type: "writes" },
+        { from: "edge:process-call", to: "table:public.interactions", type: "writes" },
+        { from: "edge:process-call", to: "table:public.event_audit", type: "writes" },
+        { from: "edge:process-call", to: "table:public.idempotency_keys", type: "writes" },
+        { from: "edge:process-call", to: "table:public.project_contacts", type: "reads" },
+        { from: "edge:process-call", to: "table:public.projects", type: "reads" },
+        { from: "edge:process-call", to: "table:public.correspondent_project_affinity", type: "reads" },
+      ];
+      if (terminalEmptyTranscript) {
+        lineageEdges.push({ from: "edge:process-call", to: "table:public.review_queue", type: "writes" });
+      }
+      if (segment_call_fired) {
+        lineageEdges.push({ from: "edge:process-call", to: "edge:segment-call", type: "calls" });
+      }
+      const { error: lineageErr } = await db.from("evidence_events").insert({
+        source_type: "lineage",
+        source_id: iid,
+        source_run_id: run_id,
+        transcript_variant: `process-call_${run_id}`,
+        metadata: { edges: lineageEdges, pipeline_version: PROCESS_CALL_VERSION },
+      });
+      if (lineageErr) warnings.push(`lineage_emit: ${lineageErr.message}`);
+    } catch { /* lineage emission must never block the response */ }
+
     return new Response(
       JSON.stringify({
         ok: true,
