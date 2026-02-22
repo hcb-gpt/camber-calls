@@ -23,6 +23,8 @@ const ALLOWED_SOURCES = [
   "agent-teams",
   "auto-review-resolver",
   "cron",
+  "pg_cron",
+  "pg_cron:auto-review-resolver",
   "claude-chat",
   "test",
 ];
@@ -40,6 +42,18 @@ interface ExtendedAuthResult {
   error_code?: string;
   detail?: string;
   method?: string;
+}
+
+function normalizeSecret(value: string | null): string {
+  if (!value) return "";
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
 }
 
 Deno.serve(async (req: Request) => {
@@ -139,11 +153,17 @@ function authenticateRequest(req: Request): ExtendedAuthResult {
     };
   }
 
+  const serviceRoleKey = normalizeSecret(Deno.env.get("SUPABASE_SERVICE_ROLE_KEY"));
+  const serviceRoleCandidates = new Set([
+    serviceRoleKey,
+    normalizeSecret(Deno.env.get("SUPABASE_SERVICE_KEY")),
+    normalizeSecret(Deno.env.get("SERVICE_ROLE_KEY")),
+  ].filter((v) => v.length > 0));
+
   const authHeader = req.headers.get("Authorization");
   if (authHeader?.startsWith("Bearer ")) {
-    const token = authHeader.replace("Bearer ", "");
-    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-    if (serviceRoleKey && token === serviceRoleKey) {
+    const token = normalizeSecret(authHeader.replace("Bearer ", ""));
+    if (serviceRoleCandidates.has(token)) {
       return { ok: true, method: "service_role" };
     }
     return {
@@ -151,6 +171,11 @@ function authenticateRequest(req: Request): ExtendedAuthResult {
       error_code: "invalid_auth_token",
       detail: "Only service_role key or X-Edge-Secret accepted",
     };
+  }
+
+  const apiKeyHeader = normalizeSecret(req.headers.get("apikey"));
+  if (apiKeyHeader && serviceRoleCandidates.has(apiKeyHeader)) {
+    return { ok: true, method: "service_role_apikey" };
   }
 
   return {
