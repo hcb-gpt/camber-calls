@@ -225,7 +225,6 @@ Deno.serve(async (req: Request) => {
     .from("journal_claims")
     .select("id", { count: "exact", head: true })
     .eq("active", true)
-    .not("project_id", "is", null)
     .not("claim_text", "is", null);
 
   if (!force) {
@@ -255,9 +254,9 @@ Deno.serve(async (req: Request) => {
         "search_text,embedding,embedding_model,embedding_version,created_at",
     )
     .eq("active", true)
-    .not("project_id", "is", null)
     .not("claim_text", "is", null)
-    .order("created_at", { ascending: true })
+    // Prioritize freshest claims so live reliability checks reflect current write health.
+    .order("created_at", { ascending: false })
     .limit(limit);
 
   if (!force) {
