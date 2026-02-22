@@ -120,6 +120,23 @@ The probe reports:
 - before/after counts for `module_claims` and `module_receipts`
 - function HTTP status and body (unless `--no-invoke`)
 
+## Embed Acceptance Watch
+
+For fast DATA/DEV co-review of embed freshness acceptance (with a built-in
+PASS/FAIL verdict):
+
+```bash
+cd /Users/chadbarlow/gh/hcb-gpt/camber-calls
+scripts/embed_acceptance_watch.sh --write-baseline
+scripts/embed_acceptance_watch.sh --compare
+```
+
+Useful flags:
+
+- `--baseline-file <path>`: use a custom baseline snapshot file
+- `--max-runid-mismatch-increase <n>`: allow limited mismatch increase (default `0`)
+- `--json`: machine-readable output for receipt generation/automation
+
 ## SMS Ingestion Restore Probe
 
 For stage-by-stage validation of `zapier-call-ingest -> process-call`:
