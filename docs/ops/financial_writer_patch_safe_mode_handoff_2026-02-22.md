@@ -10,7 +10,7 @@ Patch the scheduler writer path so `scheduler_items.financial_json` always inclu
 
 Patch artifact:
 
-- `supabase/migrations/20260222064500_patch_scheduler_financial_writer.sql`
+- `supabase/migrations/20260222064600_patch_scheduler_financial_writer.sql`
 
 ## Why This Matters
 Current production probe shows financial payloads exist but no parseable amount keys:
@@ -72,7 +72,7 @@ supabase migration list --linked > .scratch/apply_owner_migration_list_pre.txt
 
 2. Confirm patch file is present at:
 ```bash
-ls supabase/migrations/20260222064500_patch_scheduler_financial_writer.sql
+ls supabase/migrations/20260222064600_patch_scheduler_financial_writer.sql
 ```
 
 3. Dry run (shows ordered pending set + catches syntax/order faults):
@@ -125,7 +125,7 @@ from parsed;
 - After: `rows_with_any_amount > 0` (where derivable from payload context)
 
 7. Publish completion with:
-- `MIGRATION: 20260222064500_patch_scheduler_financial_writer`
+- `MIGRATION: 20260222064600_patch_scheduler_financial_writer`
 - verification query output
 - before/after counts
 - apply logs pointer
