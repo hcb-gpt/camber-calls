@@ -1,8 +1,8 @@
 /**
- * morning-digest Edge Function v1.3.0
+ * morning-digest Edge Function v1.3.1
  * Returns a structured daily digest for the Camber operator (Chad).
  *
- * @version 1.3.0
+ * @version 1.3.1
  * @date 2026-02-22
  * @purpose Dead-end consumer — surfaces actionable intelligence from pipeline data
  *
@@ -22,8 +22,49 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const FUNCTION_VERSION = "v1.3.0";
+const FUNCTION_VERSION = "v1.3.1";
 const jsonHeaders = { "Content-Type": "application/json", "Connection": "keep-alive" };
+const OPERATOR_UNAVAILABLE_TEXT = "CAMBER brief unavailable";
+
+function unavailableResponse(
+  t0: number,
+  status: number,
+  reasonCode: "AUTH_FAILED" | "TRANSFORM_ERROR" | "INTEGRITY_GUARD_FAILED",
+  detail: string | null = null,
+): Response {
+  return new Response(
+    JSON.stringify({
+      ok: false,
+      status: "UNAVAILABLE",
+      message: OPERATOR_UNAVAILABLE_TEXT,
+      fallback_text: OPERATOR_UNAVAILABLE_TEXT,
+      reason_code: reasonCode,
+      detail,
+      function_version: FUNCTION_VERSION,
+      ms: Date.now() - t0,
+    }),
+    { status, headers: jsonHeaders },
+  );
+}
+
+function hasDigestIntegrity(digest: Record<string, unknown>): boolean {
+  const narrative = digest.narrative_brief as Record<string, unknown> | undefined;
+  const whereToLook = narrative?.where_to_look_first;
+
+  return digest.ok === true &&
+    typeof digest.generated_at === "string" &&
+    typeof digest.function_version === "string" &&
+    typeof digest.ms === "number" &&
+    typeof digest.unresolved_signals === "object" &&
+    typeof digest.open_loops === "object" &&
+    typeof digest.review_pressure === "object" &&
+    typeof digest.recent_claims === "object" &&
+    typeof digest.pipeline_health === "object" &&
+    typeof narrative === "object" &&
+    typeof narrative?.what_changed === "string" &&
+    typeof narrative?.why_it_matters === "string" &&
+    Array.isArray(whereToLook);
+}
 
 Deno.serve(async (req: Request) => {
   const t0 = Date.now();
@@ -39,10 +80,7 @@ Deno.serve(async (req: Request) => {
   const edgeSecret = req.headers.get("X-Edge-Secret") || req.headers.get("x-edge-secret");
   const expectedSecret = Deno.env.get("EDGE_SHARED_SECRET");
   if (!expectedSecret || edgeSecret !== expectedSecret) {
-    return new Response(
-      JSON.stringify({ error: "unauthorized", hint: "X-Edge-Secret required" }),
-      { status: 401, headers: jsonHeaders },
-    );
+    return unavailableResponse(t0, 401, "AUTH_FAILED", "X-Edge-Secret required");
   }
 
   const db = createClient(
@@ -421,20 +459,17 @@ Deno.serve(async (req: Request) => {
       ms: Date.now() - t0,
     };
 
+    if (!hasDigestIntegrity(digest)) {
+      console.error("[morning-digest] integrity guard failed");
+      return unavailableResponse(t0, 503, "INTEGRITY_GUARD_FAILED", "Digest shape validation failed");
+    }
+
     return new Response(JSON.stringify(digest, null, 2), {
       status: 200,
       headers: jsonHeaders,
     });
   } catch (e: any) {
     console.error("[morning-digest] Error:", e.message);
-    return new Response(
-      JSON.stringify({
-        ok: false,
-        error: e.message,
-        function_version: FUNCTION_VERSION,
-        ms: Date.now() - t0,
-      }),
-      { status: 500, headers: jsonHeaders },
-    );
+    return unavailableResponse(t0, 500, "TRANSFORM_ERROR", e?.message || "Unknown failure");
   }
 });
