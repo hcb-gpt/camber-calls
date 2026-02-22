@@ -40,3 +40,6 @@ Read-only query helpers for verifying time-sync invariants and provenance hygien
   - Read-only candidate set for pending review_queue spans likely to be junk calls (voicemail, connection-failure, or minimal-content noise).
 - `scripts/consolidation_dataset_probe.sh`
   - Runtime consolidation probe that auto-selects a high-signal `journal_runs` candidate and prints baseline-vs-candidate deltas for `module_*` surfaces when present.
+- `scripts/proof_packet_normalizer.sh`
+  - Validates TRAM completion packet fields (`RECEIPT`, `COMPLETES_RECEIPT`, `RESOLUTION`, `GIT_PROOF`, `VERIFY_PROOF`, `REAL_DATA_POINTER`) and emits a TSV pass/fail matrix.
+  - Usage: `./scripts/proof_packet_normalizer.sh artifacts/reliability_proof_packets/latest8/completion__*.md`
