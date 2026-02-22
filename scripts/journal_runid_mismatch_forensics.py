@@ -41,7 +41,15 @@ def load_env(repo_root: str) -> None:
 def run_forensics(conn: psycopg.Connection, limit: int) -> dict:
     summary_sql = """
     with runs as (
-      select run_id, call_id, project_id, started_at, completed_at, claims_extracted
+      select
+        run_id,
+        call_id,
+        project_id,
+        started_at,
+        completed_at,
+        claims_extracted,
+        config->>'mode' as run_mode,
+        nullif(config->>'source_run_id','')::uuid as source_run_id
       from public.journal_runs
       where coalesce(claims_extracted, 0) > 0
     ),
@@ -50,40 +58,118 @@ def run_forensics(conn: psycopg.Connection, limit: int) -> dict:
       from public.journal_claims
       group by run_id
     ),
+    source_claim_counts as (
+      select run_id, count(*)::int as source_claim_rows
+      from public.journal_claims
+      group by run_id
+    ),
     joined as (
-      select r.*, coalesce(c.claim_rows, 0) as claim_rows
+      select
+        r.*,
+        coalesce(c.claim_rows, 0) as claim_rows,
+        coalesce(sc.source_claim_rows, 0) as source_claim_rows,
+        case
+          when r.run_mode = 'consolidate' then
+            case
+              when r.source_run_id is null then 'consolidate_no_source_run'
+              when coalesce(sc.source_claim_rows, 0) > 0 then 'consolidate_source_has_claims'
+              else 'consolidate_source_missing_claims'
+            end
+          else
+            case
+              when coalesce(c.claim_rows, 0) = 0 then 'direct_run_missing_claims'
+              else 'direct_run_has_claims'
+            end
+        end as mismatch_class
       from runs r
       left join claim_counts c on c.run_id = r.run_id
+      left join source_claim_counts sc on sc.run_id = r.source_run_id
     )
     select
-      count(*) filter (where started_at >= now() - interval '24 hours' and claim_rows = 0) as mismatches_24h,
-      count(*) filter (where started_at >= now() - interval '7 days' and claim_rows = 0) as mismatches_7d,
-      count(*) filter (where claim_rows = 0) as mismatches_all,
+      count(*) filter (
+        where started_at >= now() - interval '24 hours'
+          and mismatch_class in ('direct_run_missing_claims', 'consolidate_source_missing_claims')
+      ) as true_mismatches_24h,
+      count(*) filter (
+        where started_at >= now() - interval '7 days'
+          and mismatch_class in ('direct_run_missing_claims', 'consolidate_source_missing_claims')
+      ) as true_mismatches_7d,
+      count(*) filter (
+        where mismatch_class in ('direct_run_missing_claims', 'consolidate_source_missing_claims')
+      ) as true_mismatches_all,
+      count(*) filter (where started_at >= now() - interval '24 hours' and mismatch_class = 'consolidate_no_source_run')
+        as ambiguous_consolidate_24h,
+      count(*) filter (where started_at >= now() - interval '7 days' and mismatch_class = 'consolidate_no_source_run')
+        as ambiguous_consolidate_7d,
       count(*) filter (where started_at >= now() - interval '24 hours') as runs_24h_with_claims_extracted,
-      count(*) filter (where started_at >= now() - interval '7 days') as runs_7d_with_claims_extracted
+      count(*) filter (where started_at >= now() - interval '7 days') as runs_7d_with_claims_extracted,
+      count(*) filter (where run_mode = 'consolidate') as consolidate_runs,
+      count(*) filter (where run_mode is distinct from 'consolidate') as non_consolidate_runs
     from joined;
     """
     top_sql = """
     with runs as (
-      select run_id, call_id, project_id, started_at, completed_at, claims_extracted
+      select
+        run_id,
+        call_id,
+        project_id,
+        started_at,
+        completed_at,
+        claims_extracted,
+        config->>'mode' as run_mode,
+        nullif(config->>'source_run_id','')::uuid as source_run_id
       from public.journal_runs
       where coalesce(claims_extracted, 0) > 0
     ),
     claim_counts as (
       select run_id, count(*)::int as claim_rows
+      from public.journal_claims
+      group by run_id
+    ),
+    source_claim_counts as (
+      select run_id, count(*)::int as source_claim_rows
       from public.journal_claims
       group by run_id
     ),
     joined as (
       select
         r.run_id, r.call_id, r.project_id, r.started_at, r.completed_at,
-        r.claims_extracted, coalesce(c.claim_rows, 0) as claim_rows
+        r.claims_extracted,
+        r.run_mode,
+        r.source_run_id,
+        coalesce(c.claim_rows, 0) as claim_rows,
+        coalesce(sc.source_claim_rows, 0) as source_claim_rows,
+        case
+          when r.run_mode = 'consolidate' then
+            case
+              when r.source_run_id is null then 'consolidate_no_source_run'
+              when coalesce(sc.source_claim_rows, 0) > 0 then 'consolidate_source_has_claims'
+              else 'consolidate_source_missing_claims'
+            end
+          else
+            case
+              when coalesce(c.claim_rows, 0) = 0 then 'direct_run_missing_claims'
+              else 'direct_run_has_claims'
+            end
+        end as mismatch_class
       from runs r
       left join claim_counts c on c.run_id = r.run_id
+      left join source_claim_counts sc on sc.run_id = r.source_run_id
     )
-    select run_id, call_id, project_id, started_at, completed_at, claims_extracted, claim_rows
+    select
+      run_id,
+      call_id,
+      project_id,
+      started_at,
+      completed_at,
+      claims_extracted,
+      run_mode,
+      source_run_id,
+      claim_rows,
+      source_claim_rows,
+      mismatch_class
     from joined
-    where claim_rows = 0
+    where mismatch_class in ('direct_run_missing_claims', 'consolidate_source_missing_claims', 'consolidate_no_source_run')
     order by started_at desc nulls last
     limit %(limit)s;
     """
@@ -92,11 +178,15 @@ def run_forensics(conn: psycopg.Connection, limit: int) -> dict:
         cur.execute(summary_sql)
         s = cur.fetchone()
         summary = {
-            "mismatches_24h": s[0],
-            "mismatches_7d": s[1],
-            "mismatches_all": s[2],
-            "runs_24h_with_claims_extracted": s[3],
-            "runs_7d_with_claims_extracted": s[4],
+            "true_mismatches_24h": s[0],
+            "true_mismatches_7d": s[1],
+            "true_mismatches_all": s[2],
+            "ambiguous_consolidate_24h": s[3],
+            "ambiguous_consolidate_7d": s[4],
+            "runs_24h_with_claims_extracted": s[5],
+            "runs_7d_with_claims_extracted": s[6],
+            "consolidate_runs": s[7],
+            "non_consolidate_runs": s[8],
         }
         cur.execute(top_sql, {"limit": limit})
         cols = [d.name for d in cur.description]
