@@ -337,6 +337,7 @@ If there are no existing claims, mark everything as "new" with confidence 1.0.`;
     let remained_new = 0;
     let review_queue_entries = 0;
     let human_override_skips = 0;
+    let promotion_result: any = null;
 
     if (!dry_run) {
       for (const j of result.judgments) {
@@ -460,6 +461,20 @@ If there are no existing claims, mark everything as "new" with confidence 1.0.`;
         conflicts_detected,
         routed_to_review: review_queue_entries,
       }).eq("run_id", run_id);
+
+      // Promotion bridge:
+      // When journal-consolidate is triggered from journal-extract (body.run_id),
+      // immediately run promotion for that extraction run so belief_claims stays live.
+      if (body.run_id) {
+        const { data: promoteData, error: promoteErr } = await db.rpc(
+          "promote_journal_claims_to_belief",
+          { p_run_id: body.run_id },
+        );
+        if (promoteErr) {
+          throw new Error(`promote_belief_failed: ${promoteErr.message}`);
+        }
+        promotion_result = promoteData || null;
+      }
     }
 
     if (dry_run) {
@@ -482,6 +497,7 @@ If there are no existing claims, mark everything as "new" with confidence 1.0.`;
         judgments: { superseded, corroborated, conflicts_detected, remained_new, human_override_skips },
         review_queue_entries: dry_run ? 0 : review_queue_entries,
         cross_project_signals: result.cross_project_signals.length,
+        promotion_result: dry_run ? null : promotion_result,
         raw_judgments: dry_run ? result.judgments : undefined,
         model,
         tokens_used,
