@@ -1,14 +1,14 @@
 /**
- * morning-digest Edge Function v1.2.0
+ * morning-digest Edge Function v1.3.0
  * Returns a structured daily digest for the Camber operator (Chad).
  *
- * @version 1.2.0
- * @date 2026-02-14
+ * @version 1.3.0
+ * @date 2026-02-22
  * @purpose Dead-end consumer — surfaces actionable intelligence from pipeline data
  *
  * DESIGN:
  * - READ-ONLY: SELECT queries only, no writes
- * - Returns 5 sections: unresolved_signals, open_loops, review_pressure, recent_claims, pipeline_health
+ * - Returns 6 sections: unresolved_signals, open_loops, review_pressure, recent_claims, pipeline_health, narrative_brief
  * - AUTH: verify_jwt=false + X-Edge-Secret (Pattern A, pipeline internal)
  *
  * SECTIONS:
@@ -17,11 +17,12 @@
  * 3. Review queue pressure — pending count + top 5 oldest from review_queue
  * 4. Recent claims — last 24h from journal_claims with project context
  * 5. Pipeline health — calls_raw last 24h, segment success rate, summary generation rate
+ * 6. Narrative brief — human-readable operator summary with fallback behavior
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const FUNCTION_VERSION = "v1.2.0";
+const FUNCTION_VERSION = "v1.3.0";
 const jsonHeaders = { "Content-Type": "application/json", "Connection": "keep-alive" };
 
 Deno.serve(async (req: Request) => {
@@ -291,6 +292,56 @@ Deno.serve(async (req: Request) => {
       runsByStatus[r.status] = (runsByStatus[r.status] || 0) + 1;
     }
 
+    // ── SECTION 6: Human-Readable Narrative (additive) ───────────
+    const { data: manifestRows, error: manifestErr } = await db
+      .from("v_morning_manifest")
+      .select("project_id, project_name, new_calls, new_journal_entries, new_striking_signals, pending_reviews")
+      .order("new_calls", { ascending: false })
+      .limit(5);
+
+    if (manifestErr) {
+      console.error("[morning-digest] v_morning_manifest error:", manifestErr.message);
+    }
+
+    const { data: projectFeedRows, error: projectFeedErr } = await db
+      .from("v_project_feed")
+      .select(
+        "project_id, project_name, active_journal_claims, open_loops, striking_signal_count, pending_reviews, risk_flag",
+      )
+      .order("active_journal_claims", { ascending: false })
+      .limit(5);
+
+    if (projectFeedErr) {
+      console.error("[morning-digest] v_project_feed error:", projectFeedErr.message);
+    }
+
+    const hasManifestRows = (manifestRows || []).length > 0;
+    const fallbackActive = !hasManifestRows;
+
+    const whereToLookFirst = hasManifestRows
+      ? (manifestRows || []).map((row: any) =>
+        `${row.project_name || "Unknown"}: ${row.new_calls || 0} new calls, ${
+          row.pending_reviews || 0
+        } pending reviews, ${row.new_striking_signals || 0} new striking signals`
+      )
+      : (projectFeedRows || []).map((row: any) =>
+        `${row.project_name || "Unknown"}: ${row.open_loops || 0} open loops, ${
+          row.pending_reviews || 0
+        } pending reviews, risk=${row.risk_flag || "normal"}`
+      );
+
+    const whatChanged = `In the last 24 hours, ${callsRawCount || 0} calls were ingested, ${
+      recentClaimCount || 0
+    } claims were extracted, ${strikingRaw?.length || 0} striking signals were scored, and ${
+      loopsRaw?.length || 0
+    } open loops are currently active.`;
+
+    const whyItMatters = pendingCount && pendingCount > 1000
+      ? `Review backlog is elevated (${pendingCount} pending), which can delay human confirmation and increase stale operational risk if not triaged first.`
+      : `Review backlog is manageable (${
+        pendingCount || 0
+      } pending), so operators can prioritize high-signal projects and open loops without losing coverage.`;
+
     // ── ASSEMBLE RESPONSE ─────────────────────────────────────────
     const digest = {
       ok: true,
@@ -352,6 +403,19 @@ Deno.serve(async (req: Request) => {
           : "N/A",
         journal_runs: runsByStatus,
         claims_extracted: recentClaimCount || 0,
+      },
+
+      // Section 6
+      narrative_brief: {
+        description:
+          "Human-readable operator summary (what changed, why it matters, where to look first). Structured sections remain unchanged for machine consumers.",
+        source_mode: fallbackActive
+          ? "fallback_v_project_feed_plus_digest_totals"
+          : "v_morning_manifest_plus_digest_totals",
+        fallback_active: fallbackActive,
+        what_changed: whatChanged,
+        why_it_matters: whyItMatters,
+        where_to_look_first: whereToLookFirst,
       },
 
       ms: Date.now() - t0,
