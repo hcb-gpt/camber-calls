@@ -1,9 +1,9 @@
 /**
- * journal-consolidate Edge Function v1.0.2
+ * journal-consolidate Edge Function v1.0.3
  * Compares new claims against existing project knowledge to determine relationships
  *
- * @version 1.0.2
- * @date 2026-02-09
+ * @version 1.0.3
+ * @date 2026-02-22
  * @purpose D1 deliverable - world model consolidation layer
  *
  * Input: { project_id } or { claim_ids: [...] } or { run_id }
@@ -11,11 +11,12 @@
  * Output: updated relationship fields, conflict records, review queue entries
  *
  * v1.0.2: Fix journal_runs status='success' (constraint requires 'success' not 'completed')
+ * v1.0.3: Hotfix - remove confirmed-only filter from existing-claims read path.
  */
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const FUNCTION_VERSION = "v1.0.2";
+const FUNCTION_VERSION = "v1.0.3";
 const PROMPT_VERSION = "journal-consolidate-v1";
 const MAX_TOKENS = 4096;
 const DEFAULT_MODEL = "claude-sonnet-4-5-20250929";
@@ -255,7 +256,6 @@ Deno.serve(async (req: Request) => {
       .select("claim_id, call_id, claim_type, claim_text, epistemic_status, warrant_level, relationship, created_at")
       .eq("project_id", project_id)
       .eq("active", true)
-      .eq("claim_confirmation_state", "confirmed")
       .not("claim_id", "in", `(${newClaimIds.join(",")})`)
       .order("created_at", { ascending: true })
       .limit(MAX_EXISTING_CLAIMS_CONTEXT);
