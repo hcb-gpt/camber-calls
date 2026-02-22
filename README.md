@@ -60,6 +60,50 @@ scripts/query.sh "select now();"
 
 Details: `docs/data_sql_access.md`
 
+## Timeline Quality Audit
+
+For a fast join-integrity check of `project_timeline_events` (without `psql`):
+
+```bash
+cd /Users/chadbarlow/gh/hcb-gpt/camber-calls
+scripts/timeline_quality_audit.sh --days 7 --out .temp/timeline_audit.json
+```
+
+The script validates references against `projects`, `contacts`, and `interactions`,
+then prints a JSON report with counts plus sample suspect rows.
+
+To enforce thresholds in CI or cron checks:
+
+```bash
+cd /Users/chadbarlow/gh/hcb-gpt/camber-calls
+scripts/timeline_quality_gate.sh --days 7
+```
+
+The gate exits non-zero on threshold violations and supports overrides such as
+`--max-missing-contact-id-rows 10`.
+GitHub Actions workflow: `.github/workflows/timeline-quality-gate.yml` (daily + manual run).
+
+## Consolidation Delta Probe
+
+For fast troubleshooting when consolidation appears to run but `module_*` tables
+show no movement:
+
+```bash
+cd /Users/chadbarlow/gh/hcb-gpt/camber-calls
+./scripts/consolidation_delta_probe.sh --run-id <journal_run_uuid>
+```
+
+Useful flags:
+
+- `--no-invoke`: read-only snapshot without calling `journal-consolidate`
+- `--json`: structured output for automation/parsing
+
+The probe reports:
+
+- `journal_claims` count for the run
+- before/after counts for `module_claims` and `module_receipts`
+- function HTTP status and body (unless `--no-invoke`)
+
 ## CI/CD
 
 Push to `main` triggers automatic deployment via GitHub Actions.
