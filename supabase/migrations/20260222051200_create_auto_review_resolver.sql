@@ -175,14 +175,7 @@ begin
     candidate_confidence numeric
   ) on commit drop;
 
-  insert into tmp_low_dismissed (review_queue_id, span_id, interaction_id, candidate_project_id, candidate_confidence)
-  select
-    u.review_queue_id,
-    u.span_id,
-    u.interaction_id,
-    u.candidate_project_id,
-    u.candidate_confidence
-  from (
+  with updated as (
     update public.review_queue rq
     set
       status = 'dismissed',
@@ -199,10 +192,24 @@ begin
     returning
       rq.id as review_queue_id,
       rq.span_id,
-      rq.interaction_id::text as interaction_id,
-      c.candidate_project_id,
-      c.candidate_confidence
-  ) u;
+      rq.interaction_id::text as interaction_id
+  )
+  insert into tmp_low_dismissed (
+    review_queue_id,
+    span_id,
+    interaction_id,
+    candidate_project_id,
+    candidate_confidence
+  )
+  select
+    u.review_queue_id,
+    u.span_id,
+    u.interaction_id,
+    c.candidate_project_id,
+    c.candidate_confidence
+  from updated u
+  join tmp_auto_review_candidates c
+    on c.review_queue_id = u.review_queue_id;
 
   get diagnostics v_low_dismissed = row_count;
 
