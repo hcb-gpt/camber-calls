@@ -1,8 +1,8 @@
 /**
- * process-call Edge Function v4.3.7
+ * process-call Edge Function v4.3.8
  * Full v3.6 pipeline in Supabase - Ported from v4.0.22 context_assembly
  *
- * @version 4.3.7
+ * @version 4.3.8
  * @date 2026-02-15
  * @port context_assembly v4.0.22 - 6-source ranking, word boundaries, speaker stripping
  *
@@ -17,6 +17,10 @@
  *
  * v4.3.2 CHANGES (lineage persistence):
  * - Persist zapier_zap_id and zapier_run_id from _zapier_ingest_meta into calls_raw.
+ *
+ * v4.3.8 CHANGES (segment-call runtime reliability hardening):
+ * - Adds bounded timeout + transient retry for segment-call chaining.
+ * - Reduces dropped attribution chains during short-lived downstream failures.
  *
  * v4.3.7 CHANGES (junk-call prefilter handoff):
  * - Adds conservative junk-call prefilter on interaction writes.
@@ -57,9 +61,15 @@ import { evaluateJunkCallPrefilter, normalizeDurationSeconds } from "../_shared/
 import { normalizePhoneForLookup } from "./phone_lookup.ts";
 import { resolveCallPartyPhones } from "./phone_direction.ts";
 
-const PROCESS_CALL_VERSION = "v4.3.7"; // adds conservative junk-call prefilter to interaction needs_review wiring
+const PROCESS_CALL_VERSION = "v4.3.8"; // adds bounded timeout + transient retry for segment-call chaining
 const GATE = { PASS: "PASS", SKIP: "SKIP", NEEDS_REVIEW: "NEEDS_REVIEW" };
 const ID_PATTERN = /^cll_[a-zA-Z0-9_]+$/;
+const SEGMENT_CALL_TIMEOUT_MS = Number(Deno.env.get("PROCESS_CALL_SEGMENT_TIMEOUT_MS") || "6000");
+const SEGMENT_CALL_MAX_ATTEMPTS = Math.min(
+  3,
+  Math.max(1, Number(Deno.env.get("PROCESS_CALL_SEGMENT_MAX_ATTEMPTS") || "2")),
+);
+const RETRYABLE_HTTP_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 const ALLOWED_PROVENANCE_SOURCES = [
   "openphone",
   "zapier",
@@ -74,6 +84,71 @@ function normalizeProvenanceSource(source: unknown): string {
   const raw = String(source || "edge").trim().toLowerCase();
   if (!raw) return "edge";
   return ALLOWED_PROVENANCE_SOURCES.includes(raw) ? raw : "edge";
+}
+
+type SegmentCallInvokeResult = {
+  attempts: number;
+  status: number | null;
+  warnings: string[];
+};
+
+async function invokeSegmentCallWithRetry(
+  url: string,
+  edgeSecret: string,
+  payload: Record<string, unknown>,
+): Promise<SegmentCallInvokeResult> {
+  const warnings: string[] = [];
+  let status: number | null = null;
+  let attempts = 0;
+
+  for (let attempt = 1; attempt <= SEGMENT_CALL_MAX_ATTEMPTS; attempt++) {
+    attempts = attempt;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort("segment-call-timeout"), SEGMENT_CALL_TIMEOUT_MS);
+
+    try {
+      const segResp = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Edge-Secret": edgeSecret,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      status = segResp.status;
+
+      if (segResp.ok) {
+        clearTimeout(timeout);
+        return { attempts, status, warnings };
+      }
+
+      const errBody = await segResp.text().catch(() => "unknown");
+      warnings.push(`segment_call_http_${segResp.status}_attempt_${attempt}: ${errBody.slice(0, 200)}`);
+
+      if (!RETRYABLE_HTTP_STATUS.has(segResp.status) || attempt === SEGMENT_CALL_MAX_ATTEMPTS) {
+        clearTimeout(timeout);
+        return { attempts, status, warnings };
+      }
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      if (msg.toLowerCase().includes("aborted")) {
+        warnings.push(`segment_call_timeout_attempt_${attempt}: ${SEGMENT_CALL_TIMEOUT_MS}ms`);
+      } else {
+        warnings.push(`segment_call_exception_attempt_${attempt}: ${msg}`);
+      }
+      if (attempt === SEGMENT_CALL_MAX_ATTEMPTS) {
+        clearTimeout(timeout);
+        return { attempts, status, warnings };
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
+  }
+
+  return { attempts, status, warnings };
 }
 
 // ============================================================
@@ -407,6 +482,7 @@ Deno.serve(async (req: Request) => {
   // v4.3.0: segment-call chain tracking
   let segment_call_fired = false;
   let segment_call_status: number | null = null;
+  let segment_call_attempts = 0;
 
   // V3 ported: candidate tracking
   const candidatesById = new Map<string, {
@@ -1067,24 +1143,19 @@ Deno.serve(async (req: Request) => {
         const segmentCallUrl = `${Deno.env.get("SUPABASE_URL")}/functions/v1/segment-call`;
         if (edgeSecretVal) {
           try {
-            const segResp = await fetch(segmentCallUrl, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "X-Edge-Secret": edgeSecretVal,
-              },
-              body: JSON.stringify({
+            const segInvoke = await invokeSegmentCallWithRetry(
+              segmentCallUrl,
+              edgeSecretVal,
+              {
                 interaction_id: iid,
                 transcript: n.transcript,
                 source: "process-call",
-              }),
-            });
+              },
+            );
             segment_call_fired = true;
-            segment_call_status = segResp.status;
-            if (!segResp.ok) {
-              const errBody = await segResp.text().catch(() => "unknown");
-              warnings.push(`segment_call_http_${segResp.status}: ${errBody.slice(0, 200)}`);
-            }
+            segment_call_status = segInvoke.status;
+            segment_call_attempts = segInvoke.attempts;
+            warnings.push(...segInvoke.warnings);
           } catch (e: any) {
             segment_call_fired = true;
             warnings.push(`segment_call_exception: ${e.message}`);
@@ -1169,6 +1240,7 @@ Deno.serve(async (req: Request) => {
         segment_call: {
           fired: segment_call_fired,
           status: segment_call_status,
+          attempts: segment_call_attempts,
         },
         junk_prefilter: {
           applied: junkCallFiltered,
